@@ -29,25 +29,25 @@ namespace Coflnet.Sky.Indexer
                 c.SwaggerDoc("v1", new OpenApiInfo { Title = "SkyIndexer", Version = "v1" });
             });
             services.AddJaeger();
-            
+
             services.AddDbContext<HypixelContext>(
                 dbContextOptions => dbContextOptions
                     .UseMySQL(Configuration["DBCONNECTION"])
                     .EnableSensitiveDataLogging() // <-- These two calls are optional but help
                     .EnableDetailedErrors()       // <-- with debugging (remove for production).
             );
-
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
         {
-            if (env.IsDevelopment())
+            app.UseDeveloperExceptionPage();
+            app.UseSwagger();
+            app.UseSwaggerUI(c =>
             {
-                app.UseDeveloperExceptionPage();
-                app.UseSwagger();
-                app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "SkyFlipper v1"));
-            }
+                c.SwaggerEndpoint("/swagger/v1/swagger.json", "SkyIndexer v1");
+                c.RoutePrefix = "api";
+            });
 
             app.UseRouting();
 

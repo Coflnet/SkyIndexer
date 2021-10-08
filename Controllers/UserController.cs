@@ -20,7 +20,7 @@ namespace Coflnet.Sky.Indexer.Controllers
         }
 
 
-        [Route("create")]
+        [Route("")]
         [HttpPost]
         public GoogleUser LastUpdate([FromBody] GoogleUser user)
         {

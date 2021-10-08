@@ -19,7 +19,7 @@ namespace Coflnet.Sky.Indexer
             // migrations
             //hypixel.Program.GetDBToDesiredState();
             ItemDetails.Instance.LoadFromDB();
-            var redisInit = hypixel.Program.MakeSureRedisIsInitialized();
+            Task.Run(hypixel.Program.MakeSureRedisIsInitialized);
 
             Console.WriteLine("booting db dependend stuff");
             var bazaar = new dev.BazaarIndexer();

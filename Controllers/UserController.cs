@@ -10,11 +10,11 @@ namespace Coflnet.Sky.Indexer.Controllers
 {
     [ApiController]
     [Route("[controller]")]
-    public class ApiController : ControllerBase
+    public class UserController : ControllerBase
     {
-        private readonly ILogger<ApiController> _logger;
+        private readonly ILogger<UserController> _logger;
 
-        public ApiController(ILogger<ApiController> logger)
+        public UserController(ILogger<UserController> logger)
         {
             _logger = logger;
         }

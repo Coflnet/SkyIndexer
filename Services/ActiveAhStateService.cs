@@ -32,7 +32,8 @@ namespace Coflnet.Sky.Indexer
                         ActiveAuctions = new System.Collections.Concurrent.ConcurrentDictionary<long, long>(
                             await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 2500000 && a.End > DateTime.Now)
                             .Select(a => a.UId)
-                            .ToDictionaryAsync(a => a))
+                            .ToDictionaryAsync(a => a)),
+                        Time = DateTime.Now
                     });
                     Console.WriteLine("loaded all active auctionids");
                 }

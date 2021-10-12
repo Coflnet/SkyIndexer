@@ -38,6 +38,7 @@ namespace Coflnet.Sky.Indexer
                 await Task.Delay(TimeSpan.FromMinutes(3));
                 await ItemPrices.Instance.BackfillPrices();
             }).ConfigureAwait(false);
+            NameUpdater.Run();
 
             /*try
             {

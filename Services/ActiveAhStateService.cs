@@ -30,10 +30,11 @@ namespace Coflnet.Sky.Indexer
                     RecentUpdates.Enqueue(new AhStateSumary()
                     {
                         ActiveAuctions = new System.Collections.Concurrent.ConcurrentDictionary<long, long>(
-                            context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 1000000 && a.End > DateTime.Now).Select(a => a.UId)
-                            .ToDictionary(a => a)
-                    )
+                            await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 2500000 && a.End > DateTime.Now)
+                            .Select(a => a.UId)
+                            .ToDictionaryAsync(a => a))
                     });
+                    Console.WriteLine("loaded all active auctionids");
                 }
                 catch (Exception e)
                 {
@@ -51,10 +52,13 @@ namespace Coflnet.Sky.Indexer
                             return;
                         RecentUpdates.Enqueue(sum);
 
-                        if (RecentUpdates.Min(r => r.Time) > DateTime.Now - TimeSpan.FromMinutes(3))
+                        if (RecentUpdates.Min(r => r.Time) > DateTime.Now - TimeSpan.FromMinutes(4))
                             return;
                         List<long> missing = FindInactiveAuctions();
                         await UpdateInactiveAuctions(missing, sum.ActiveAuctions);
+
+                        if (RecentUpdates.Peek().Time < DateTime.Now - TimeSpan.FromMinutes(5))
+                            RecentUpdates.Dequeue();
 
                     }, stoppingToken);
                 }
@@ -68,7 +72,7 @@ namespace Coflnet.Sky.Indexer
         private List<long> FindInactiveAuctions()
         {
             var oldest = RecentUpdates.Dequeue();
-            var mostRecent = RecentUpdates.OrderByDescending(u => u.Time).Take(3).ToList();
+            var mostRecent = RecentUpdates.Where(u => u.Time > DateTime.Now - TimeSpan.FromMinutes(3.4)).ToList();
             List<long> missing = new List<long>();
             foreach (var item in oldest.ActiveAuctions.Keys)
             {

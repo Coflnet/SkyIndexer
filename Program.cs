@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using hypixel;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -17,7 +18,10 @@ namespace Coflnet.Sky.Indexer
         public static void Main(string[] args)
         {
             // migrations
-            //hypixel.Program.GetDBToDesiredState();
+            using (var context = new HypixelContext())
+            {
+                context.Database.Migrate();
+            }
             ItemDetails.Instance.LoadFromDB();
             Task.Run(hypixel.Program.MakeSureRedisIsInitialized);
 

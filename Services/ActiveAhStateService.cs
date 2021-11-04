@@ -15,6 +15,8 @@ namespace Coflnet.Sky.Indexer
         IConfiguration config;
         Queue<AhStateSumary> RecentUpdates = new Queue<AhStateSumary>();
 
+        public AhStateSumary LastUpdate => RecentUpdates.LastOrDefault();
+
         public ActiveAhStateService(IConfiguration config)
         {
             this.config = config;

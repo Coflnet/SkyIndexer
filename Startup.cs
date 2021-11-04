@@ -36,7 +36,8 @@ namespace Coflnet.Sky.Indexer
                     .EnableSensitiveDataLogging() // <-- These two calls are optional but help
                     .EnableDetailedErrors()       // <-- with debugging (remove for production).
             );
-            services.AddHostedService<ActiveAhStateService>();
+            services.AddSingleton<ActiveAhStateService>();
+            services.AddHostedService<ActiveAhStateService>(a=>a.GetRequiredService<ActiveAhStateService>());
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.

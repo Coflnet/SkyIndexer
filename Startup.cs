@@ -30,12 +30,7 @@ namespace Coflnet.Sky.Indexer
             });
             services.AddJaeger();
 
-            services.AddDbContext<HypixelContext>(
-                dbContextOptions => dbContextOptions
-                    .UseMySQL(Configuration["DBCONNECTION"])
-                    .EnableSensitiveDataLogging() // <-- These two calls are optional but help
-                    .EnableDetailedErrors()       // <-- with debugging (remove for production).
-            );
+            services.AddDbContext<HypixelContext>();
             services.AddSingleton<ActiveAhStateService>();
             services.AddHostedService<ActiveAhStateService>(a=>a.GetRequiredService<ActiveAhStateService>());
         }

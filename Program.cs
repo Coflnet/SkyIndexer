@@ -31,7 +31,7 @@ namespace Coflnet.Sky.Indexer
             hypixel.Indexer.LoadFromDB();
             hypixel.Program.RunIsolatedForever(async () =>
             {
-                await hypixel.Indexer.ProcessQueue();
+                await hypixel.Indexer.ProcessQueue(System.Threading.CancellationToken.None);
                 await hypixel.Indexer.LastHourIndex();
 
             }, "An error occured while indexing");

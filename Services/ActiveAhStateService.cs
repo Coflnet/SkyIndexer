@@ -121,9 +121,10 @@ namespace Coflnet.Sky.Indexer
                     var foundActiveAgain = await context.Auctions.Where(a => toCheck.Contains(a.UId) && a.End < DateTime.Now).ToListAsync();
                     foreach (var item in foundActiveAgain)
                     {
-                        item.End = DateTime.Now + TimeSpan.FromMinutes(10);
+                        var ticks = activeAuctions.GetValueOrDefault(item.UId);
+                        item.End = ticks > 2 ? new DateTime(ticks) : DateTime.Now + TimeSpan.FromMinutes(10);
                         context.Update(item);
-                        Console.WriteLine("reactivated " + item.Uuid);
+                        Console.WriteLine($"reactivated {item.Uuid}  {item.End}");
                     }
                     await context.SaveChangesAsync();
                     Console.WriteLine(foundActiveAgain.FirstOrDefault()?.Uuid + " found ended active " + foundActiveAgain.Count);

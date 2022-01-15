@@ -12,6 +12,7 @@ namespace hypixel
         private static ConcurrentQueue<IdAndName> newPlayers = new ConcurrentQueue<IdAndName>();
 
         private static int updateCount= 0;
+        static Prometheus.Counter nameUpdateCounter = Prometheus.Metrics.CreateCounter("sky_indexer_name_update","Tracks the count of updated mc names");
 
         private class IdAndName 
         {
@@ -22,7 +23,7 @@ namespace hypixel
         public static async Task<int> UpdateFlaggedNames()
         {
             var updated = 0;
-            var targetAmount = 100;
+            var targetAmount = 45;
             using(var context = new HypixelContext())
             {
                 var players = context.Players.Where(p => p.ChangedFlag && p.Id > 0)
@@ -35,6 +36,7 @@ namespace hypixel
                     player.ChangedFlag = false;
                     player.UpdatedAt = DateTime.Now;
                     context.Players.Update(player);
+                    nameUpdateCounter.Inc();
                 }
 
                 updated = await context.SaveChangesAsync();
@@ -75,7 +77,7 @@ namespace hypixel
                 {
                     Logger.Instance.Error($"NameUpdater encountered an error \n {e.Message} {e.StackTrace} \n{e.InnerException?.Message} {e.InnerException?.StackTrace}");
                 }
-                await Task.Delay(30000);
+                await Task.Delay(10000);
             }
         }
 
@@ -107,7 +109,7 @@ namespace hypixel
             using(var context = new HypixelContext())
             {
                 var players = context.Players.Where(p => p.Id > 0)
-                    .OrderBy(p => p.UpdatedAt).Take(50);
+                    .OrderBy(p => p.UpdatedAt).Take(30);
                 foreach (var p in players)
                 {
                     p.ChangedFlag = true;

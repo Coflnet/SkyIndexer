@@ -34,9 +34,13 @@ namespace hypixel
         private static ConcurrentQueue<SaveAuction> auctionsQueue = new ConcurrentQueue<SaveAuction>();
 
 
+        static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert","Tracks the count of inserted auctions");
+
+
 
         public static async Task LastHourIndex()
         {
+
             DateTime indexStart;
             string targetTmp, pullPath;
             VariableSetup(out indexStart, out targetTmp, out pullPath);
@@ -200,6 +204,7 @@ namespace hypixel
                         Logger.Instance.Error($"Error on CreateLookup: {e.Message} \n{e.StackTrace} \n{JSON.Stringify(auction.NbtData.Data)}");
                         throw e;
                     }
+                    insertCount.Inc();
 
                 }
 

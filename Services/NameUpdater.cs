@@ -11,10 +11,10 @@ namespace hypixel
         public static DateTime LastUpdate { get; internal set; }
         private static ConcurrentQueue<IdAndName> newPlayers = new ConcurrentQueue<IdAndName>();
 
-        private static int updateCount= 0;
-        static Prometheus.Counter nameUpdateCounter = Prometheus.Metrics.CreateCounter("sky_indexer_name_update","Tracks the count of updated mc names");
+        private static int updateCount = 0;
+        static Prometheus.Counter nameUpdateCounter = Prometheus.Metrics.CreateCounter("sky_indexer_name_update", "Tracks the count of updated mc names");
 
-        private class IdAndName 
+        private class IdAndName
         {
             public string Uuid;
             public string Name;
@@ -24,7 +24,7 @@ namespace hypixel
         {
             var updated = 0;
             var targetAmount = 45;
-            using(var context = new HypixelContext())
+            using (var context = new HypixelContext())
             {
                 var players = context.Players.Where(p => p.ChangedFlag && p.Id > 0)
                     .OrderBy(p => p.UpdatedAt)
@@ -57,9 +57,9 @@ namespace hypixel
             }).ConfigureAwait(false);
         }
 
-        internal static void UpdateUUid(string id,string name = null)
+        internal static void UpdateUUid(string id, string name = null)
         {
-            newPlayers.Enqueue(new IdAndName(){Name=name,Uuid=id});
+            newPlayers.Enqueue(new IdAndName() { Name = name, Uuid = id });
         }
 
         static async Task RunForever()
@@ -70,7 +70,8 @@ namespace hypixel
                 {
                     FlagChanged();
                     var count = await UpdateFlaggedNames();
-                    await FlagOldest();
+                    if (count < 5)
+                        await FlagOldest();
                     Console.WriteLine($" - Updated flagged player names ({count}) - ");
                 }
                 catch (Exception e)
@@ -85,19 +86,19 @@ namespace hypixel
         {
             if (newPlayers.Count() == 0)
                 return;
-            using(var context = new HypixelContext())
+            using (var context = new HypixelContext())
             {
-                while(newPlayers.TryDequeue(out IdAndName result))
+                while (newPlayers.TryDequeue(out IdAndName result))
                 {
-                    var player = context.Players.Where(p=>p.UuId == result.Uuid).FirstOrDefault();
-                    if(player != null)
+                    var player = context.Players.Where(p => p.UuId == result.Uuid).FirstOrDefault();
+                    if (player != null)
                     {
                         player.ChangedFlag = true;
                         player.Name = result.Name;
                         context.Players.Update(player);
                         continue;
-                    } 
-                    Program.AddPlayer(context,result.Uuid,ref Indexer.highestPlayerId,result.Name); 
+                    }
+                    Program.AddPlayer(context, result.Uuid, ref Indexer.highestPlayerId, result.Name);
                 }
                 context.SaveChanges();
             }
@@ -106,7 +107,7 @@ namespace hypixel
         static async Task FlagOldest()
         {
             // this is a workaround, because the "updatedat" field is only updated when there is a change
-            using(var context = new HypixelContext())
+            using (var context = new HypixelContext())
             {
                 var players = context.Players.Where(p => p.Id > 0)
                     .OrderBy(p => p.UpdatedAt).Take(30);
@@ -122,4 +123,4 @@ namespace hypixel
 
     }
 
-} 
+}

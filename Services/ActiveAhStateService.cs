@@ -1,12 +1,17 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Confluent.Kafka;
+using hypixel;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
+using Newtonsoft.Json;
 using OpenTracing.Util;
+using RestSharp;
 
 namespace Coflnet.Sky.Indexer
 {
@@ -17,10 +22,18 @@ namespace Coflnet.Sky.Indexer
 
         public AhStateSumary LastUpdate => RecentUpdates.LastOrDefault();
 
+
         public ActiveAhStateService(IConfiguration config)
         {
             this.config = config;
         }
+
+
+        private static ProducerConfig producerConfig = new ProducerConfig
+        {
+            BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"],
+            LingerMs = 100,
+        };
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
@@ -29,15 +42,19 @@ namespace Coflnet.Sky.Indexer
                 using var spancontext = GlobalTracer.Instance.BuildSpan("LoadActive").StartActive();
                 try
                 {
-                    RecentUpdates.Enqueue(new AhStateSumary()
-                    {
-                        ActiveAuctions = new System.Collections.Concurrent.ConcurrentDictionary<long, long>(
+                    var activeAuctions = new System.Collections.Concurrent.ConcurrentDictionary<long, long>(
                             await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 2500000 && a.End > DateTime.Now)
                             .Select(a => a.UId)
-                            .ToDictionaryAsync(a => a)),
+                            .ToDictionaryAsync(a => a));
+                    RecentUpdates.Enqueue(new AhStateSumary()
+                    {
+                        ActiveAuctions = activeAuctions,
                         Time = DateTime.Now
                     });
                     Console.WriteLine("loaded all active auctionids");
+
+                    RequestCheck(await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 25)
+                                .ToListAsync());
                 }
                 catch (Exception e)
                 {
@@ -101,7 +118,7 @@ namespace Coflnet.Sky.Indexer
             return missing;
         }
 
-        private static async Task UpdateInactiveAuctions(List<long> missing, System.Collections.Concurrent.ConcurrentDictionary<long, long> activeAuctions)
+        private async Task UpdateInactiveAuctions(List<long> missing, System.Collections.Concurrent.ConcurrentDictionary<long, long> activeAuctions)
         {
             using (var context = new hypixel.HypixelContext())
             {
@@ -115,6 +132,9 @@ namespace Coflnet.Sky.Indexer
                         item.End = DateTime.Now;
                         context.Update(item);
                     }
+                    var sumarised = toUpdate.GroupBy(b => b.AuctioneerId).Select(b => b.First()).ToList();
+                    Console.WriteLine("deactivated " + toUpdate.Count());
+                    Console.WriteLine("from sellers: " + sumarised.Count());
                     await context.SaveChangesAsync();
                     var denominator = 6;
                     var toCheck = activeAuctions.Where(a => a.Key % denominator == DateTime.Now.Minute % denominator).Select(a => a.Key).ToList();
@@ -128,11 +148,39 @@ namespace Coflnet.Sky.Indexer
                     }
                     await context.SaveChangesAsync();
                     Console.WriteLine(foundActiveAgain.FirstOrDefault()?.Uuid + " found ended active " + foundActiveAgain.Count);
+                    RequestCheck(toUpdate);
                 }
                 catch (Exception e)
                 {
                     dev.Logger.Instance.Error(e, "updating inactive auctions");
                 }
+            }
+        }
+
+        private void RequestCheck(List<SaveAuction> sumarised)
+        {
+            using (var p = new ProducerBuilder<string, SaveAuction>(producerConfig).SetValueSerializer(SerializerFactory.GetSerializer<SaveAuction>()).Build())
+            {
+                foreach (var item in sumarised)
+                {
+                    try
+                    {
+
+                        p.Produce(config["TOPICS:AUCTION_CHECK"], new Message<string, SaveAuction> { Value = item, Key = $"{item.UId.ToString()}{(item.Bids == null ? "null" : item.Bids.Count)}{item.End}" }, r =>
+                        {
+                            if (r.Error.IsError || r.TopicPartitionOffset.Offset % 1000 == 10)
+                                Console.WriteLine(!r.Error.IsError ?
+                                    $"Delivered {r.Topic} {r.Offset} " :
+                                    $"\nDelivery Error {r.Topic}: {r.Error.Reason}");
+                        });
+                    }
+                    catch (Exception e)
+                    {
+                        dev.Logger.Instance.Error(e, "Sending auction " + JsonConvert.SerializeObject(item));
+                    }
+                }
+                  p.Flush(TimeSpan.FromSeconds(10));
+                Console.WriteLine("sent to check: " +sumarised.Count());
             }
         }
     }

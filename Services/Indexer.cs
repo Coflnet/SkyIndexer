@@ -34,7 +34,7 @@ namespace hypixel
         private static ConcurrentQueue<SaveAuction> auctionsQueue = new ConcurrentQueue<SaveAuction>();
 
 
-        static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert","Tracks the count of inserted auctions");
+        static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert", "Tracks the count of inserted auctions");
 
 
 
@@ -94,13 +94,29 @@ namespace hypixel
 
         public static async Task ProcessQueue(CancellationToken stopToken)
         {
-            await Coflnet.Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
-                Program.KafkaHost,
-                new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic },
-                ToDb,
-                stopToken,
-                "sky-indexer"
-                );
+            var token = new CancellationTokenSource();
+            await Task.WhenAny(new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic }.Select(
+                async topic =>
+                {
+                    try
+                    {
+                        await Coflnet.Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
+                            Program.KafkaHost,
+                            topic,
+                            ToDb,
+                            token.Token,
+                            "sky-indexer"
+                            );
+                    }
+                    catch (Exception e)
+                    {
+                        dev.Logger.Instance.Error(e, $"consuming {topic} failed {e.GetType().Name}");
+                    }
+                }
+            ));
+            // cancel all as they will be restarted
+            token.Cancel();
+
         }
 
         private static void VariableSetup(out DateTime indexStart, out string targetTmp, out string pullPath)
@@ -156,23 +172,34 @@ namespace hypixel
                     LoadFromDB();
             }
 
-            using (var context = new HypixelContext())
+            for (int i = 0; i < 5; i++)
             {
-                Dictionary<string, SaveAuction> inDb = await GetExistingAuctions(auctions, context);
-
-                var comparer = new BidComparer();
-
-                foreach (var auction in auctions)
+                try
                 {
-                    ProcessAuction(context, inDb, comparer, auction);
+                    using (var context = new HypixelContext())
+                    {
+                        Dictionary<string, SaveAuction> inDb = await GetExistingAuctions(auctions, context);
+
+                        var comparer = new BidComparer();
+
+                        foreach (var auction in auctions)
+                        {
+                            ProcessAuction(context, inDb, comparer, auction);
+                        }
+
+
+                        //Program.AddPlayers (context, playerIds);
+
+                        await context.SaveChangesAsync();
+                        context.Dispose();
+                    }
                 }
-
-
-                //Program.AddPlayers (context, playerIds);
-
-                await context.SaveChangesAsync();
-                context.Dispose();
+                catch (Exception e)
+                {
+                    dev.Logger.Instance.Error(e, "Trying to index batch of " + auctions.Count());
+                }
             }
+
             LastFinish = DateTime.Now;
         }
 

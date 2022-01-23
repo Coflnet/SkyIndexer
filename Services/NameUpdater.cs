@@ -119,8 +119,5 @@ namespace hypixel
                 await context.SaveChangesAsync();
             }
         }
-
-
     }
-
 }

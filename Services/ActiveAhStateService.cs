@@ -179,8 +179,8 @@ namespace Coflnet.Sky.Indexer
                         dev.Logger.Instance.Error(e, "Sending auction " + JsonConvert.SerializeObject(item));
                     }
                 }
-                  p.Flush(TimeSpan.FromSeconds(10));
-                Console.WriteLine("sent to check: " +sumarised.Count());
+                p.Flush(TimeSpan.FromSeconds(10));
+                Console.WriteLine("sent to check: " + sumarised.Count());
             }
         }
     }

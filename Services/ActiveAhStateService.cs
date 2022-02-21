@@ -43,15 +43,15 @@ namespace Coflnet.Sky.Indexer
                 try
                 {
                     var activeAuctions = new System.Collections.Concurrent.ConcurrentDictionary<long, long>(
-                            await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 2500000 && a.End > DateTime.Now)
+                            await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 2500000 && a.End > Now)
                             .Select(a => a.UId)
                             .ToDictionaryAsync(a => a));
                     RecentUpdates.Enqueue(new AhStateSumary()
                     {
                         ActiveAuctions = activeAuctions,
-                        Time = DateTime.Now
+                        Time = Now
                     });
-                    Console.WriteLine("loaded all active auctionids");
+                    Console.WriteLine("loaded all active auctionids " + activeAuctions.Count);
 
                     RequestCheck(await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 25)
                                 .ToListAsync());
@@ -68,16 +68,19 @@ namespace Coflnet.Sky.Indexer
                     {
                         Console.WriteLine("\n-->Consumed update sumary " + sum.Time);
                         using var spancontext = GlobalTracer.Instance.BuildSpan("AhSumaryUpdate").StartActive();
-                        if (sum.Time < DateTime.Now - TimeSpan.FromMinutes(5))
+                        if (sum.Time < Now - TimeSpan.FromMinutes(5))
                             return;
                         RecentUpdates.Enqueue(sum);
 
-                        if (RecentUpdates.Min(r => r.Time) > DateTime.Now - TimeSpan.FromMinutes(4))
+                        if (RecentUpdates.Min(r => r.Time) > Now - TimeSpan.FromMinutes(3))
                             return;
+                        if(RecentUpdates.Count < 6)
+                            return;
+                        
                         List<long> missing = FindInactiveAuctions();
                         await UpdateInactiveAuctions(missing, sum.ActiveAuctions);
 
-                        if (RecentUpdates.Peek().Time < DateTime.Now - TimeSpan.FromMinutes(5))
+                        if (RecentUpdates.Peek().Time < Now - TimeSpan.FromMinutes(5))
                             RecentUpdates.Dequeue();
 
                     }, stoppingToken);
@@ -92,7 +95,7 @@ namespace Coflnet.Sky.Indexer
         private List<long> FindInactiveAuctions()
         {
             var oldest = RecentUpdates.Dequeue();
-            var mostRecent = RecentUpdates.Where(u => u.Time > DateTime.Now - TimeSpan.FromMinutes(3.4)).ToList();
+            var mostRecent = RecentUpdates.Where(u => u.Time > DateTime.UtcNow - TimeSpan.FromMinutes(3.4)).ToList();
             List<long> missing = new List<long>();
             foreach (var item in oldest.ActiveAuctions.Keys)
             {
@@ -125,24 +128,24 @@ namespace Coflnet.Sky.Indexer
                 try
                 {
 
-                    var toUpdate = await context.Auctions.Where(a => missing.Contains(a.UId) && a.End > DateTime.Now).ToListAsync();
+                    var toUpdate = await context.Auctions.Where(a => missing.Contains(a.UId) && a.End > Now).ToListAsync();
                     foreach (var item in toUpdate)
                     {
                         Console.WriteLine("inactive auction " + item.Uuid);
-                        item.End = DateTime.Now;
+                        item.End = Now;
                         context.Update(item);
                     }
                     var sumarised = toUpdate.GroupBy(b => b.AuctioneerId).Select(b => b.First()).ToList();
                     Console.WriteLine("deactivated " + toUpdate.Count());
                     Console.WriteLine("from sellers: " + sumarised.Count());
                     await context.SaveChangesAsync();
-                    var denominator = 6;
-                    var toCheck = activeAuctions.Where(a => a.Key % denominator == DateTime.Now.Minute % denominator).Select(a => a.Key).ToList();
-                    var foundActiveAgain = await context.Auctions.Where(a => toCheck.Contains(a.UId) && a.End < DateTime.Now).ToListAsync();
+                    var denominator = 2;
+                    var toCheck = activeAuctions.Where(a => a.Key % denominator == Now.Minute % denominator).Select(a => a.Key).ToList();
+                    var foundActiveAgain = await context.Auctions.Where(a => toCheck.Contains(a.UId) && a.End < Now).ToListAsync();
                     foreach (var item in foundActiveAgain)
                     {
                         var ticks = activeAuctions.GetValueOrDefault(item.UId);
-                        item.End = ticks > 2 ? new DateTime(ticks) : DateTime.Now + TimeSpan.FromMinutes(10);
+                        item.End = ticks > 2 ? new DateTime(ticks) : Now + TimeSpan.FromMinutes(10);
                         context.Update(item);
                         Console.WriteLine($"reactivated {item.Uuid}  {item.End}");
                     }
@@ -156,6 +159,9 @@ namespace Coflnet.Sky.Indexer
                 }
             }
         }
+
+        private static DateTime Now => DateTime.UtcNow;
+        
 
         private void RequestCheck(List<SaveAuction> sumarised)
         {

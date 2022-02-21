@@ -165,7 +165,7 @@ namespace hypixel
 
         private static async Task ToDb(IEnumerable<SaveAuction> auctions)
         {
-            auctions = auctions.Distinct(new AuctionComparer()).ToList();
+            auctions = auctions.GroupBy(a=>a.UId).Select(g=>g.OrderByDescending(a=>a.Bids.Count).First()).ToList();
             lock (nameof(highestPlayerId))
             {
                 if (highestPlayerId == 1)
@@ -191,12 +191,12 @@ namespace hypixel
                         //Program.AddPlayers (context, playerIds);
 
                         await context.SaveChangesAsync();
-                        context.Dispose();
                     }
                 }
                 catch (Exception e)
                 {
                     dev.Logger.Instance.Error(e, "Trying to index batch of " + auctions.Count());
+                    await Task.Delay(500);
                 }
             }
 
@@ -249,13 +249,6 @@ namespace hypixel
 
         private static void UpdateAuction(HypixelContext context, BidComparer comparer, SaveAuction auction, SaveAuction dbauction)
         {
-            if (auction.AuctioneerId == null)
-            {
-                // an ended auction
-                dbauction.End = auction.End;
-                context.Auctions.Update(dbauction);
-                return;
-            }
             foreach (var bid in auction.Bids)
             {
                 bid.Auction = dbauction;
@@ -264,6 +257,13 @@ namespace hypixel
                     context.Bids.Add(bid);
                     dbauction.HighestBidAmount = auction.HighestBidAmount;
                 }
+            }
+            if (auction.AuctioneerId == null)
+            {
+                // an ended auction
+                dbauction.End = auction.End;
+                context.Auctions.Update(dbauction);
+                return;
             }
             if (auction.Bin)
             {

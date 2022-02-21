@@ -37,9 +37,8 @@ namespace hypixel
                     player.UpdatedAt = DateTime.Now;
                     context.Players.Update(player);
                     nameUpdateCounter.Inc();
+                    updated += await context.SaveChangesAsync();
                 }
-
-                updated = await context.SaveChangesAsync();
             }
             LastUpdate = DateTime.Now;
             updateCount++;

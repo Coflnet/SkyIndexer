@@ -139,7 +139,7 @@ namespace Coflnet.Sky.Indexer
             if(missing.Count > 120)
             {
                 Console.WriteLine("to many went inactive, dropping");
-                return new List<long>();
+                return missing.Take(100).ToList();
             }
 
             return missing;

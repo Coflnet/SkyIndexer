@@ -21,6 +21,8 @@ namespace Coflnet.Sky.Indexer.Controllers
         [HttpPatch]
         public Task<Player> UpdatName(string uuid, string name = null)
         {
+            if(uuid == null || uuid.Length != 32)
+                return null;
             return PlayerService.Instance.UpdatePlayerName(uuid);
         }
     }

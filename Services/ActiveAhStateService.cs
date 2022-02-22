@@ -88,11 +88,11 @@ namespace Coflnet.Sky.Indexer
                             return;
 
                         List<long> missing = FindInactiveAuctions();
-                        if(missing.Count == 0)
+                        if (missing.Count == 0)
                             return;
                         await UpdateInactiveAuctions(missing);
 
-                        if (RecentUpdates.Peek().Time < Now - TimeSpan.FromMinutes(5))
+                        if (RecentUpdates.Peek().Time < Now - TimeSpan.FromMinutes(10))
                             RecentUpdates.Dequeue();
 
                     }, stoppingToken);
@@ -106,11 +106,11 @@ namespace Coflnet.Sky.Indexer
 
         private List<long> FindInactiveAuctions()
         {
-            if(RecentUpdates.Where(u => u.Time > Now - TimeSpan.FromMinutes(4.4)).Count() < 4)
+            if (RecentUpdates.Where(u => u.Time > Now - TimeSpan.FromMinutes(4.4)).Count() < 4)
                 return new List<long>(); // not enough context
-            
+
             var oldest = RecentUpdates.Dequeue();
-            var mostRecent = RecentUpdates.Where(u => u.Time > Now - TimeSpan.FromMinutes(4.4)).ToList();
+            var mostRecent = RecentUpdates.Where(u => u.Time > Now - TimeSpan.FromMinutes(5)).ToList();
             List<long> missing = new List<long>();
             foreach (var item in mostRecent)
             {
@@ -136,11 +136,6 @@ namespace Coflnet.Sky.Indexer
             Console.WriteLine("Total missing " + missing.Count);
             Console.WriteLine("First missing " + missing.FirstOrDefault());
             Console.WriteLine("oldest count " + oldest.ActiveAuctions.Count);
-            if(missing.Count > 120)
-            {
-                Console.WriteLine("to many went inactive, dropping");
-                return missing.Take(100).ToList();
-            }
 
             return missing;
         }
@@ -153,6 +148,12 @@ namespace Coflnet.Sky.Indexer
                 {
 
                     var toUpdate = await context.Auctions.Where(a => missing.Contains(a.UId) && a.End > Now).ToListAsync();
+
+                    if (toUpdate.Count > 60)
+                    {
+                        Console.WriteLine("to many went inactive, dropping");
+                        return;
+                    }
                     foreach (var item in toUpdate)
                     {
                         Console.WriteLine("inactive auction " + item.Uuid);
@@ -177,7 +178,7 @@ namespace Coflnet.Sky.Indexer
             var activeAuctions = sumary.ActiveAuctions;
             var denominator = 1;
             var minUtcTicks = (sumary.Time + TimeSpan.FromMinutes(1.5)).Ticks;
-            var toCheck = activeAuctions.Where(a => a.Value > minUtcTicks && a.Key % denominator == Now.Minute % denominator ).Select(a => a.Key).ToList();
+            var toCheck = activeAuctions.Where(a => a.Value > minUtcTicks && a.Key % denominator == Now.Minute % denominator).Select(a => a.Key).ToList();
             var almostEnded = activeAuctions.Where(a => a.Value < minUtcTicks);
             Console.WriteLine($"No need to reactivate almost expired {almostEnded.Count()} {almostEnded.FirstOrDefault().Key}");
             // maximimum time considered in the past to require reactivation (sells can take up to 2 minutes to be saved)

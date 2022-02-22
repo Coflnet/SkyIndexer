@@ -35,7 +35,7 @@ namespace Coflnet.Sky.Indexer
             LingerMs = 100,
         };
 
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        private async Task LoadActiveFromDb()
         {
             using (var context = new hypixel.HypixelContext())
             {
@@ -61,19 +61,25 @@ namespace Coflnet.Sky.Indexer
                     dev.Logger.Instance.Error(e, "loading active auctionids");
                 }
             }
+        }
+
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            await LoadActiveFromDb();
+
             while (!stoppingToken.IsCancellationRequested)
                 try
                 {
                     await Kafka.KafkaConsumer.Consume<AhStateSumary>(hypixel.Program.KafkaHost, config["TOPICS:AH_SUMARY"], async sum =>
                     {
-                        Console.WriteLine("\n-->Consumed update sumary " + sum.Time);
+                        Console.WriteLine($"\n-->Consumed update sumary {sum.Time} {sum.ActiveAuctions.Count}");
                         using var spancontext = GlobalTracer.Instance.BuildSpan("AhSumaryUpdate").StartActive();
                         if (sum.Time < Now - TimeSpan.FromMinutes(5))
                             return;
                         RecentUpdates.Enqueue(sum);
                         using (var context = new HypixelContext())
                         {
-                            await ReactiveFalsyDeactivated(sum.ActiveAuctions, context);
+                            await ReactiveFalsyDeactivated(sum, context);
                         }
 
                         if (RecentUpdates.Min(r => r.Time) > Now - TimeSpan.FromMinutes(4))
@@ -82,6 +88,8 @@ namespace Coflnet.Sky.Indexer
                             return;
 
                         List<long> missing = FindInactiveAuctions();
+                        if(missing.Count == 0)
+                            return;
                         await UpdateInactiveAuctions(missing);
 
                         if (RecentUpdates.Peek().Time < Now - TimeSpan.FromMinutes(5))
@@ -98,9 +106,16 @@ namespace Coflnet.Sky.Indexer
 
         private List<long> FindInactiveAuctions()
         {
+            if(RecentUpdates.Where(u => u.Time > Now - TimeSpan.FromMinutes(4.4)).Count() < 4)
+                return new List<long>(); // not enough context
+            
             var oldest = RecentUpdates.Dequeue();
             var mostRecent = RecentUpdates.Where(u => u.Time > Now - TimeSpan.FromMinutes(4.4)).ToList();
             List<long> missing = new List<long>();
+            foreach (var item in mostRecent)
+            {
+                Console.WriteLine($"Checking part with time {item.Time} {item.ActiveAuctions.Count()}");
+            }
             foreach (var item in oldest.ActiveAuctions.Keys)
             {
                 var exists = false;
@@ -121,6 +136,11 @@ namespace Coflnet.Sky.Indexer
             Console.WriteLine("Total missing " + missing.Count);
             Console.WriteLine("First missing " + missing.FirstOrDefault());
             Console.WriteLine("oldest count " + oldest.ActiveAuctions.Count);
+            if(missing.Count > 120)
+            {
+                Console.WriteLine("to many went inactive, dropping");
+                return new List<long>();
+            }
 
             return missing;
         }
@@ -152,14 +172,17 @@ namespace Coflnet.Sky.Indexer
             }
         }
 
-        private static async Task ReactiveFalsyDeactivated(ConcurrentDictionary<long, long> activeAuctions, HypixelContext context)
+        private static async Task ReactiveFalsyDeactivated(AhStateSumary sumary, HypixelContext context)
         {
-            var denominator = 2;
-            var minUtcTicks = (Now + TimeSpan.FromMinutes(1.5)).Ticks;
+            var activeAuctions = sumary.ActiveAuctions;
+            var denominator = 1;
+            var minUtcTicks = (sumary.Time + TimeSpan.FromMinutes(1.5)).Ticks;
             var toCheck = activeAuctions.Where(a => a.Value > minUtcTicks && a.Key % denominator == Now.Minute % denominator ).Select(a => a.Key).ToList();
             var almostEnded = activeAuctions.Where(a => a.Value < minUtcTicks);
             Console.WriteLine($"No need to reactivate almost expired {almostEnded.Count()} {almostEnded.FirstOrDefault().Key}");
-            var foundActiveAgain = await context.Auctions.Where(a => toCheck.Contains(a.UId) && a.End < Now).ToListAsync();
+            // maximimum time considered in the past to require reactivation (sells can take up to 2 minutes to be saved)
+            var maxExpiry = Now - TimeSpan.FromMinutes(1.5);
+            var foundActiveAgain = await context.Auctions.Where(a => toCheck.Contains(a.UId) && a.End < maxExpiry).ToListAsync();
             foreach (var item in foundActiveAgain)
             {
                 var ticks = activeAuctions.GetValueOrDefault(item.UId);

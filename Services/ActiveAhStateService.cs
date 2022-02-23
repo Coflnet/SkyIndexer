@@ -82,7 +82,7 @@ namespace Coflnet.Sky.Indexer
                             await ReactiveFalsyDeactivated(sum, context);
                         }
 
-                        if (RecentUpdates.Min(r => r.Time) > Now - TimeSpan.FromMinutes(4))
+                        if (RecentUpdates.Min(r => r.Time) > Now - TimeSpan.FromMinutes(5))
                             return;
                         if (RecentUpdates.Count < 6)
                             return;

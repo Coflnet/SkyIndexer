@@ -2,6 +2,7 @@ using System.Threading.Tasks;
 using hypixel;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using RestSharp;
 
 namespace Coflnet.Sky.Indexer.Controllers
 {
@@ -19,11 +20,16 @@ namespace Coflnet.Sky.Indexer.Controllers
 
         [Route("{uuid}")]
         [HttpPatch]
-        public Task<Player> UpdatName(string uuid, string name = null)
+        public async Task<Player> UpdatName(string uuid, string name = null)
         {
             if(uuid == null || uuid.Length != 32)
                 return null;
-            return PlayerService.Instance.UpdatePlayerName(uuid);
+            var client = new RestClient("https://playerdb.co/api/player/minecraft/");
+            var result = await client.ExecuteAsync(new RestRequest(uuid));
+            if(result.StatusCode != System.Net.HttpStatusCode.OK)
+                throw new CoflnetException("invalid_uuid", "There was no player with the given uuid found");
+            return await PlayerService.Instance.UpdatePlayerName(uuid);
+
         }
     }
 }

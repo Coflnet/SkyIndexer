@@ -114,7 +114,7 @@ namespace Coflnet.Sky.Indexer
             List<long> missing = new List<long>();
             foreach (var item in mostRecent)
             {
-                Console.WriteLine($"Checking part with time {item.Time} {item.ActiveAuctions.Count()}");
+                Console.WriteLine($"Checking part with time {item.Time} {item.Part} {item.ActiveAuctions.Count()} ");
             }
             foreach (var item in oldest.ActiveAuctions.Keys)
             {
@@ -151,8 +151,8 @@ namespace Coflnet.Sky.Indexer
 
                     if (toUpdate.Count > 60)
                     {
-                        Console.WriteLine("to many went inactive, dropping");
-                        return;
+                        Console.WriteLine($"to many went inactive {toUpdate.Count}, dropping");
+                        toUpdate = toUpdate.Take(30).ToList();
                     }
                     foreach (var item in toUpdate)
                     {

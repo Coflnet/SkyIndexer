@@ -16,10 +16,14 @@ namespace Coflnet.Sky.Indexer.Controllers
             _logger = logger;
         }
 
-
+        /// <summary>
+        /// Adds a user to the database
+        /// </summary>
+        /// <param name="user"></param>
+        /// <returns></returns>
         [Route("")]
         [HttpPost]
-        public GoogleUser LastUpdate([FromBody] GoogleUser user)
+        public GoogleUser CreateUser([FromBody] GoogleUser user)
         {
             return UserService.Instance.GetOrCreateUser(user.GoogleId, user.Email);
         }

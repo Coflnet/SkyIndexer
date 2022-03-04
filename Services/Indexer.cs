@@ -255,9 +255,11 @@ namespace hypixel
                 if (!dbauction.Bids.Contains(bid, comparer))
                 {
                     context.Bids.Add(bid);
-                    dbauction.HighestBidAmount = auction.HighestBidAmount;
                 }
             }
+            if(dbauction.HighestBidAmount < auction.HighestBidAmount)
+                dbauction.HighestBidAmount = auction.HighestBidAmount;
+
             if (auction.AuctioneerId == null)
             {
                 // an ended auction

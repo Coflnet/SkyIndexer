@@ -25,7 +25,8 @@ namespace Coflnet.Sky.Indexer.Controllers
         [HttpPost]
         public GoogleUser CreateUser([FromBody] GoogleUser user)
         {
-            return UserService.Instance.GetOrCreateUser(user.GoogleId, user.Email);
+            lock (user.Email)
+                return UserService.Instance.GetOrCreateUser(user.GoogleId, user.Email);
         }
     }
 }

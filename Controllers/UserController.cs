@@ -1,4 +1,6 @@
 using System;
+using System.Threading;
+using System.Threading.Tasks;
 using hypixel;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -10,6 +12,7 @@ namespace Coflnet.Sky.Indexer.Controllers
     public class UserController : ControllerBase
     {
         private readonly ILogger<UserController> _logger;
+        private SemaphoreSlim creationLock = new(1);
 
         public UserController(ILogger<UserController> logger)
         {
@@ -23,10 +26,17 @@ namespace Coflnet.Sky.Indexer.Controllers
         /// <returns></returns>
         [Route("")]
         [HttpPost]
-        public GoogleUser CreateUser([FromBody] GoogleUser user)
+        public async Task<GoogleUser> CreateUser([FromBody] GoogleUser user)
         {
-            lock (user.Email)
+            try
+            {
+                await creationLock.WaitAsync();
                 return UserService.Instance.GetOrCreateUser(user.GoogleId, user.Email);
+            }
+            finally
+            {
+                creationLock.Release();
+            }
         }
     }
 }

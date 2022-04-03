@@ -156,7 +156,8 @@ namespace Coflnet.Sky.Indexer
                     }
                     foreach (var item in toUpdate)
                     {
-                        Console.WriteLine("inactive auction " + item.Uuid);
+                        if (item.UId % 3 == 0)
+                            Console.WriteLine("inactive auction " + item.Uuid);
                         item.End = Now;
                         context.Update(item);
                     }

@@ -198,6 +198,8 @@ namespace Coflnet.Sky.Indexer
                 {
                     dev.Logger.Instance.Error(e, "Trying to index batch of " + auctions.Count());
                     await Task.Delay(500);
+                    if(i >=4)
+                        throw e;
                 }
             }
 

@@ -31,8 +31,6 @@ namespace Coflnet.Sky.Indexer
             Coflnet.Sky.Core.Program.RunIsolatedForever(async () =>
             {
                 await Indexer.ProcessQueue(System.Threading.CancellationToken.None);
-                //await Coflnet.Sky.Core.Indexer.LastHourIndex();
-
             }, "An error occured while indexing");
             Coflnet.Sky.Core.Program.RunIsolatedForever(Numberer.NumberUsers, "Error occured while userIndexing");
             //NameUpdater.Run();

@@ -14,7 +14,6 @@ namespace Coflnet.Sky.Indexer
 {
     public class Program
     {
-        static string apiKey = SimplerConfig.Config.Instance["apiKey"];
         public static void Main(string[] args)
         {
             // migrations

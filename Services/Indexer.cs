@@ -10,8 +10,9 @@ using Confluent.Kafka;
 using dev;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
+using Coflnet.Sky.Core;
 
-namespace hypixel
+namespace Coflnet.Sky.Indexer
 {
     public class Indexer
     {
@@ -48,7 +49,7 @@ namespace hypixel
             if (!Directory.Exists(pullPath) && !Directory.Exists(targetTmp))
             {
                 // update first
-                if (!Program.FullServerMode)
+                if (!Sky.Core.Program.FullServerMode)
                     Console.WriteLine("nothing to build indexes from, run again with option u first");
                 return;
             }
@@ -71,7 +72,7 @@ namespace hypixel
                         break;
                 }
 
-                Console.WriteLine($"Indexing done, Indexed: {count} NameRequests: {Program.RequestsSinceStart}");
+                Console.WriteLine($"Indexing done, Indexed: {count} NameRequests: {Sky.Core.Program.RequestsSinceStart}");
 
                 if (!abort)
                     // successful made this index save the startTime
@@ -101,7 +102,7 @@ namespace hypixel
                     try
                     {
                         await Coflnet.Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
-                            Program.KafkaHost,
+                            Sky.Core.Program.KafkaHost,
                             topic,
                             ToDb,
                             token.Token,
@@ -122,7 +123,7 @@ namespace hypixel
         private static void VariableSetup(out DateTime indexStart, out string targetTmp, out string pullPath)
         {
             indexStart = DateTime.Now;
-            if (!Program.FullServerMode)
+            if (!Sky.Core.Program.FullServerMode)
                 Console.WriteLine($"{indexStart}");
             var lastIndexStart = new DateTime(2020, 4, 25);
             if (FileController.Exists("lastIndex"))
@@ -237,7 +238,7 @@ namespace hypixel
 
                 count++;
                 if (!minimumOutput && count % 50 == 0)
-                    Console.Write($"\r         Indexed: {count} NameRequests: {Program.RequestsSinceStart}");
+                    Console.Write($"\r         Indexed: {count} NameRequests: {Sky.Core.Program.RequestsSinceStart}");
 
             }
             catch (Exception e)

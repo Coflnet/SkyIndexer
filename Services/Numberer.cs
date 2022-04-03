@@ -2,8 +2,9 @@ using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
+using Coflnet.Sky.Core;
 
-namespace hypixel
+namespace Coflnet.Sky.Indexer
 {
     public class Numberer
     {
@@ -123,6 +124,8 @@ namespace hypixel
             if (auction.ItemId == 0)
             {
                 var id = ItemDetails.Instance.GetOrCreateItemIdForAuction(auction, context);
+                if(id == 0)
+                    dev.Logger.Instance.Error("could not get itemid for " + auction.UId);
                 auction.ItemId = id;
 
 
@@ -173,7 +176,7 @@ namespace hypixel
             var id = context.Players.Where(p => p.UuId == uuid).Select(p => p.Id).FirstOrDefault();
             if (id == 0)
             {
-                id = Program.AddPlayer(context, uuid, ref Indexer.highestPlayerId);
+                id = Sky.Core.Program.AddPlayer(context, uuid, ref Indexer.highestPlayerId);
                 if (id != 0 && id % 10 == 0)
                     Console.WriteLine($"Adding player {id} {uuid} {Indexer.highestPlayerId}");
             }

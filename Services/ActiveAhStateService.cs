@@ -5,7 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Confluent.Kafka;
-using hypixel;
+using Coflnet.Sky.Core;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
@@ -37,7 +37,7 @@ namespace Coflnet.Sky.Indexer
 
         private async Task LoadActiveFromDb()
         {
-            using (var context = new hypixel.HypixelContext())
+            using (var context = new HypixelContext())
             {
                 using var spancontext = GlobalTracer.Instance.BuildSpan("LoadActive").StartActive();
                 try
@@ -70,7 +70,7 @@ namespace Coflnet.Sky.Indexer
             while (!stoppingToken.IsCancellationRequested)
                 try
                 {
-                    await Kafka.KafkaConsumer.Consume<AhStateSumary>(hypixel.Program.KafkaHost, config["TOPICS:AH_SUMARY"], async sum =>
+                    await Kafka.KafkaConsumer.Consume<AhStateSumary>(Sky.Core.Program.KafkaHost, config["TOPICS:AH_SUMARY"], async sum =>
                     {
                         Console.WriteLine($"\n-->Consumed update sumary {sum.Time} {sum.ActiveAuctions.Count}");
                         using var spancontext = GlobalTracer.Instance.BuildSpan("AhSumaryUpdate").StartActive();
@@ -142,7 +142,7 @@ namespace Coflnet.Sky.Indexer
 
         private async Task UpdateInactiveAuctions(List<long> missing)
         {
-            using (var context = new hypixel.HypixelContext())
+            using (var context = new HypixelContext())
             {
                 try
                 {

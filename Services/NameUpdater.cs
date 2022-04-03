@@ -3,8 +3,9 @@ using System.Collections.Concurrent;
 using System.Linq;
 using System.Threading.Tasks;
 using dev;
+using Coflnet.Sky.Core;
 
-namespace hypixel
+namespace Coflnet.Sky.Indexer
 {
     public class NameUpdater
     {
@@ -32,7 +33,7 @@ namespace hypixel
 
                 foreach (var player in players)
                 {
-                    player.Name = await Program.GetPlayerNameFromUuid(player.UuId);
+                    player.Name = await Sky.Core.Program.GetPlayerNameFromUuid(player.UuId);
                     player.ChangedFlag = false;
                     player.UpdatedAt = DateTime.Now;
                     context.Players.Update(player);
@@ -97,7 +98,7 @@ namespace hypixel
                         context.Players.Update(player);
                         continue;
                     }
-                    Program.AddPlayer(context, result.Uuid, ref Indexer.highestPlayerId, result.Name);
+                    Sky.Core.Program.AddPlayer(context, result.Uuid, ref Indexer.highestPlayerId, result.Name);
                 }
                 context.SaveChanges();
             }

@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using hypixel;
+using Coflnet.Sky.Core;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -23,19 +23,18 @@ namespace Coflnet.Sky.Indexer
                 context.Database.Migrate();
             }
             ItemDetails.Instance.LoadFromDB();
-            Task.Run(hypixel.Program.MakeSureRedisIsInitialized);
+            Task.Run(Coflnet.Sky.Core.Program.MakeSureRedisIsInitialized);
 
             Console.WriteLine("booting db dependend stuff");
-            var bazaar = new dev.BazaarIndexer();
-            hypixel.Program.RunIsolatedForever(bazaar.ProcessBazaarQueue, "bazaar queue");
-            hypixel.Indexer.LoadFromDB();
-            hypixel.Program.RunIsolatedForever(async () =>
+            
+            Indexer.LoadFromDB();
+            Coflnet.Sky.Core.Program.RunIsolatedForever(async () =>
             {
-                await hypixel.Indexer.ProcessQueue(System.Threading.CancellationToken.None);
-                //await hypixel.Indexer.LastHourIndex();
+                await Indexer.ProcessQueue(System.Threading.CancellationToken.None);
+                //await Coflnet.Sky.Core.Indexer.LastHourIndex();
 
             }, "An error occured while indexing");
-            hypixel.Program.RunIsolatedForever(Numberer.NumberUsers, "Error occured while userIndexing");
+            Coflnet.Sky.Core.Program.RunIsolatedForever(Numberer.NumberUsers, "Error occured while userIndexing");
             //NameUpdater.Run();
             Task.Run(async () =>
             {
@@ -46,7 +45,7 @@ namespace Coflnet.Sky.Indexer
 
             /*try
             {
-                hypixel.Program.CleanDB();
+                Coflnet.Sky.Core.Program.CleanDB();
             }
             catch (Exception e)
             {

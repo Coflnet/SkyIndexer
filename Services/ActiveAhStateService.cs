@@ -112,10 +112,7 @@ namespace Coflnet.Sky.Indexer
             var oldest = RecentUpdates.Dequeue();
             var mostRecent = RecentUpdates.Where(u => u.Time > Now - TimeSpan.FromMinutes(5)).ToList();
             List<long> missing = new List<long>();
-            foreach (var item in mostRecent)
-            {
-                Console.WriteLine($"Checking part with time {item.Time} {item.Part} {item.ActiveAuctions.Count()} ");
-            }
+            Console.WriteLine($"Checking parts {mostRecent.Count()} with time {mostRecent.First().Time} avg part counts: {string.Join(',',mostRecent.GroupBy(m=>m.Part).Select(m=>m.Average(d=>d.ActiveAuctions.Count())))} ");
             foreach (var item in oldest.ActiveAuctions.Keys)
             {
                 var exists = false;
@@ -156,7 +153,7 @@ namespace Coflnet.Sky.Indexer
                     }
                     foreach (var item in toUpdate)
                     {
-                        if (item.UId % 3 == 0)
+                        if (item.UId % 5 == 0)
                             Console.WriteLine("inactive auction " + item.Uuid);
                         item.End = Now;
                         context.Update(item);

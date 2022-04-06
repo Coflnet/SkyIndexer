@@ -25,7 +25,7 @@ namespace Coflnet.Sky.Indexer
             Task.Run(Coflnet.Sky.Core.Program.MakeSureRedisIsInitialized);
 
             Console.WriteLine("booting db dependend stuff");
-            
+
             Indexer.LoadFromDB();
             Coflnet.Sky.Core.Program.RunIsolatedForever(async () =>
             {
@@ -36,7 +36,15 @@ namespace Coflnet.Sky.Indexer
             Task.Run(async () =>
             {
                 await Task.Delay(TimeSpan.FromMinutes(3));
-                await ItemPrices.Instance.BackfillPrices();
+                try
+                {
+                    await ItemPrices.Instance.BackfillPrices();
+
+                }
+                catch (Exception e)
+                {
+                    dev.Logger.Instance.Error(e, "Item Backfill failed");
+                }
             }).ConfigureAwait(false);
             NameUpdater.Run();
 

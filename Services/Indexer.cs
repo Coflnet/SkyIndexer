@@ -166,7 +166,7 @@ namespace Coflnet.Sky.Indexer
 
         private static async Task ToDb(IEnumerable<SaveAuction> auctions)
         {
-            auctions = auctions.GroupBy(a=>a.UId).Select(g=>g.OrderByDescending(a=>a.Bids.Count).First()).ToList();
+            auctions = auctions.GroupBy(a => a.UId).Select(g => g.OrderByDescending(a => a.Bids.Count).First()).ToList();
             lock (nameof(highestPlayerId))
             {
                 if (highestPlayerId == 1)
@@ -191,14 +191,15 @@ namespace Coflnet.Sky.Indexer
 
                         //Program.AddPlayers (context, playerIds);
 
-                        await context.SaveChangesAsync();
+                        var count = await context.SaveChangesAsync();
+                        insertCount.Inc(count);
                     }
                 }
                 catch (Exception e)
                 {
                     dev.Logger.Instance.Error(e, "Trying to index batch of " + auctions.Count());
                     await Task.Delay(500);
-                    if(i >=4)
+                    if (i >= 4)
                         throw e;
                 }
             }
@@ -223,7 +224,6 @@ namespace Coflnet.Sky.Indexer
                         Logger.Instance.Error($"auction removed bevore in db " + auction.Uuid);
                         return;
                     }
-                    context.Auctions.Add(auction);
                     try
                     {
                         if (auction.NBTLookup == null || auction.NBTLookup.Count() == 0)
@@ -234,7 +234,7 @@ namespace Coflnet.Sky.Indexer
                         Logger.Instance.Error($"Error on CreateLookup: {e.Message} \n{e.StackTrace} \n{JSON.Stringify(auction.NbtData.Data)}");
                         throw e;
                     }
-                    insertCount.Inc();
+                    context.Auctions.Add(auction);
 
                 }
 
@@ -260,7 +260,7 @@ namespace Coflnet.Sky.Indexer
                     context.Bids.Add(bid);
                 }
             }
-            if(dbauction.HighestBidAmount < auction.HighestBidAmount)
+            if (dbauction.HighestBidAmount < auction.HighestBidAmount)
                 dbauction.HighestBidAmount = auction.HighestBidAmount;
 
             if (auction.AuctioneerId == null)

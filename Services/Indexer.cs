@@ -260,8 +260,12 @@ namespace Coflnet.Sky.Indexer
                     context.Bids.Add(bid);
                 }
             }
-            if (dbauction.HighestBidAmount < auction.HighestBidAmount)
-                dbauction.HighestBidAmount = auction.HighestBidAmount;
+            var highestBid = auction.HighestBidAmount;
+            // special case sometimes highest bid is not set
+            if(highestBid == 0 && auction.Bids.Count > 0)
+                highestBid = auction.Bids.Max(b=>b.Amount);
+            if (dbauction.HighestBidAmount < highestBid)
+                dbauction.HighestBidAmount = highestBid;
 
             if (auction.AuctioneerId == null)
             {

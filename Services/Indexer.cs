@@ -193,6 +193,8 @@ namespace Coflnet.Sky.Indexer
 
                         var count = await context.SaveChangesAsync();
                         insertCount.Inc(count);
+                        LastFinish = DateTime.Now;
+                        return;
                     }
                 }
                 catch (Exception e)
@@ -204,7 +206,6 @@ namespace Coflnet.Sky.Indexer
                 }
             }
 
-            LastFinish = DateTime.Now;
         }
 
         private static void ProcessAuction(HypixelContext context, Dictionary<string, SaveAuction> inDb, BidComparer comparer, SaveAuction auction)
@@ -262,8 +263,8 @@ namespace Coflnet.Sky.Indexer
             }
             var highestBid = auction.HighestBidAmount;
             // special case sometimes highest bid is not set
-            if(highestBid == 0 && auction.Bids.Count > 0)
-                highestBid = auction.Bids.Max(b=>b.Amount);
+            if (highestBid == 0 && auction.Bids.Count > 0)
+                highestBid = auction.Bids.Max(b => b.Amount);
             if (dbauction.HighestBidAmount < highestBid)
                 dbauction.HighestBidAmount = highestBid;
 

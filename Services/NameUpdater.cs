@@ -110,7 +110,7 @@ namespace Coflnet.Sky.Indexer
             using (var context = new HypixelContext())
             {
                 var players = context.Players.Where(p => p.Id > 0)
-                    .OrderBy(p => p.UpdatedAt).Take(30);
+                    .OrderBy(p => p.UpdatedAt).Take(50);
                 foreach (var p in players)
                 {
                     p.ChangedFlag = true;

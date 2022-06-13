@@ -16,7 +16,7 @@ namespace Coflnet.Sky.Indexer
             {
                 for (int i = 0; i < 3; i++)
                 {
-                    var doublePlayersId = await context.Players.GroupBy(p => p.Id).Where(p => p.Count() > 1).Select(p => p.Key).FirstOrDefaultAsync();
+                    var doublePlayersId = await context.Players.Where(p=>p.Id > 2_000_000).GroupBy(p => p.Id).Where(p => p.Count() > 1).Select(p => p.Key).FirstOrDefaultAsync();
                     if (doublePlayersId == 0)
                         break;
 
@@ -60,7 +60,7 @@ namespace Coflnet.Sky.Indexer
                 await bidNumberTask;
 
             // give the db a moment to store everything
-            await Task.Delay(2000);
+            await Task.Delay(5000);
 
         }
 

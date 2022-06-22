@@ -106,7 +106,8 @@ namespace Coflnet.Sky.Indexer
                             topic,
                             ToDb,
                             token.Token,
-                            "sky-indexer"
+                            "sky-indexer",
+                            80
                             );
                     }
                     catch (Exception e)
@@ -187,9 +188,6 @@ namespace Coflnet.Sky.Indexer
                         {
                             ProcessAuction(context, inDb, comparer, auction);
                         }
-
-
-                        //Program.AddPlayers (context, playerIds);
 
                         var count = await context.SaveChangesAsync();
                         insertCount.Inc(count);

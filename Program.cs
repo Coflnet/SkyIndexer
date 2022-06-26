@@ -48,6 +48,30 @@ namespace Coflnet.Sky.Indexer
             }).ConfigureAwait(false);
             NameUpdater.Run();
 
+            Coflnet.Sky.Core.Program.RunIsolatedForever(async () =>
+            {
+                if (System.Net.Dns.GetHostName().Contains("ekwav"))
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(3));
+                    return;
+                }
+                while (true)
+                {
+                    using var context = new HypixelContext();
+                    var pulls = await context.BazaarPull
+                            .Where(p => p.Id > 3437504)
+                            .Include(p => p.Products).ThenInclude(p => p.SellSummary)
+                            .Include(p => p.Products).ThenInclude(p => p.BuySummery)
+                            .Include(p => p.Products).ThenInclude(p => p.QuickStatus)
+                            .Take(2).ToListAsync();
+                    if(pulls.Count == 0)
+                        throw new TaskCanceledException();
+                    context.RemoveRange(pulls);
+                    var x = await context.SaveChangesAsync();
+                    Console.WriteLine("removed " + x);
+                }
+            }, "Bazaar delete failed");
+
             /*try
             {
                 Coflnet.Sky.Core.Program.CleanDB();

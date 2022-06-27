@@ -63,7 +63,7 @@ namespace Coflnet.Sky.Indexer
                             .Include(p => p.Products).ThenInclude(p => p.SellSummary)
                             .Include(p => p.Products).ThenInclude(p => p.BuySummery)
                             .Include(p => p.Products).ThenInclude(p => p.QuickStatus)
-                            .Take(2).ToListAsync();
+                            .Take(5).ToListAsync();
                     if(pulls.Count == 0)
                         throw new TaskCanceledException();
                     context.RemoveRange(pulls);

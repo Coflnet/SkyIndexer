@@ -203,7 +203,6 @@ namespace Coflnet.Sky.Indexer
                         throw e;
                 }
             }
-
         }
 
         private static void ProcessAuction(HypixelContext context, Dictionary<string, SaveAuction> inDb, BidComparer comparer, SaveAuction auction)

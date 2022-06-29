@@ -70,8 +70,8 @@ namespace Coflnet.Sky.Indexer
                     foreach (var pull in pulls)
                     {
                         context.RemoveRange(pull.Products);
-                        context.RemoveRange(pull.Products.Select(p => p.SellSummary));
-                        context.RemoveRange(pull.Products.Select(p => p.BuySummery));
+                        context.RemoveRange(pull.Products.SelectMany(p => p.SellSummary));
+                        context.RemoveRange(pull.Products.SelectMany(p => p.BuySummery));
                         context.RemoveRange(pull.Products.Select(p => p.QuickStatus));
                     }
                     var x = await context.SaveChangesAsync();

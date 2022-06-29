@@ -67,6 +67,13 @@ namespace Coflnet.Sky.Indexer
                     if(pulls.Count == 0)
                         throw new TaskCanceledException();
                     context.RemoveRange(pulls);
+                    foreach (var pull in pulls)
+                    {
+                        context.RemoveRange(pull.Products);
+                        context.RemoveRange(pull.Products.Select(p => p.SellSummary));
+                        context.RemoveRange(pull.Products.Select(p => p.BuySummery));
+                        context.RemoveRange(pull.Products.Select(p => p.QuickStatus));
+                    }
                     var x = await context.SaveChangesAsync();
                     Console.WriteLine($"removed {pulls.FirstOrDefault()?.Products.FirstOrDefault().Id} " + x);
                 }

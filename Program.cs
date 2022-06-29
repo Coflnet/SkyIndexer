@@ -64,18 +64,21 @@ namespace Coflnet.Sky.Indexer
                             .Include(p => p.Products).ThenInclude(p => p.BuySummery)
                             .Include(p => p.Products).ThenInclude(p => p.QuickStatus)
                             .Take(5).ToListAsync();
-                    if(pulls.Count == 0)
+                    if (pulls.Count == 0)
                         throw new TaskCanceledException();
                     context.RemoveRange(pulls);
                     foreach (var pull in pulls)
                     {
-                        context.RemoveRange(pull.Products);
-                        context.RemoveRange(pull.Products.SelectMany(p => p.SellSummary));
-                        context.RemoveRange(pull.Products.SelectMany(p => p.BuySummery));
-                        context.RemoveRange(pull.Products.Select(p => p.QuickStatus));
+                        var products = pull.Products;
+                        MarkAllForDeletion(context, products);
                     }
                     var x = await context.SaveChangesAsync();
                     Console.WriteLine($"removed {pulls.FirstOrDefault()?.Products.FirstOrDefault().Id} " + x);
+                    
+                    var productsWithNoPull = await context.BazaarPrices.Where(p => p.PullInstance == null).Include(p => p.SellSummary).Include(p => p.BuySummery).Include(p => p.QuickStatus).Take(500).ToListAsync();
+                    MarkAllForDeletion(context, productsWithNoPull);
+                    var y = await context.SaveChangesAsync();
+                    Console.WriteLine($"removed {productsWithNoPull.FirstOrDefault().Id} " + y);
                 }
             }, "Bazaar delete failed");
 
@@ -88,6 +91,14 @@ namespace Coflnet.Sky.Indexer
                 Console.WriteLine($"Cleaning failed {e.Message}");
             }*/
             CreateHostBuilder(args).Build().Run();
+        }
+
+        private static void MarkAllForDeletion(HypixelContext context, List<dev.ProductInfo> products)
+        {
+            context.RemoveRange(products);
+            context.RemoveRange(products.SelectMany(p => p.SellSummary));
+            context.RemoveRange(products.SelectMany(p => p.BuySummery));
+            context.RemoveRange(products.Select(p => p.QuickStatus));
         }
 
         public static IHostBuilder CreateHostBuilder(string[] args) =>

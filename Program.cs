@@ -74,7 +74,8 @@ namespace Coflnet.Sky.Indexer
                     }
                     var x = await context.SaveChangesAsync();
                     Console.WriteLine($"removed {pulls.FirstOrDefault()?.Products.FirstOrDefault().Id} " + x);
-                    
+
+                    continue;
                     var productsWithNoPull = await context.BazaarPrices.Where(p => p.Id > 285053670).Include(p => p.SellSummary).Include(p => p.BuySummery).Include(p => p.QuickStatus).Take(500).ToListAsync();
                     MarkAllForDeletion(context, productsWithNoPull);
                     var y = await context.SaveChangesAsync();

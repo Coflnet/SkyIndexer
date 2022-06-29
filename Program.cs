@@ -68,7 +68,7 @@ namespace Coflnet.Sky.Indexer
                         throw new TaskCanceledException();
                     context.RemoveRange(pulls);
                     var x = await context.SaveChangesAsync();
-                    Console.WriteLine("removed " + x);
+                    Console.WriteLine($"removed {pulls.FirstOrDefault()?.Products.FirstOrDefault().Id} " + x);
                 }
             }, "Bazaar delete failed");
 

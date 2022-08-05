@@ -1,8 +1,10 @@
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using Coflnet.Sky.Core;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using RestSharp;
+using StackExchange.Redis;
 
 namespace Coflnet.Sky.Indexer.Controllers
 {
@@ -11,10 +13,12 @@ namespace Coflnet.Sky.Indexer.Controllers
     public class PlayerController : ControllerBase
     {
         private readonly ILogger<PlayerController> _logger;
+        private readonly NameUpdateService nameUpdateService;
 
-        public PlayerController(ILogger<PlayerController> logger)
+        public PlayerController(ILogger<PlayerController> logger, NameUpdateService nameUpdateService)
         {
             _logger = logger;
+            this.nameUpdateService = nameUpdateService;
         }
 
 
@@ -30,6 +34,11 @@ namespace Coflnet.Sky.Indexer.Controllers
                 throw new CoflnetException("invalid_uuid", "There was no player with the given uuid found");
             return await PlayerService.Instance.UpdatePlayerName(uuid);
 
+        }
+
+        public async Task<IEnumerable<Player>> GetPlayersToUpdate(int count = 10)
+        {
+            return await nameUpdateService.GetPlayersToUpdate(count);
         }
     }
 }

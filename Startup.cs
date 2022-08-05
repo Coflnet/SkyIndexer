@@ -7,6 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.OpenApi.Models;
 using Prometheus;
+using StackExchange.Redis;
 
 namespace Coflnet.Sky.Indexer
 {
@@ -32,7 +33,11 @@ namespace Coflnet.Sky.Indexer
 
             services.AddDbContext<HypixelContext>();
             services.AddSingleton<ActiveAhStateService>();
-            services.AddHostedService<ActiveAhStateService>(a=>a.GetRequiredService<ActiveAhStateService>());
+            services.AddHostedService<ActiveAhStateService>(a => a.GetRequiredService<ActiveAhStateService>());
+
+            var redisOptions = ConfigurationOptions.Parse(Configuration["REDIS_HOST"]);
+            services.AddSingleton<IConnectionMultiplexer>(provider => ConnectionMultiplexer.Connect(redisOptions));
+            services.AddSingleton<NameUpdateService>();
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.

@@ -197,8 +197,20 @@ namespace Coflnet.Sky.Indexer
                 }
                 catch (Exception e)
                 {
+                    dev.Logger.Instance.Error("failed save once, retrying");
+                    if(i > 0)
                     dev.Logger.Instance.Error(e, "Trying to index batch of " + auctions.Count());
                     await Task.Delay(500);
+                    if (i == 3)
+                    {
+                        if (auctions.Count() == 1)
+                            dev.Logger.Instance.Error("Could not save this auction " + JsonConvert.SerializeObject(auctions));
+                        else
+                        {
+                            await ToDb(auctions.Take(auctions.Count() / 2));
+                            await ToDb(auctions.Skip(auctions.Count() / 2));
+                        }
+                    }
                     if (i >= 4)
                         throw e;
                 }

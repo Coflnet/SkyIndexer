@@ -48,6 +48,7 @@ namespace Coflnet.Sky.Indexer
             }).ConfigureAwait(false);
             NameUpdater.Run();
 
+                    /*
             Coflnet.Sky.Core.Program.RunIsolatedForever(async () =>
             {
                 if (System.Net.Dns.GetHostName().Contains("ekwav"))
@@ -57,8 +58,7 @@ namespace Coflnet.Sky.Indexer
                 }
                 while (true)
                 {
-                    using var context = new HypixelContext();
-                    /*var pulls = await context.BazaarPull
+                    using var context = new HypixelContext();var pulls = await context.BazaarPull
                             .Where(p => p.Id > 3437504)
                             .Include(p => p.Products).ThenInclude(p => p.SellSummary)
                             .Include(p => p.Products).ThenInclude(p => p.BuySummery)
@@ -73,14 +73,14 @@ namespace Coflnet.Sky.Indexer
                         MarkAllForDeletion(context, products);
                     }
                     var x = await context.SaveChangesAsync();
-                    Console.WriteLine($"removed {pulls.FirstOrDefault()?.Products.FirstOrDefault().Id} " + x);*/
+                    Console.WriteLine($"removed {pulls.FirstOrDefault()?.Products.FirstOrDefault().Id} " + x);
 
                     var productsWithNoPull = await context.BazaarPrices.Where(p => p.Id > 285053670).Include(p => p.SellSummary).Include(p => p.BuySummery).Include(p => p.QuickStatus).Take(500).ToListAsync();
                     MarkAllForDeletion(context, productsWithNoPull);
                     var y = await context.SaveChangesAsync();
                     Console.WriteLine($"removed {productsWithNoPull.FirstOrDefault().Id} " + y);
                 }
-            }, "Bazaar delete failed");
+            }, "Bazaar delete failed");*/
 
             /*try
             {

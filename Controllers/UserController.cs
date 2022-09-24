@@ -1,42 +1,40 @@
-using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Coflnet.Sky.Core;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 
-namespace Coflnet.Sky.Indexer.Controllers
+namespace Coflnet.Sky.Indexer.Controllers;
+
+[ApiController]
+[Route("[controller]")]
+public class UserController : ControllerBase
 {
-    [ApiController]
-    [Route("[controller]")]
-    public class UserController : ControllerBase
+    private readonly ILogger<UserController> _logger;
+    private SemaphoreSlim creationLock = new(1);
+
+    public UserController(ILogger<UserController> logger)
     {
-        private readonly ILogger<UserController> _logger;
-        private SemaphoreSlim creationLock = new(1);
+        _logger = logger;
+    }
 
-        public UserController(ILogger<UserController> logger)
+    /// <summary>
+    /// Adds a user to the database
+    /// </summary>
+    /// <param name="user"></param>
+    /// <returns></returns>
+    [Route("")]
+    [HttpPost]
+    public async Task<GoogleUser> CreateUser([FromBody] GoogleUser user)
+    {
+        try
         {
-            _logger = logger;
+            await creationLock.WaitAsync();
+            return UserService.Instance.GetOrCreateUser(user.GoogleId, user.Email);
         }
-
-        /// <summary>
-        /// Adds a user to the database
-        /// </summary>
-        /// <param name="user"></param>
-        /// <returns></returns>
-        [Route("")]
-        [HttpPost]
-        public async Task<GoogleUser> CreateUser([FromBody] GoogleUser user)
+        finally
         {
-            try
-            {
-                await creationLock.WaitAsync();
-                return UserService.Instance.GetOrCreateUser(user.GoogleId, user.Email);
-            }
-            finally
-            {
-                creationLock.Release();
-            }
+            creationLock.Release();
         }
     }
 }

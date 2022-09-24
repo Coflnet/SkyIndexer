@@ -21,7 +21,6 @@ namespace Coflnet.Sky.Indexer.Controllers
             this.nameUpdateService = nameUpdateService;
         }
 
-
         [Route("{uuid}")]
         [HttpPatch]
         public async Task<Player> UpdatName(string uuid, string name = null)
@@ -35,7 +34,7 @@ namespace Coflnet.Sky.Indexer.Controllers
             return await PlayerService.Instance.UpdatePlayerName(uuid);
 
         }
-
+        [HttpGet]
         public async Task<IEnumerable<Player>> GetPlayersToUpdate(int count = 10)
         {
             return await nameUpdateService.GetPlayersToUpdate(count);

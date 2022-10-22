@@ -204,7 +204,7 @@ namespace Coflnet.Sky.Indexer
                     if (i == 3)
                     {
                         if (auctions.Count() == 1)
-                            dev.Logger.Instance.Error("Could not save this auction " + JsonConvert.SerializeObject(auctions));
+                            dev.Logger.Instance.Error("Could not save this auction\n" + JsonConvert.SerializeObject(auctions, Formatting.Indented));
                         else
                         {
                             await ToDb(auctions.Take(auctions.Count() / 2));

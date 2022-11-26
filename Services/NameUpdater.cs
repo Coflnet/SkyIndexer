@@ -34,12 +34,11 @@ namespace Coflnet.Sky.Indexer
                 {
                     // indicates something went wrong
                     await Task.Delay(200);
-                    updated++; // don't flag more
-                    continue;
                 }
                 using var context = new HypixelContext();
                 var playerToUpdate = context.Players.Where(p => p.UuId == player.UuId).First();
-                playerToUpdate.Name = name;
+                if (name != null)
+                    playerToUpdate.Name = name;
                 playerToUpdate.ChangedFlag = false;
                 player.UpdatedAt = DateTime.Now;
                 context.Players.Update(playerToUpdate);

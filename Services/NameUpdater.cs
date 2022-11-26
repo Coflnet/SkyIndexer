@@ -38,6 +38,7 @@ namespace Coflnet.Sky.Indexer
                     {
                         // indicates something went wrong
                         await Task.Delay(500);
+                        updated++; // don't flag more
                         continue;
                     }
                     player.Name = name;
@@ -85,7 +86,7 @@ namespace Coflnet.Sky.Indexer
                 {
                     await FlagChanged();
                     var count = await UpdateFlaggedNames();
-                    if (count < 5)
+                    if (count < 25)
                         await FlagOldest();
                     Console.WriteLine($" - Updated flagged player names ({count}) - ");
                 }

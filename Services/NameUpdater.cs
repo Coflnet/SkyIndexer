@@ -24,48 +24,63 @@ namespace Coflnet.Sky.Indexer
 
         public static async Task<int> UpdateFlaggedNames()
         {
-            var updated = 0;
-            var targetAmount = 60;
+            var targetAmount = 80;
             var players = PlayersToUpdate(targetAmount);
             foreach (var player in players)
             {
-                var name = await Sky.Core.Program.GetPlayerNameFromUuid(player.UuId);
-                if (name == null)
+                var uuid = player.UuId;
+                await Task.Delay(300);
+                _ = Task.Run(async () =>
                 {
-                    // indicates something went wrong
-                    await Task.Delay(1000);
-                    dev.Logger.Instance.Error("could not update player, response null " + Newtonsoft.Json.JsonConvert.SerializeObject(player));
-                }
-                using var context = new HypixelContext();
-                var playerToUpdate = context.Players.Where(p => p.UuId == player.UuId).First();
-                if (name != null)
-                {
-                    playerToUpdate.Name = name;
-                    if (playerToUpdate.HitCount < 0)
-                        playerToUpdate.HitCount = 0;
-                }
-                else if (playerToUpdate.HitCount < -10)
-                    playerToUpdate.Name = "!unobtainable";
-                else if (playerToUpdate.Name == null && name == null)
-                    playerToUpdate.HitCount--;
-                playerToUpdate.ChangedFlag = false;
-                player.UpdatedAt = DateTime.Now;
-                context.Players.Update(playerToUpdate);
-                nameUpdateCounter.Inc();
-                try
-                {
-                    updated += await context.SaveChangesAsync();
-                }
-                catch (Microsoft.EntityFrameworkCore.DbUpdateConcurrencyException)
-                {
-                    dev.Logger.Instance.Error("could not update player, already modified " + Newtonsoft.Json.JsonConvert.SerializeObject(player));
-                    await Task.Delay(2000);
-                }
+                    try
+                    {
+                        await UpdateNameFor(uuid);
+                    }
+                    catch (System.Exception error)
+                    {
+                        dev.Logger.Instance.Error(error, "updating name " + uuid);
+                    }
+                });
             }
 
             LastUpdate = DateTime.Now;
             updateCount++;
-            return updated;
+            return players.Count();
+        }
+
+        private static async Task UpdateNameFor(string uuid)
+        {
+            var name = await Sky.Core.Program.GetPlayerNameFromUuid(uuid);
+            using var context = new HypixelContext();
+            var playerToUpdate = context.Players.Where(p => p.UuId == uuid).First();
+            if (name == null)
+            {
+                dev.Logger.Instance.Error("could not update player, response null " + Newtonsoft.Json.JsonConvert.SerializeObject(playerToUpdate));
+            }
+            if (name != null)
+            {
+                playerToUpdate.Name = name;
+                if (playerToUpdate.HitCount < 0)
+                    playerToUpdate.HitCount = 0;
+            }
+            else if (playerToUpdate.HitCount < -10)
+                playerToUpdate.Name = "!unobtainable";
+            else if (playerToUpdate.Name == null && name == null)
+                playerToUpdate.HitCount--;
+            playerToUpdate.ChangedFlag = false;
+            playerToUpdate.UpdatedAt = DateTime.Now;
+            context.Players.Update(playerToUpdate);
+            nameUpdateCounter.Inc();
+
+            try
+            {
+                await context.SaveChangesAsync();
+            }
+            catch (Microsoft.EntityFrameworkCore.DbUpdateConcurrencyException)
+            {
+                dev.Logger.Instance.Error("could not update player, already modified " + Newtonsoft.Json.JsonConvert.SerializeObject(playerToUpdate));
+                await Task.Delay(2000);
+            }
         }
 
         private static List<Player> PlayersToUpdate(int targetAmount)
@@ -145,7 +160,7 @@ namespace Coflnet.Sky.Indexer
             using (var context = new HypixelContext())
             {
                 var players = context.Players.Where(p => p.Id > 0)
-                    .OrderBy(p => p.UpdatedAt).Take(50);
+                    .OrderBy(p => p.UpdatedAt).Take(40);
                 players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null));
                 foreach (var p in players)
                 {

@@ -33,7 +33,10 @@ namespace Coflnet.Sky.Indexer
 
                 foreach (var player in players)
                 {
-                    player.Name = await Sky.Core.Program.GetPlayerNameFromUuid(player.UuId);
+                    var name = await Sky.Core.Program.GetPlayerNameFromUuid(player.UuId);
+                    if(player.Name == null)
+                        continue;
+                    player.Name = name;
                     player.ChangedFlag = false;
                     player.UpdatedAt = DateTime.Now;
                     context.Players.Update(player);

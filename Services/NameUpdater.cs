@@ -34,11 +34,16 @@ namespace Coflnet.Sky.Indexer
                 {
                     // indicates something went wrong
                     await Task.Delay(200);
+                    dev.Logger.Instance.Error("could not update player, response null " + Newtonsoft.Json.JsonConvert.SerializeObject(player));
                 }
                 using var context = new HypixelContext();
                 var playerToUpdate = context.Players.Where(p => p.UuId == player.UuId).First();
                 if (name != null)
                     playerToUpdate.Name = name;
+                else if (playerToUpdate.HitCount < -10)
+                    playerToUpdate.Name = "!unobtainable";
+                else if (playerToUpdate.Name == null && name == null)
+                    playerToUpdate.HitCount--;
                 playerToUpdate.ChangedFlag = false;
                 player.UpdatedAt = DateTime.Now;
                 context.Players.Update(playerToUpdate);

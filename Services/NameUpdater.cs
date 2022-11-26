@@ -33,7 +33,7 @@ namespace Coflnet.Sky.Indexer
                 if (name == null)
                 {
                     // indicates something went wrong
-                    await Task.Delay(500);
+                    await Task.Delay(200);
                     updated++; // don't flag more
                     continue;
                 }
@@ -146,6 +146,7 @@ namespace Coflnet.Sky.Indexer
                 }
                 await context.SaveChangesAsync();
             }
+            await Task.Delay(10000);
         }
     }
 }

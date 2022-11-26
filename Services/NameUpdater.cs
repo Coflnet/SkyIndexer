@@ -144,7 +144,8 @@ namespace Coflnet.Sky.Indexer
                     if (player != null)
                     {
                         player.ChangedFlag = true;
-                        player.Name = result.Name;
+                        if (result.Name != null)
+                            player.Name = result.Name;
                         context.Players.Update(player);
                         continue;
                     }

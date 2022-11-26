@@ -161,7 +161,7 @@ namespace Coflnet.Sky.Indexer
             {
                 var players = context.Players.Where(p => p.Id > 0)
                     .OrderBy(p => p.UpdatedAt).Take(40);
-                players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null));
+                players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null).Take(35));
                 foreach (var p in players)
                 {
                     p.ChangedFlag = true;

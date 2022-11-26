@@ -26,6 +26,10 @@ namespace Coflnet.Sky.Indexer
         {
             var targetAmount = 80;
             var players = PlayersToUpdate(targetAmount);
+            while(Sky.Core.Program.IsRatelimited())
+            {
+                await Task.Delay(5000);
+            }
             foreach (var player in players)
             {
                 var uuid = player.UuId;

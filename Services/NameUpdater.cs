@@ -34,14 +34,22 @@ namespace Coflnet.Sky.Indexer
                 foreach (var player in players)
                 {
                     var name = await Sky.Core.Program.GetPlayerNameFromUuid(player.UuId);
-                    if(player.Name == null)
+                    if (player.Name == null)
                         continue;
                     player.Name = name;
                     player.ChangedFlag = false;
                     player.UpdatedAt = DateTime.Now;
                     context.Players.Update(player);
                     nameUpdateCounter.Inc();
-                    updated += await context.SaveChangesAsync();
+                    try
+                    {
+                        updated += await context.SaveChangesAsync();
+                    }
+                    catch (System.Exception e)
+                    {
+                        dev.Logger.Instance.Error(e, "could not update player " + Newtonsoft.Json.JsonConvert.SerializeObject(player));
+                        throw;
+                    }
                 }
             }
             LastUpdate = DateTime.Now;
@@ -55,7 +63,7 @@ namespace Coflnet.Sky.Indexer
             {
                 // set the start time to not return bad status
                 LastUpdate = DateTime.Now;
-                await Task.Delay(TimeSpan.FromMinutes(1));
+                await Task.Delay(TimeSpan.FromSeconds(30));
                 await RunForever();
             }).ConfigureAwait(false);
         }
@@ -71,7 +79,7 @@ namespace Coflnet.Sky.Indexer
             {
                 try
                 {
-                    FlagChanged();
+                    await FlagChanged();
                     var count = await UpdateFlaggedNames();
                     if (count < 5)
                         await FlagOldest();
@@ -85,7 +93,7 @@ namespace Coflnet.Sky.Indexer
             }
         }
 
-        private static void FlagChanged()
+        private static async Task FlagChanged()
         {
             if (newPlayers.Count() == 0)
                 return;
@@ -103,7 +111,7 @@ namespace Coflnet.Sky.Indexer
                     }
                     Sky.Core.Program.AddPlayer(context, result.Uuid, ref Indexer.highestPlayerId, result.Name);
                 }
-                context.SaveChanges();
+                await context.SaveChangesAsync();
             }
         }
 
@@ -114,6 +122,7 @@ namespace Coflnet.Sky.Indexer
             {
                 var players = context.Players.Where(p => p.Id > 0)
                     .OrderBy(p => p.UpdatedAt).Take(50);
+                players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null));
                 foreach (var p in players)
                 {
                     p.ChangedFlag = true;

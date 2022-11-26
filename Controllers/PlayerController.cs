@@ -25,13 +25,11 @@ namespace Coflnet.Sky.Indexer.Controllers
         [HttpPatch]
         public async Task<Player> UpdatName(string uuid, string name = null)
         {
-            if(uuid == null || uuid.Length != 32)
+            if (uuid == null || uuid.Length != 32)
                 return null;
-            var client = new RestClient("https://playerdb.co/api/player/minecraft/");
-            var result = await client.ExecuteAsync(new RestRequest(uuid));
-            if(result.StatusCode != System.Net.HttpStatusCode.OK)
-                throw new CoflnetException("invalid_uuid", "There was no player with the given uuid found");
-            return await PlayerService.Instance.UpdatePlayerName(uuid);
+
+            NameUpdater.UpdateUUid(uuid, name);
+            return new Player(uuid) { Name = name };
 
         }
         [HttpGet]

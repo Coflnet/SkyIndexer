@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using dev;
 using Coflnet.Sky.Core;
+using System.Collections.Generic;
 
 namespace Coflnet.Sky.Indexer
 {
@@ -25,41 +26,51 @@ namespace Coflnet.Sky.Indexer
         {
             var updated = 0;
             var targetAmount = 60;
-            using (var context = new HypixelContext())
+            var players = PlayersToUpdate(targetAmount);
+            foreach (var player in players)
             {
-                var players = context.Players.Where(p => p.ChangedFlag && p.Id > 0)
-                    .OrderBy(p => p.UpdatedAt)
-                    .Take(targetAmount).ToList();
-
-                foreach (var player in players)
+                var name = await Sky.Core.Program.GetPlayerNameFromUuid(player.UuId);
+                if (name == null)
                 {
-                    var name = await Sky.Core.Program.GetPlayerNameFromUuid(player.UuId);
-                    if (name == null)
-                    {
-                        // indicates something went wrong
-                        await Task.Delay(500);
-                        updated++; // don't flag more
-                        continue;
-                    }
-                    player.Name = name;
-                    player.ChangedFlag = false;
-                    player.UpdatedAt = DateTime.Now;
-                    context.Players.Update(player);
-                    nameUpdateCounter.Inc();
-                    try
-                    {
-                        updated += await context.SaveChangesAsync();
-                    }
-                    catch (System.Exception e)
-                    {
-                        dev.Logger.Instance.Error(e, "could not update player " + Newtonsoft.Json.JsonConvert.SerializeObject(player));
-                        throw;
-                    }
+                    // indicates something went wrong
+                    await Task.Delay(500);
+                    updated++; // don't flag more
+                    continue;
+                }
+                using var context = new HypixelContext();
+                var playerToUpdate = context.Players.Where(p => p.UuId == player.UuId).First();
+                playerToUpdate.Name = name;
+                playerToUpdate.ChangedFlag = false;
+                player.UpdatedAt = DateTime.Now;
+                context.Players.Update(playerToUpdate);
+                nameUpdateCounter.Inc();
+                try
+                {
+                    updated += await context.SaveChangesAsync();
+                }
+                catch (Microsoft.EntityFrameworkCore.DbUpdateConcurrencyException)
+                {
+                    dev.Logger.Instance.Error("could not update player, already modified " + Newtonsoft.Json.JsonConvert.SerializeObject(player));
+                    await Task.Delay(2000);
                 }
             }
+
             LastUpdate = DateTime.Now;
             updateCount++;
             return updated;
+        }
+
+        private static List<Player> PlayersToUpdate(int targetAmount)
+        {
+            List<Player> players;
+            using (var context = new HypixelContext())
+            {
+                players = context.Players.Where(p => p.ChangedFlag && p.Id > 0)
+                    .OrderBy(p => p.UpdatedAt)
+                    .Take(targetAmount).ToList();
+            }
+
+            return players;
         }
 
         public static void Run()
@@ -68,7 +79,7 @@ namespace Coflnet.Sky.Indexer
             {
                 // set the start time to not return bad status
                 LastUpdate = DateTime.Now;
-                await Task.Delay(TimeSpan.FromSeconds(30));
+                await Task.Delay(TimeSpan.FromSeconds(3));
                 await RunForever();
             }).ConfigureAwait(false);
         }
@@ -86,7 +97,7 @@ namespace Coflnet.Sky.Indexer
                 {
                     await FlagChanged();
                     var count = await UpdateFlaggedNames();
-                    if (count < 25)
+                    if (count < 5)
                         await FlagOldest();
                     Console.WriteLine($" - Updated flagged player names ({count}) - ");
                 }
@@ -94,7 +105,7 @@ namespace Coflnet.Sky.Indexer
                 {
                     Logger.Instance.Error($"NameUpdater encountered an error \n {e.Message} {e.StackTrace} \n{e.InnerException?.Message} {e.InnerException?.StackTrace}");
                 }
-                await Task.Delay(10000);
+                await Task.Delay(5000);
             }
         }
 

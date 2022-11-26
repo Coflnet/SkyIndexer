@@ -33,13 +33,17 @@ namespace Coflnet.Sky.Indexer
                 if (name == null)
                 {
                     // indicates something went wrong
-                    await Task.Delay(200);
+                    await Task.Delay(1000);
                     dev.Logger.Instance.Error("could not update player, response null " + Newtonsoft.Json.JsonConvert.SerializeObject(player));
                 }
                 using var context = new HypixelContext();
                 var playerToUpdate = context.Players.Where(p => p.UuId == player.UuId).First();
                 if (name != null)
+                {
                     playerToUpdate.Name = name;
+                    if (playerToUpdate.HitCount < 0)
+                        playerToUpdate.HitCount = 0;
+                }
                 else if (playerToUpdate.HitCount < -10)
                     playerToUpdate.Name = "!unobtainable";
                 else if (playerToUpdate.Name == null && name == null)

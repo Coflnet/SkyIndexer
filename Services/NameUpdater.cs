@@ -24,7 +24,7 @@ namespace Coflnet.Sky.Indexer
         public static async Task<int> UpdateFlaggedNames()
         {
             var updated = 0;
-            var targetAmount = 45;
+            var targetAmount = 60;
             using (var context = new HypixelContext())
             {
                 var players = context.Players.Where(p => p.ChangedFlag && p.Id > 0)
@@ -34,8 +34,12 @@ namespace Coflnet.Sky.Indexer
                 foreach (var player in players)
                 {
                     var name = await Sky.Core.Program.GetPlayerNameFromUuid(player.UuId);
-                    if (player.Name == null)
+                    if (name == null)
+                    {
+                        // indicates something went wrong
+                        await Task.Delay(500);
                         continue;
+                    }
                     player.Name = name;
                     player.ChangedFlag = false;
                     player.UpdatedAt = DateTime.Now;

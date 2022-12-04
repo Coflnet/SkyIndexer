@@ -48,7 +48,7 @@ namespace Coflnet.Sky.Indexer
             }).ConfigureAwait(false);
             NameUpdater.Run();
 
-                    /*
+                    
             Coflnet.Sky.Core.Program.RunIsolatedForever(async () =>
             {
                 if (System.Net.Dns.GetHostName().Contains("ekwav"))
@@ -58,12 +58,10 @@ namespace Coflnet.Sky.Indexer
                 }
                 while (true)
                 {
-                    using var context = new HypixelContext();var pulls = await context.BazaarPull
-                            .Where(p => p.Id > 3437504)
-                            .Include(p => p.Products).ThenInclude(p => p.SellSummary)
-                            .Include(p => p.Products).ThenInclude(p => p.BuySummery)
+                    using var context = new HypixelContext();
+                    var pulls = await context.BazaarPull
                             .Include(p => p.Products).ThenInclude(p => p.QuickStatus)
-                            .Take(5).ToListAsync();
+                            .Take(25).ToListAsync();
                     if (pulls.Count == 0)
                         throw new TaskCanceledException();
                     context.RemoveRange(pulls);
@@ -75,12 +73,12 @@ namespace Coflnet.Sky.Indexer
                     var x = await context.SaveChangesAsync();
                     Console.WriteLine($"removed {pulls.FirstOrDefault()?.Products.FirstOrDefault().Id} " + x);
 
-                    var productsWithNoPull = await context.BazaarPrices.Where(p => p.Id > 285053670).Include(p => p.SellSummary).Include(p => p.BuySummery).Include(p => p.QuickStatus).Take(500).ToListAsync();
+                    var productsWithNoPull = await context.BazaarPrices.Where(p => p.PullInstance == null).Include(p => p.QuickStatus).Take(500).ToListAsync();
                     MarkAllForDeletion(context, productsWithNoPull);
                     var y = await context.SaveChangesAsync();
                     Console.WriteLine($"removed {productsWithNoPull.FirstOrDefault().Id} " + y);
                 }
-            }, "Bazaar delete failed");*/
+            }, "Bazaar delete failed");
 
             /*try
             {
@@ -96,8 +94,6 @@ namespace Coflnet.Sky.Indexer
         private static void MarkAllForDeletion(HypixelContext context, List<dev.ProductInfo> products)
         {
             context.RemoveRange(products);
-            context.RemoveRange(products.SelectMany(p => p.SellSummary));
-            context.RemoveRange(products.SelectMany(p => p.BuySummery));
             context.RemoveRange(products.Select(p => p.QuickStatus));
         }
 

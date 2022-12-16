@@ -61,7 +61,7 @@ namespace Coflnet.Sky.Indexer
                     using var context = new HypixelContext();
                     var pulls = await context.BazaarPull
                             .Include(p => p.Products).ThenInclude(p => p.QuickStatus)
-                            .Take(25).ToListAsync();
+                            .Take(50).ToListAsync();
                     if (pulls.Count == 0)
                         throw new TaskCanceledException();
                     context.RemoveRange(pulls);

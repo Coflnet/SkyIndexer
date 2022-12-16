@@ -73,10 +73,10 @@ namespace Coflnet.Sky.Indexer
                     var x = await context.SaveChangesAsync();
                     Console.WriteLine($"removed {pulls.FirstOrDefault()?.Products.FirstOrDefault().Id} " + x);
 
-                    var productsWithNoPull = await context.BazaarPrices.Where(p => p.PullInstance == null).Include(p => p.QuickStatus).Take(500).ToListAsync();
-                    MarkAllForDeletion(context, productsWithNoPull);
+                    //var productsWithNoPull = await context.BazaarPrices.Where(p => p.PullInstance == null).Include(p => p.QuickStatus).Take(500).ToListAsync();
+                    //MarkAllForDeletion(context, productsWithNoPull);
                     var y = await context.SaveChangesAsync();
-                    Console.WriteLine($"removed {productsWithNoPull.FirstOrDefault().Id} " + y);
+                    //Console.WriteLine($"removed {productsWithNoPull.FirstOrDefault().Id} " + y);
                 }
             }, "Bazaar delete failed");
 

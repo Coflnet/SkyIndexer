@@ -51,9 +51,10 @@ namespace Coflnet.Sky.Indexer
                     
             Coflnet.Sky.Core.Program.RunIsolatedForever(async () =>
             {
-                if (System.Net.Dns.GetHostName().Contains("ekwav"))
+                if (!System.Net.Dns.GetHostName().Contains("indexer"))
                 {
-                    await Task.Delay(TimeSpan.FromMinutes(3));
+                    Console.WriteLine("not deleting bazaar data on this indexer instance");
+                    await Task.Delay(TimeSpan.FromDays(3));
                     return;
                 }
                 while (true)

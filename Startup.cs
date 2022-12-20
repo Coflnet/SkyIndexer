@@ -29,7 +29,7 @@ namespace Coflnet.Sky.Indexer
             {
                 c.SwaggerDoc("v1", new OpenApiInfo { Title = "SkyIndexer", Version = "v1" });
             });
-            services.AddJaeger();
+            services.AddJaeger(Configuration);
 
             services.AddDbContext<HypixelContext>();
             services.AddSingleton<ActiveAhStateService>();

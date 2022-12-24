@@ -244,6 +244,11 @@ namespace Coflnet.Sky.Indexer
                         Logger.Instance.Error($"Error on CreateLookup: {e.Message} \n{e.StackTrace} \n{JSON.Stringify(auction.NbtData.Data)}");
                         throw e;
                     }
+                    if(auction.HighestBidAmount == 0 && auction.Bids.Count > 0)
+                    {
+                        Logger.Instance.Info($"Fixing highest bid amount for {auction.Uuid}");
+                        auction.HighestBidAmount = auction.Bids.Max(b => b.Amount);
+                    }
                     context.Auctions.Add(auction);
 
                 }
@@ -270,12 +275,7 @@ namespace Coflnet.Sky.Indexer
                     context.Bids.Add(bid);
                 }
             }
-            var highestBid = auction.HighestBidAmount;
-            // special case sometimes highest bid is not set
-            if (highestBid == 0 && auction.Bids.Count > 0)
-                highestBid = auction.Bids.Max(b => b.Amount);
-            if (dbauction.HighestBidAmount < highestBid)
-                dbauction.HighestBidAmount = highestBid;
+            UpdateHighestBid(auction, dbauction);
 
             if (auction.AuctioneerId == null)
             {
@@ -300,6 +300,16 @@ namespace Coflnet.Sky.Indexer
 
             // update
             context.Auctions.Update(dbauction);
+        }
+
+        internal static void UpdateHighestBid(SaveAuction auction, SaveAuction dbauction)
+        {
+            var highestBid = auction.HighestBidAmount;
+            // special case sometimes highest bid is not set
+            if (highestBid == 0 && auction.Bids.Count > 0)
+                highestBid = auction.Bids.Max(b => b.Amount);
+            if (dbauction.HighestBidAmount < highestBid)
+                dbauction.HighestBidAmount = highestBid;
         }
 
         private static async Task<Dictionary<string, SaveAuction>> GetExistingAuctions(IEnumerable<SaveAuction> auctions, HypixelContext context)

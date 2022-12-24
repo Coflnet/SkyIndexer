@@ -3,20 +3,47 @@ using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Coflnet.Sky.Core;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 
 namespace Coflnet.Sky.Indexer
 {
-    public class Numberer
+    public class Numberer : BackgroundService
     {
-        public static async Task NumberUsers()
-        {
+        private ActivitySource activitySource;
+        private ILogger<Numberer> logger;
 
+        public Numberer(ActivitySource activitySource, ILogger<Numberer> logger)
+        {
+            this.activitySource = activitySource;
+            this.logger = logger;
+        }
+
+        protected override async Task ExecuteAsync(System.Threading.CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    using var activity = activitySource.StartActivity("Numberer");
+                    await NumberUsers();
+                }
+                catch (Exception e)
+                {
+                    logger.LogError(e, "Error while numbering");
+                }
+                await Task.Delay(1000, stoppingToken);
+            }
+        }
+        public async Task NumberUsers()
+        {
             Task bidNumberTask = null;
             using (var context = new HypixelContext())
             {
                 for (int i = 0; i < 3; i++)
                 {
-                    var doublePlayersId = await context.Players.Where(p=>p.Id > 2_000_000).GroupBy(p => p.Id).Where(p => p.Count() > 1).Select(p => p.Key).FirstOrDefaultAsync();
+                    var doublePlayersId = await context.Players.Where(p => p.Id > 2_000_000).GroupBy(p => p.Id).Where(p => p.Count() > 1).Select(p => p.Key).FirstOrDefaultAsync();
                     if (doublePlayersId == 0)
                         break;
 
@@ -39,6 +66,7 @@ namespace Coflnet.Sky.Indexer
 
                 if (unindexedPlayers.Count < 2000)
                 {
+                    using var activity = activitySource.StartActivity("NumberAuctions");
                     // all players in the db have an id now
                     bidNumberTask = Task.Run(NumberBids);
                     await NumberAuctions(context);
@@ -47,7 +75,7 @@ namespace Coflnet.Sky.Indexer
                 }
 
                 // temp migration
-                foreach (var item in context.Auctions.Where(a=>a.UId == 0)
+                foreach (var item in context.Auctions.Where(a => a.UId == 0)
                                     .OrderByDescending(a => a.Id).Take(5000))
                 {
                     item.UId = AuctionService.Instance.GetId(item.Uuid);
@@ -60,7 +88,7 @@ namespace Coflnet.Sky.Indexer
                 await bidNumberTask;
 
             // give the db a moment to store everything
-            await Task.Delay(3000);
+            await Task.Delay(2000);
 
         }
 
@@ -120,11 +148,11 @@ namespace Coflnet.Sky.Indexer
             if (auction.SellerId == 0)
                 // his player has not yet received his number
                 return;
-                
+
             if (auction.ItemId == 0)
             {
                 var id = ItemDetails.Instance.GetOrCreateItemIdForAuction(auction, context);
-                if(id == 0)
+                if (id == 0)
                     dev.Logger.Instance.Error("could not get itemid for " + auction.UId);
                 auction.ItemId = id;
 
@@ -138,36 +166,39 @@ namespace Coflnet.Sky.Indexer
 
         static int batchSize = 2000;
 
-        private static async Task NumberBids()
+        public Numberer()
         {
-            using (var context = new HypixelContext())
+        }
+
+        private async Task NumberBids()
+        {
+            using var activity = activitySource.StartActivity("NumberBids");
+            using var context = new HypixelContext();
+            try
             {
-                try
+                var bidsWithoutSellerId = await context.Bids.Where(a => a.BidderId == 0).Take(batchSize).ToListAsync();
+                foreach (var bid in bidsWithoutSellerId)
                 {
-                    var bidsWithoutSellerId = await context.Bids.Where(a => a.BidderId == 0).Take(batchSize).ToListAsync();
-                    foreach (var bid in bidsWithoutSellerId)
-                    {
 
-                        bid.BidderId = await GetOrCreatePlayerId(context, bid.Bidder);
-                        if (bid.BidderId == 0)
-                            // his player has not yet received his number
-                            continue;
+                    bid.BidderId = await GetOrCreatePlayerId(context, bid.Bidder);
+                    if (bid.BidderId == 0)
+                        // this player has not yet received his number
+                        continue;
 
-                        context.Bids.Update(bid);
-                    }
-
-                    await context.SaveChangesAsync();
+                    context.Bids.Update(bid);
                 }
-                catch (Exception e)
-                {
-                    Console.WriteLine($"Ran into error on numbering bids {e.Message} {e.StackTrace}");
-                }
+
+                await context.SaveChangesAsync();
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Ran into error on numbering bids {e.Message} {e.StackTrace}");
             }
         }
 
         private static async Task<int> GetOrCreatePlayerId(HypixelContext context, string uuid)
         {
-            if(uuid == null)
+            if (uuid == null)
                 return -1;
             var id = await context.Players.Where(p => p.UuId == uuid).Select(p => p.Id).FirstOrDefaultAsync();
             if (id == 0)
@@ -178,7 +209,5 @@ namespace Coflnet.Sky.Indexer
             }
             return id;
         }
-
-
     }
 }

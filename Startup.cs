@@ -38,6 +38,7 @@ namespace Coflnet.Sky.Indexer
             var redisOptions = ConfigurationOptions.Parse(Configuration["REDIS_HOST"]);
             services.AddSingleton<IConnectionMultiplexer>(provider => ConnectionMultiplexer.Connect(redisOptions));
             services.AddSingleton<NameUpdateService>();
+            services.AddHostedService<Numberer>();
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.

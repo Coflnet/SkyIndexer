@@ -60,7 +60,7 @@ namespace Coflnet.Sky.Indexer
                 await bidNumberTask;
 
             // give the db a moment to store everything
-            await Task.Delay(5000);
+            await Task.Delay(3000);
 
         }
 
@@ -94,7 +94,7 @@ namespace Coflnet.Sky.Indexer
                                     .Include(a => a.Enchantments)
                                     .Include(a => a.NBTLookup)
                                     .OrderByDescending(a => a.Id)
-                                    .Take(5000).ToListAsync();
+                                    .Take(2000).ToListAsync();
             if (auctionsWithoutSellerId.Count() > 0)
                 Console.Write(" -#-");
             foreach (var auction in auctionsWithoutSellerId)
@@ -102,7 +102,7 @@ namespace Coflnet.Sky.Indexer
 
                 try
                 {
-                    NumberAuction(context, auction);
+                    await NumberAuction(context, auction);
 
                 }
                 catch (Exception e)
@@ -113,9 +113,9 @@ namespace Coflnet.Sky.Indexer
             }
         }
 
-        private static void NumberAuction(HypixelContext context, SaveAuction auction)
+        private static async Task NumberAuction(HypixelContext context, SaveAuction auction)
         {
-            auction.SellerId = GetOrCreatePlayerId(context, auction.AuctioneerId);
+            auction.SellerId = await GetOrCreatePlayerId(context, auction.AuctioneerId);
 
             if (auction.SellerId == 0)
                 // his player has not yet received his number
@@ -128,20 +128,17 @@ namespace Coflnet.Sky.Indexer
                     dev.Logger.Instance.Error("could not get itemid for " + auction.UId);
                 auction.ItemId = id;
 
-
                 foreach (var enchant in auction.Enchantments)
                 {
                     enchant.ItemType = auction.ItemId;
                 }
             }
-
-
             context.Auctions.Update(auction);
         }
 
-        static int batchSize = 10000;
+        static int batchSize = 2000;
 
-        private static async void NumberBids()
+        private static async Task NumberBids()
         {
             using (var context = new HypixelContext())
             {
@@ -151,7 +148,7 @@ namespace Coflnet.Sky.Indexer
                     foreach (var bid in bidsWithoutSellerId)
                     {
 
-                        bid.BidderId = GetOrCreatePlayerId(context, bid.Bidder);
+                        bid.BidderId = await GetOrCreatePlayerId(context, bid.Bidder);
                         if (bid.BidderId == 0)
                             // his player has not yet received his number
                             continue;
@@ -165,15 +162,14 @@ namespace Coflnet.Sky.Indexer
                 {
                     Console.WriteLine($"Ran into error on numbering bids {e.Message} {e.StackTrace}");
                 }
-
             }
         }
 
-        private static int GetOrCreatePlayerId(HypixelContext context, string uuid)
+        private static async Task<int> GetOrCreatePlayerId(HypixelContext context, string uuid)
         {
             if(uuid == null)
                 return -1;
-            var id = context.Players.Where(p => p.UuId == uuid).Select(p => p.Id).FirstOrDefault();
+            var id = await context.Players.Where(p => p.UuId == uuid).Select(p => p.Id).FirstOrDefaultAsync();
             if (id == 0)
             {
                 id = Sky.Core.Program.AddPlayer(context, uuid, ref Indexer.highestPlayerId);

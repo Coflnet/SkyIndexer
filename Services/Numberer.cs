@@ -7,6 +7,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Diagnostics;
 using Prometheus;
+using System.Collections.Generic;
 
 namespace Coflnet.Sky.Indexer
 {
@@ -135,12 +136,13 @@ namespace Coflnet.Sky.Indexer
                                     .Take(2000).ToListAsync();
             if (auctionsWithoutSellerId.Count() > 0)
                 Console.Write(" -#-");
+
+            Dictionary<string, int> playerIdLookup = await BatchLookupPlayerId(context, auctionsWithoutSellerId.Select(a => a.AuctioneerId).Distinct().ToList());
             foreach (var auction in auctionsWithoutSellerId)
             {
-
                 try
                 {
-                    await NumberAuction(context, auction);
+                    await NumberAuction(context, auction, playerIdLookup);
 
                 }
                 catch (Exception e)
@@ -153,9 +155,9 @@ namespace Coflnet.Sky.Indexer
             auctionsNumbered.Inc(auctionsWithoutSellerId.Count());
         }
 
-        private static async Task NumberAuction(HypixelContext context, SaveAuction auction)
+        private static async Task NumberAuction(HypixelContext context, SaveAuction auction, Dictionary<string, int> lookup)
         {
-            auction.SellerId = await GetOrCreatePlayerId(context, auction.AuctioneerId);
+            auction.SellerId = await GetOrCreatePlayerId(context, auction.AuctioneerId, lookup);
 
             if (auction.SellerId == 0)
                 // his player has not yet received his number
@@ -189,10 +191,12 @@ namespace Coflnet.Sky.Indexer
             try
             {
                 var bidsWithoutSellerId = await context.Bids.Where(a => a.BidderId == 0).Take(batchSize).ToListAsync();
+                var uuids = bidsWithoutSellerId.Select(b => b.Bidder).Distinct().ToList();
+                Dictionary<string, int> bidderIds = await BatchLookupPlayerId(context, uuids);
                 foreach (var bid in bidsWithoutSellerId)
                 {
 
-                    bid.BidderId = await GetOrCreatePlayerId(context, bid.Bidder);
+                    bid.BidderId = await GetOrCreatePlayerId(context, bid.Bidder, bidderIds);
                     if (bid.BidderId == 0)
                         // this player has not yet received his number
                         continue;
@@ -210,10 +214,18 @@ namespace Coflnet.Sky.Indexer
             }
         }
 
-        private static async Task<int> GetOrCreatePlayerId(HypixelContext context, string uuid)
+        private static async Task<Dictionary<string, int>> BatchLookupPlayerId(HypixelContext context, List<string> bidderIdBatch)
+        {
+            return await context.Players.Where(p => bidderIdBatch.Contains(p.UuId)).ToDictionaryAsync(p => p.UuId, p => p.Id);
+        }
+
+        private static async Task<int> GetOrCreatePlayerId(HypixelContext context, string uuid, Dictionary<string, int> lookup = null)
         {
             if (uuid == null)
                 return -1;
+
+            if (lookup != null && lookup.TryGetValue(uuid, out int lookupId))
+                return lookupId;
             var id = await context.Players.Where(p => p.UuId == uuid).Select(p => p.Id).FirstOrDefaultAsync();
             if (id == 0)
             {

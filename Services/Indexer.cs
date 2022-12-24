@@ -96,26 +96,22 @@ namespace Coflnet.Sky.Indexer
         public static async Task ProcessQueue(CancellationToken stopToken)
         {
             var token = new CancellationTokenSource();
-            await Task.WhenAny(new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic }.Select(
-                async topic =>
-                {
-                    try
-                    {
-                        await Coflnet.Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
-                            Sky.Core.Program.KafkaHost,
-                            topic,
-                            ToDb,
-                            token.Token,
-                            "sky-indexer",
-                            200
-                            );
-                    }
-                    catch (Exception e)
-                    {
-                        dev.Logger.Instance.Error(e, $"consuming {topic} failed {e.GetType().Name}");
-                    }
-                }
-            ));
+
+            try
+            {
+                await Coflnet.Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
+                    Sky.Core.Program.KafkaHost,
+                    new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic },
+                    ToDb,
+                    token.Token,
+                    "sky-indexer",
+                    200
+                    );
+            }
+            catch (Exception e)
+            {
+                dev.Logger.Instance.Error(e, $"consuming failed {e.GetType().Name}");
+            }
             // cancel all as they will be restarted
             token.Cancel();
 
@@ -198,8 +194,8 @@ namespace Coflnet.Sky.Indexer
                 catch (Exception e)
                 {
                     dev.Logger.Instance.Error("failed save once, retrying");
-                    if(i > 0)
-                    dev.Logger.Instance.Error(e, "Trying to index batch of " + auctions.Count());
+                    if (i > 0)
+                        dev.Logger.Instance.Error(e, "Trying to index batch of " + auctions.Count());
                     await Task.Delay(500);
                     if (i == 3)
                     {
@@ -244,7 +240,7 @@ namespace Coflnet.Sky.Indexer
                         Logger.Instance.Error($"Error on CreateLookup: {e.Message} \n{e.StackTrace} \n{JSON.Stringify(auction.NbtData.Data)}");
                         throw e;
                     }
-                    if(auction.HighestBidAmount == 0 && auction.Bids.Count > 0)
+                    if (auction.HighestBidAmount == 0 && auction.Bids.Count > 0)
                     {
                         Logger.Instance.Info($"Fixing highest bid amount for {auction.Uuid}");
                         auction.HighestBidAmount = auction.Bids.Max(b => b.Amount);

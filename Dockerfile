@@ -4,7 +4,7 @@ RUN echo "revision new"
 RUN git clone --depth=1 https://github.com/Coflnet/HypixelSkyblock.git dev
 WORKDIR /build/sky
 COPY SkyIndexer.csproj SkyIndexer.csproj
-RUN dotnet restore -c release
+RUN dotnet restore
 COPY . .
 RUN dotnet publish -c release -o /artifact
 

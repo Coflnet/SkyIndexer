@@ -6,6 +6,7 @@ using Coflnet.Sky.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Diagnostics;
+using Prometheus;
 
 namespace Coflnet.Sky.Indexer
 {
@@ -13,6 +14,12 @@ namespace Coflnet.Sky.Indexer
     {
         private ActivitySource activitySource;
         private ILogger<Numberer> logger;
+        Gauge bidsWithoutId = Metrics.CreateGauge("sky_indexer_bids_without_id", "Number of Bids that don't yet have a player id");
+        Gauge auctionsWithoutId = Metrics.CreateGauge("sky_indexer_auctions_without_id", "Number of Auctions that don't yet have a player id");
+        Counter auctionsNumbered = Metrics.CreateCounter("sky_indexer_auctions_numbered", "Number of Auctions that have been numbered");
+        Counter bidsNumbered = Metrics.CreateCounter("sky_indexer_bids_numbered", "Number of Bids that have been numbered");
+        Counter playersNumbered = Metrics.CreateCounter("sky_indexer_players_numbered", "Number of Players that have been numbered");
+        Counter doublePlayersReset = Metrics.CreateCounter("sky_indexer_double_players_reset", "Number of Players that have been reset");
 
         public Numberer(ActivitySource activitySource, ILogger<Numberer> logger)
         {
@@ -48,6 +55,7 @@ namespace Coflnet.Sky.Indexer
                         break;
 
                     await ResetDoublePlayers(context, doublePlayersId);
+                    doublePlayersReset.Inc();
                 }
 
                 await context.SaveChangesAsync();
@@ -59,6 +67,7 @@ namespace Coflnet.Sky.Indexer
                     {
                         player.Id = System.Threading.Interlocked.Increment(ref Indexer.highestPlayerId);
                         context.Players.Update(player);
+                        playersNumbered.Inc();
                     }
                     // save all the ids
                     await context.SaveChangesAsync();
@@ -71,7 +80,8 @@ namespace Coflnet.Sky.Indexer
                     bidNumberTask = Task.Run(NumberBids);
                     await NumberAuctions(context);
 
-                    await context.SaveChangesAsync();
+
+                    auctionsWithoutId.Set(context.Auctions.Count(a => a.SellerId == 0));
                 }
 
                 // temp migration
@@ -115,7 +125,7 @@ namespace Coflnet.Sky.Indexer
             await context.SaveChangesAsync();
         }
 
-        private static async Task NumberAuctions(HypixelContext context)
+        private async Task NumberAuctions(HypixelContext context)
         {
             var auctionsWithoutSellerId = await context
                                     .Auctions.Where(a => a.SellerId == 0)
@@ -139,6 +149,8 @@ namespace Coflnet.Sky.Indexer
                     Console.WriteLine($"Error occured while userIndexing: {e.Message} {e.StackTrace}\n {e.InnerException?.Message} {e.InnerException?.StackTrace}");
                 }
             }
+            await context.SaveChangesAsync();
+            auctionsNumbered.Inc(auctionsWithoutSellerId.Count());
         }
 
         private static async Task NumberAuction(HypixelContext context, SaveAuction auction)
@@ -189,6 +201,8 @@ namespace Coflnet.Sky.Indexer
                 }
 
                 await context.SaveChangesAsync();
+                bidsWithoutId.Set(await context.Bids.Where(a => a.BidderId == 0).CountAsync());
+                bidsNumbered.Inc(bidsWithoutSellerId.Count(b => b.BidderId != 0));
             }
             catch (Exception e)
             {

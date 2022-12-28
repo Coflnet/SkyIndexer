@@ -33,7 +33,7 @@ namespace Coflnet.Sky.Indexer
             foreach (var player in players)
             {
                 var uuid = player.UuId;
-                await Task.Delay(300);
+                await Task.Delay(400);
                 _ = Task.Run(async () =>
                 {
                     try
@@ -132,7 +132,7 @@ namespace Coflnet.Sky.Indexer
                 {
                     Logger.Instance.Error($"NameUpdater encountered an error \n {e.Message} {e.StackTrace} \n{e.InnerException?.Message} {e.InnerException?.StackTrace}");
                 }
-                await Task.Delay(5000);
+                await Task.Delay(1000);
             }
         }
 
@@ -165,8 +165,8 @@ namespace Coflnet.Sky.Indexer
             using (var context = new HypixelContext())
             {
                 var players = context.Players.Where(p => p.Id > 0)
-                    .OrderBy(p => p.UpdatedAt).Take(40);
-                players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null).Take(35));
+                    .OrderBy(p => p.UpdatedAt).Take(10);
+                players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null).Take(15));
                 foreach (var p in players)
                 {
                     p.ChangedFlag = true;
@@ -174,7 +174,7 @@ namespace Coflnet.Sky.Indexer
                 }
                 await context.SaveChangesAsync();
             }
-            await Task.Delay(10000);
+            await Task.Delay(2000);
         }
     }
 }

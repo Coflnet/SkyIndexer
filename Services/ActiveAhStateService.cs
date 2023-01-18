@@ -19,7 +19,7 @@ namespace Coflnet.Sky.Indexer
     {
         IConfiguration config;
         Queue<AhStateSumary> RecentUpdates = new Queue<AhStateSumary>();
-
+        private const int LoadedFromDB = 8001;
         public AhStateSumary LastUpdate => RecentUpdates.LastOrDefault();
 
 
@@ -49,7 +49,8 @@ namespace Coflnet.Sky.Indexer
                     await ProcessSummary(new AhStateSumary()
                     {
                         ActiveAuctions = activeAuctions,
-                        Time = Now
+                        Time = Now,
+                        PartCount = LoadedFromDB
                     });
                     Console.WriteLine("loaded all active auctionids " + activeAuctions.Count);
 
@@ -193,6 +194,8 @@ namespace Coflnet.Sky.Indexer
 
         private static async Task ReactiveFalsyDeactivated(AhStateSumary sumary, HypixelContext context)
         {
+            if (sumary.PartCount == LoadedFromDB)
+                return;
             var activeAuctions = sumary.ActiveAuctions;
             var denominator = 1;
             var minUtcTicks = (sumary.Time + TimeSpan.FromMinutes(1.5)).Ticks;

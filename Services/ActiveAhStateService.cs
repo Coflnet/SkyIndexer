@@ -46,7 +46,7 @@ namespace Coflnet.Sky.Indexer
                             await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 2500000 && a.End > Now)
                             .Select(a => a.UId)
                             .ToDictionaryAsync(a => a));
-                    RecentUpdates.Enqueue(new AhStateSumary()
+                    await ProcessSummary(new AhStateSumary()
                     {
                         ActiveAuctions = activeAuctions,
                         Time = Now
@@ -67,33 +67,25 @@ namespace Coflnet.Sky.Indexer
         {
             await LoadActiveFromDb();
 
+            await Task.Run(async () =>
+            {
+
+                while (!stoppingToken.IsCancellationRequested)
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(15), stoppingToken);
+                    await LoadActiveFromDb();
+                    KeepQueueSizeInCheck();
+                }
+            });
+
             while (!stoppingToken.IsCancellationRequested)
                 try
                 {
-                    await Kafka.KafkaConsumer.Consume<AhStateSumary>(Sky.Core.Program.KafkaHost, config["TOPICS:AH_SUMARY"], async sum =>
+                    await Kafka.KafkaConsumer.Consume<AhStateSumary>(Core.Program.KafkaHost, config["TOPICS:AH_SUMARY"], async sum =>
                     {
                         Console.WriteLine($"\n-->Consumed update sumary {sum.Time} {sum.ActiveAuctions.Count}");
                         using var spancontext = GlobalTracer.Instance.BuildSpan("AhSumaryUpdate").StartActive();
-                        if (sum.Time < Now - TimeSpan.FromMinutes(5))
-                            return;
-                        RecentUpdates.Enqueue(sum);
-                        using (var context = new HypixelContext())
-                        {
-                            await ReactiveFalsyDeactivated(sum, context);
-                        }
-
-                        if (RecentUpdates.Min(r => r.Time) > Now - TimeSpan.FromMinutes(5))
-                            return;
-                        if (RecentUpdates.Count < 6)
-                            return;
-
-                        List<long> missing = FindInactiveAuctions();
-                        if (missing.Count == 0)
-                            return;
-                        await UpdateInactiveAuctions(missing);
-
-                        if (RecentUpdates.Peek().Time < Now - TimeSpan.FromMinutes(10))
-                            RecentUpdates.Dequeue();
+                        await ProcessSummary(sum);
 
                     }, stoppingToken);
                 }
@@ -104,6 +96,34 @@ namespace Coflnet.Sky.Indexer
 
         }
 
+        private async Task ProcessSummary(AhStateSumary sum)
+        {
+            if (sum.Time < Now - TimeSpan.FromMinutes(5))
+                return;
+            RecentUpdates.Enqueue(sum);
+            using (var context = new HypixelContext())
+            {
+                await ReactiveFalsyDeactivated(sum, context);
+            }
+
+            if (RecentUpdates.Min(r => r.Time) > Now - TimeSpan.FromMinutes(5))
+                return;
+            if (RecentUpdates.Count < 6)
+                return;
+
+            List<long> missing = FindInactiveAuctions();
+            if (missing.Count == 0)
+                return;
+            await UpdateInactiveAuctions(missing);
+            KeepQueueSizeInCheck();
+        }
+
+        private void KeepQueueSizeInCheck()
+        {
+            if (RecentUpdates.Peek().Time < Now - TimeSpan.FromMinutes(10))
+                RecentUpdates.Dequeue();
+        }
+
         private List<long> FindInactiveAuctions()
         {
             if (RecentUpdates.Where(u => u.Time > Now - TimeSpan.FromMinutes(4.4)).Count() < 4)
@@ -112,7 +132,7 @@ namespace Coflnet.Sky.Indexer
             var oldest = RecentUpdates.Dequeue();
             var mostRecent = RecentUpdates.Where(u => u.Time > Now - TimeSpan.FromMinutes(5)).ToList();
             List<long> missing = new List<long>();
-            Console.WriteLine($"Checking parts {mostRecent.Count()} with time {mostRecent.First().Time} avg part counts: {string.Join(',',mostRecent.GroupBy(m=>m.Part).Select(m=>m.Average(d=>d.ActiveAuctions.Count())))} ");
+            Console.WriteLine($"Checking parts {mostRecent.Count()} with time {mostRecent.First().Time} avg part counts: {string.Join(',', mostRecent.GroupBy(m => m.Part).Select(m => m.Average(d => d.ActiveAuctions.Count())))} ");
             foreach (var item in oldest.ActiveAuctions.Keys)
             {
                 var exists = false;
@@ -146,10 +166,10 @@ namespace Coflnet.Sky.Indexer
 
                     var toUpdate = await context.Auctions.Where(a => missing.Contains(a.UId) && a.End > Now).ToListAsync();
 
-                    if (toUpdate.Count > 60)
+                    if (toUpdate.Count > 100)
                     {
                         Console.WriteLine($"to many went inactive {toUpdate.Count}, dropping");
-                        toUpdate = toUpdate.Take(30).ToList();
+                        toUpdate = toUpdate.Take(50).ToList();
                     }
                     foreach (var item in toUpdate)
                     {

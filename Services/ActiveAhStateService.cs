@@ -84,11 +84,13 @@ namespace Coflnet.Sky.Indexer
                 {
                     await Kafka.KafkaConsumer.Consume<AhStateSumary>(Core.Program.KafkaHost, config["TOPICS:AH_SUMARY"], async sum =>
                     {
+                        if(sum.Time < Now - TimeSpan.FromMinutes(50))
+                            return;
                         Console.WriteLine($"\n-->Consumed update sumary {sum.Time} {sum.ActiveAuctions.Count}");
                         using var spancontext = GlobalTracer.Instance.BuildSpan("AhSumaryUpdate").StartActive();
                         await ProcessSummary(sum);
 
-                    }, stoppingToken);
+                    }, stoppingToken, "sky-indexer");
                 }
                 catch (Exception e)
                 {

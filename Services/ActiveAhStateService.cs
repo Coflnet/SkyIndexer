@@ -68,7 +68,7 @@ namespace Coflnet.Sky.Indexer
         {
             await LoadActiveFromDb();
 
-            await Task.Run(async () =>
+            _ = Task.Run(async () =>
             {
 
                 while (!stoppingToken.IsCancellationRequested)
@@ -78,7 +78,7 @@ namespace Coflnet.Sky.Indexer
                     KeepQueueSizeInCheck();
                 }
             });
-
+            Console.WriteLine("Starting to consume auction summary");
             while (!stoppingToken.IsCancellationRequested)
                 try
                 {

@@ -43,7 +43,7 @@ namespace Coflnet.Sky.Indexer
                 try
                 {
                     var activeAuctions = new System.Collections.Concurrent.ConcurrentDictionary<long, long>(
-                            await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 2500000 && a.End > Now)
+                            await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 4500000 && a.End > Now)
                             .Select(a => a.UId)
                             .ToDictionaryAsync(a => a));
                     await ProcessSummary(new AhStateSumary()

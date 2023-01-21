@@ -90,7 +90,7 @@ namespace Coflnet.Sky.Indexer
                         using var spancontext = GlobalTracer.Instance.BuildSpan("AhSumaryUpdate").StartActive();
                         await ProcessSummary(sum);
 
-                    }, stoppingToken, "sky-indexer");
+                    }, stoppingToken, "sky-indexer", AutoOffsetReset.Latest);
                 }
                 catch (Exception e)
                 {

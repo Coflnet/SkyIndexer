@@ -160,6 +160,7 @@ namespace Coflnet.Sky.Indexer
             return missing;
         }
 
+        private bool wentThroughBacklog = false;
         private async Task UpdateInactiveAuctions(List<long> missing)
         {
             using (var context = new HypixelContext())
@@ -169,11 +170,12 @@ namespace Coflnet.Sky.Indexer
 
                     var toUpdate = await context.Auctions.Where(a => missing.Contains(a.UId) && a.End > Now).ToListAsync();
 
-                    if (toUpdate.Count > 100)
+                    if (toUpdate.Count > 100 && wentThroughBacklog)
                     {
                         Console.WriteLine($"to many went inactive {toUpdate.Count}, dropping");
                         toUpdate = toUpdate.Take(50).ToList();
                     }
+                    wentThroughBacklog = true;
                     foreach (var item in toUpdate)
                     {
                         if (item.UId % 5 == 0)

@@ -47,37 +47,6 @@ namespace Coflnet.Sky.Indexer
             }).ConfigureAwait(false);
             NameUpdater.Run();
 
-                    
-            Coflnet.Sky.Core.Program.RunIsolatedForever(async () =>
-            {
-                if (System.Net.Dns.GetHostName().Contains("ekwav"))
-                {
-                    await Task.Delay(TimeSpan.FromMinutes(3));
-                    return;
-                }
-                while (true)
-                {
-                    using var context = new HypixelContext();
-                    var pulls = await context.BazaarPull
-                            .Include(p => p.Products).ThenInclude(p => p.QuickStatus)
-                            .Take(50).ToListAsync();
-                    if (pulls.Count == 0)
-                        throw new TaskCanceledException();
-                    context.RemoveRange(pulls);
-                    foreach (var pull in pulls)
-                    {
-                        var products = pull.Products;
-                        MarkAllForDeletion(context, products);
-                    }
-                    var x = await context.SaveChangesAsync();
-                    Console.WriteLine($"removed {pulls.FirstOrDefault()?.Products.FirstOrDefault().Id} " + x);
-
-                    //var productsWithNoPull = await context.BazaarPrices.Where(p => p.PullInstance == null).Include(p => p.QuickStatus).Take(500).ToListAsync();
-                    //MarkAllForDeletion(context, productsWithNoPull);
-                    var y = await context.SaveChangesAsync();
-                    //Console.WriteLine($"removed {productsWithNoPull.FirstOrDefault().Id} " + y);
-                }
-            }, "Bazaar delete failed");
 
             /*try
             {

@@ -42,10 +42,11 @@ namespace Coflnet.Sky.Indexer
                 using var spancontext = GlobalTracer.Instance.BuildSpan("LoadActive").StartActive();
                 try
                 {
+                    var activeList = await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 4500000 && a.End > Now)
+                            .Select(a => new { a.UId, a.End })
+                            .ToListAsync();
                     var activeAuctions = new System.Collections.Concurrent.ConcurrentDictionary<long, long>(
-                            await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 4500000 && a.End > Now)
-                            .Select(a => a.UId)
-                            .ToDictionaryAsync(a => a));
+                            activeList.ToDictionary(a => a.UId, a => a.End.Ticks));
                     await ProcessSummary(new AhStateSumary()
                     {
                         ActiveAuctions = activeAuctions,
@@ -84,7 +85,7 @@ namespace Coflnet.Sky.Indexer
                 {
                     await Kafka.KafkaConsumer.Consume<AhStateSumary>(Core.Program.KafkaHost, config["TOPICS:AH_SUMARY"], async sum =>
                     {
-                        if(sum.Time < Now - TimeSpan.FromMinutes(50))
+                        if (sum.Time < Now - TimeSpan.FromMinutes(50))
                             return;
                         Console.WriteLine($"\n-->Consumed update sumary {sum.Time} {sum.ActiveAuctions.Count}");
                         using var spancontext = GlobalTracer.Instance.BuildSpan("AhSumaryUpdate").StartActive();

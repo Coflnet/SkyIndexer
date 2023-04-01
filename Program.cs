@@ -19,6 +19,8 @@ namespace Coflnet.Sky.Indexer
             // migrations
             using (var context = new HypixelContext())
             {
+                // if you setup from scratch you may want to use EnsureCreated because for unkown reasons migrations don't want to create an empty db
+                // context.Database.EnsureCreated();
                 context.Database.Migrate();
             }
             ItemDetails.Instance.LoadFromDB();

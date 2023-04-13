@@ -171,10 +171,10 @@ namespace Coflnet.Sky.Indexer
 
                     var toUpdate = await context.Auctions.Where(a => missing.Contains(a.UId) && a.End > Now).ToListAsync();
 
-                    if (toUpdate.Count > 100 && wentThroughBacklog)
+                    if (toUpdate.Count > 300 && wentThroughBacklog)
                     {
                         Console.WriteLine($"to many went inactive {toUpdate.Count}, dropping");
-                        toUpdate = toUpdate.Take(50).ToList();
+                        toUpdate = toUpdate.Take(150).ToList();
                     }
                     wentThroughBacklog = true;
                     foreach (var item in toUpdate)

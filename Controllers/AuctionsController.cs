@@ -32,11 +32,27 @@ public class AuctionsController : ControllerBase
     {
         var uid = AuctionService.Instance.GetId(uuid);
         var auction = await db.Auctions.Where(a => a.UId == uid).Include(a => a.NbtData).Include(a => a.NBTLookup).FirstOrDefaultAsync();
-        Console.WriteLine(JsonConvert.SerializeObject(auction.NBTLookup,Formatting.Indented));
+        Console.WriteLine(JsonConvert.SerializeObject(auction.NBTLookup, Formatting.Indented));
         auction.NBTLookup = NBT.CreateLookup(auction);
-        Console.WriteLine(JsonConvert.SerializeObject(auction.NBTLookup,Formatting.Indented));
+        Console.WriteLine(JsonConvert.SerializeObject(auction.NBTLookup, Formatting.Indented));
         db.Update(auction);
         await db.SaveChangesAsync();
+    }
+
+    [Route("reindex")]
+    [HttpPost]
+    public async Task<int> Reindex(int amount, int offset)
+    {
+        var max = db.Auctions.Max(d => d.Id);
+        var auctions = await db.Auctions.Include(a => a.Bids).Where(a => a.Id > max - amount - offset && a.Id < max - offset && a.Bin && a.Bids.Count > 0 && a.Bids.First().Timestamp != a.End).ToListAsync();
+        foreach (var auction in auctions)
+        {
+            if (auction.End.RoundDown(TimeSpan.FromMinutes(1)) == auction.Bids.First().Timestamp.RoundDown(TimeSpan.FromMinutes(1)))
+                continue;
+            auction.End = auction.Bids.First().Timestamp;
+            db.Update(auction);
+        }
+        return await db.SaveChangesAsync();
     }
 }
 

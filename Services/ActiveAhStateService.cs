@@ -169,7 +169,7 @@ namespace Coflnet.Sky.Indexer
                 try
                 {
 
-                    var toUpdate = await context.Auctions.Where(a => missing.Contains(a.UId) && a.End > Now).ToListAsync();
+                    var toUpdate = await context.Auctions.Where(a => missing.Contains(a.UId) && a.End > Now).Include(a => a.Bids).ToListAsync();
 
                     if (toUpdate.Count > 300 && wentThroughBacklog)
                     {
@@ -181,7 +181,10 @@ namespace Coflnet.Sky.Indexer
                     {
                         if (item.UId % 5 == 0)
                             Console.WriteLine("inactive auction " + item.Uuid);
-                        item.End = Now;
+                        if (item.Bin && item.Bids.Count > 0)
+                            item.End = item.Bids.Max(b => b.Timestamp);
+                        else
+                            item.End = Now;
                         context.Update(item);
                     }
                     var sumarised = toUpdate.GroupBy(b => b.AuctioneerId).Select(b => b.First()).ToList();

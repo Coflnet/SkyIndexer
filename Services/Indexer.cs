@@ -214,6 +214,7 @@ namespace Coflnet.Sky.Indexer
                         {
                             await ToDb(auctions.Take(auctions.Count() / 2));
                             await ToDb(auctions.Skip(auctions.Count() / 2));
+                            return;
                         }
                     }
                     if (i >= 4)
@@ -254,6 +255,9 @@ namespace Coflnet.Sky.Indexer
                         Logger.Instance.Info($"Fixing highest bid amount for {auction.Uuid}");
                         auction.HighestBidAmount = auction.Bids.Max(b => b.Amount);
                     }
+                    // remove dashes if present
+                    if(auction.Uuid.Contains('-'))
+                        auction.Uuid = auction.Uuid.Replace("-", "");
                     context.Auctions.Add(auction);
 
                 }

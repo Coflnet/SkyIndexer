@@ -12,6 +12,7 @@ using Microsoft.Extensions.Hosting;
 using Newtonsoft.Json;
 using OpenTracing.Util;
 using RestSharp;
+using Coflnet.Kafka;
 
 namespace Coflnet.Sky.Indexer
 {
@@ -21,11 +22,12 @@ namespace Coflnet.Sky.Indexer
         Queue<AhStateSumary> RecentUpdates = new Queue<AhStateSumary>();
         private const int LoadedFromDB = 8001;
         public AhStateSumary LastUpdate => RecentUpdates.LastOrDefault();
+        private KafkaCreator kafkaCreator;
 
-
-        public ActiveAhStateService(IConfiguration config)
+        public ActiveAhStateService(IConfiguration config, KafkaCreator kafkaCreator)
         {
             this.config = config;
+            this.kafkaCreator = kafkaCreator;
         }
 
 
@@ -83,7 +85,7 @@ namespace Coflnet.Sky.Indexer
             while (!stoppingToken.IsCancellationRequested)
                 try
                 {
-                    await Kafka.KafkaConsumer.Consume<AhStateSumary>(Core.Program.KafkaHost, config["TOPICS:AH_SUMARY"], async sum =>
+                    await Kafka.KafkaConsumer.Consume<AhStateSumary>(config, config["TOPICS:AH_SUMARY"], async sum =>
                     {
                         if (sum.Time < Now - TimeSpan.FromMinutes(50))
                             return;
@@ -229,7 +231,7 @@ namespace Coflnet.Sky.Indexer
 
         private void RequestCheck(List<SaveAuction> sumarised)
         {
-            using (var p = new ProducerBuilder<string, SaveAuction>(producerConfig).SetValueSerializer(SerializerFactory.GetSerializer<SaveAuction>()).Build())
+            using (var p = kafkaCreator.BuildProducer<string, SaveAuction>())
             {
                 foreach (var item in sumarised)
                 {

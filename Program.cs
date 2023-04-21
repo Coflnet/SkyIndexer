@@ -29,10 +29,6 @@ namespace Coflnet.Sky.Indexer
             Console.WriteLine("booting db dependend stuff");
 
             Indexer.LoadFromDB();
-            Coflnet.Sky.Core.Program.RunIsolatedForever(async () =>
-            {
-                await Indexer.ProcessQueue(System.Threading.CancellationToken.None);
-            }, "An error occured while indexing");
             //NameUpdater.Run();
             Task.Run(async () =>
             {

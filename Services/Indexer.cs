@@ -11,10 +11,12 @@ using dev;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
 using Coflnet.Sky.Core;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 
 namespace Coflnet.Sky.Indexer
 {
-    public class Indexer
+    public class Indexer : BackgroundService
     {
         private const int MAX_QUEUE_SIZE = 10000;
         private const int AUCTION_CHUNK_SIZE = 1000;
@@ -33,7 +35,12 @@ namespace Coflnet.Sky.Indexer
         public static DateTime LastFinish { get; internal set; }
 
         private static ConcurrentQueue<SaveAuction> auctionsQueue = new ConcurrentQueue<SaveAuction>();
+        private IConfiguration config;
 
+        public Indexer(IConfiguration config)
+        {
+            this.config = config;
+        }
 
         static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert", "Tracks the count of inserted auctions");
 
@@ -93,14 +100,14 @@ namespace Coflnet.Sky.Indexer
             DeleteDir(targetTmp);
         }
 
-        public static async Task ProcessQueue(CancellationToken stopToken)
+        protected override async Task ExecuteAsync(CancellationToken stopToken)
         {
             var token = new CancellationTokenSource();
 
             try
             {
                 await Coflnet.Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
-                    Sky.Core.Program.KafkaHost,
+                    config,
                     new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic },
                     ToDb,
                     token.Token,

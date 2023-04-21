@@ -102,15 +102,16 @@ namespace Coflnet.Sky.Indexer
 
         protected override async Task ExecuteAsync(CancellationToken stopToken)
         {
-            var token = new CancellationTokenSource();
-
+            var tokenSource = new CancellationTokenSource();
+            stopToken.Register(() => tokenSource.Cancel());
+            Console.WriteLine("Starting consuming updates");
             try
             {
                 await Coflnet.Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
                     config,
                     new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic },
                     ToDb,
-                    token.Token,
+                    tokenSource.Token,
                     "sky-indexer",
                     200
                     );
@@ -120,7 +121,7 @@ namespace Coflnet.Sky.Indexer
                 dev.Logger.Instance.Error(e, $"consuming failed {e.GetType().Name}");
             }
             // cancel all as they will be restarted
-            token.Cancel();
+            tokenSource.Cancel();
 
         }
 
@@ -170,7 +171,8 @@ namespace Coflnet.Sky.Indexer
 
         private static async Task ToDb(IEnumerable<SaveAuction> auctions)
         {
-            auctions = auctions.GroupBy(a => a.UId).Select(g => g.OrderByDescending(a => a.Bids.Count).First()).ToList();
+            Console.WriteLine("\rdb batch " + auctions.Count());
+            auctions = auctions.GroupBy(a => a.UId).Select(g => g.OrderByDescending(a => a.Bids?.Count).First()).ToList();
             lock (nameof(highestPlayerId))
             {
                 if (highestPlayerId == 1)

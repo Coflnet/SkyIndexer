@@ -122,6 +122,7 @@ namespace Coflnet.Sky.Indexer
             }
             // cancel all as they will be restarted
             tokenSource.Cancel();
+            throw new Exception("Kafka consumer failed");
 
         }
 
@@ -171,7 +172,6 @@ namespace Coflnet.Sky.Indexer
 
         private static async Task ToDb(IEnumerable<SaveAuction> auctions)
         {
-            Console.WriteLine("\rdb batch " + auctions.Count());
             auctions = auctions.GroupBy(a => a.UId).Select(g => g.OrderByDescending(a => a.Bids?.Count).First()).ToList();
             lock (nameof(highestPlayerId))
             {

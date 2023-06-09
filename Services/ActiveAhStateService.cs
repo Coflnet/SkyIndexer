@@ -214,7 +214,9 @@ namespace Coflnet.Sky.Indexer
             Console.WriteLine($"No need to reactivate almost expired {almostEnded.Count()} {almostEnded.FirstOrDefault().Key}");
             // maximimum time considered in the past to require reactivation (sells can take up to 2 minutes to be saved)
             var maxExpiry = Now - TimeSpan.FromMinutes(1.5);
-            var foundActiveAgain = await context.Auctions.Where(a => toCheck.Contains(a.UId) && a.End < maxExpiry).ToListAsync();
+            var foundActiveAgain = await context.Auctions.Where(a => toCheck.Contains(a.UId) && a.End < maxExpiry && (a.Bids.Count() == 0 || !a.Bin)).ToListAsync();
+            if(foundActiveAgain.Count > 100_000)
+                throw new Exception("impossible many auctions to reactivate, abording");
             foreach (var item in foundActiveAgain)
             {
                 var ticks = activeAuctions.GetValueOrDefault(item.UId);

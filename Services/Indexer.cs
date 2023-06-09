@@ -290,6 +290,8 @@ namespace Coflnet.Sky.Indexer
             {
                 // an ended auction
                 dbauction.End = auction.End;
+                if(dbauction.End > DateTime.UtcNow)
+                    dbauction.End = DateTime.UtcNow;
                 context.Auctions.Update(dbauction);
                 return;
             }

@@ -12,6 +12,7 @@
 
   <ItemGroup>
     <PackageReference Include="AspNetCoreRateLimit" Version="4.0.1" />
+    <PackageReference Include="CassandraCSharpDriver" Version="3.19.2" />
     <PackageReference Include="RateLimiter" Version="2.2.0" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.1.5" />
     <PackageReference Include="Swashbuckle.AspNetCore.Newtonsoft" Version="6.1.5" />

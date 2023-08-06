@@ -86,7 +86,7 @@ namespace Coflnet.Sky.Indexer
                 }
 
                 await context.SaveChangesAsync();
-                var grandRuneId = ItemDetails.Instance.GetItemIdForTag("UNIQUE_RUNE", true);
+                var grandRuneId = ItemDetails.Instance.GetItemIdForTag("ABICASE", true);
                 var batch = await context.Auctions.Where(a => a.ItemId == grandRuneId).Include(a => a.NbtData).Take(200).ToListAsync();
                 foreach (var auction in batch)
                 {

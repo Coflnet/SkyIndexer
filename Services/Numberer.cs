@@ -86,6 +86,18 @@ namespace Coflnet.Sky.Indexer
                 }
 
                 await context.SaveChangesAsync();
+                var grandRuneId = ItemDetails.Instance.GetItemIdForTag("UNIQUE_RUNE", true);
+                var batch = await context.Auctions.Where(a => a.ItemId == grandRuneId).Include(a => a.NbtData).Take(200).ToListAsync();
+                foreach (var auction in batch)
+                {
+                    var tag = auction.NbtData.Root();
+                    tag.Add(new fNbt.NbtString("id", auction.Tag));
+                    auction.Tag = NBT.ItemIdFromExtra(tag);
+                    // renumber in next iteration
+                    auction.ItemId = 0;
+                    auction.SellerId = 0;
+                }
+                await context.SaveChangesAsync();
 
             }
             if (bidNumberTask != null)

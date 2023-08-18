@@ -253,10 +253,10 @@ namespace Coflnet.Sky.Indexer
                     if (auction.HighestBidAmount == 0 && auction.Bids.Count > 0)
                     {
                         Logger.Instance.Info($"Fixing highest bid amount for {auction.Uuid}");
-                        auction.HighestBidAmount = auction.Bids.Max(b => b.Amount);
                     }
+                    auction.HighestBidAmount = auction.Bids.Select(b => b.Amount).DefaultIfEmpty(auction.HighestBidAmount).Max();
                     // remove dashes if present
-                    if(auction.Uuid.Contains('-'))
+                    if (auction.Uuid.Contains('-'))
                         auction.Uuid = auction.Uuid.Replace("-", "");
                     context.Auctions.Add(auction);
 
@@ -290,7 +290,7 @@ namespace Coflnet.Sky.Indexer
             {
                 // an ended auction
                 dbauction.End = auction.End;
-                if(dbauction.End > DateTime.UtcNow)
+                if (dbauction.End > DateTime.UtcNow)
                     dbauction.End = DateTime.UtcNow;
                 context.Auctions.Update(dbauction);
                 return;
@@ -305,7 +305,7 @@ namespace Coflnet.Sky.Indexer
                 dbauction.ProfileId = auction.ProfileId;
             if (dbauction.Start == default(DateTime))
                 dbauction.Start = auction.Start;
-            if(dbauction.End > auction.End || dbauction.End == default(DateTime))
+            if (dbauction.End > auction.End || dbauction.End == default(DateTime))
                 dbauction.End = auction.End;
             if (dbauction.Category == Category.UNKNOWN)
                 dbauction.Category = auction.Category;
@@ -318,10 +318,9 @@ namespace Coflnet.Sky.Indexer
         {
             var highestBid = auction.HighestBidAmount;
             // special case sometimes highest bid is not set
-            if (highestBid == 0 && auction.Bids.Count > 0)
+            if (auction.Bids.Count > 0)
                 highestBid = auction.Bids.Max(b => b.Amount);
-            if (dbauction.HighestBidAmount < highestBid)
-                dbauction.HighestBidAmount = highestBid;
+            dbauction.HighestBidAmount = Math.Max(highestBid, dbauction.HighestBidAmount);
         }
 
         private static async Task<Dictionary<string, SaveAuction>> GetExistingAuctions(IEnumerable<SaveAuction> auctions, HypixelContext context)

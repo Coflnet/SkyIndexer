@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Coflnet.Sky.Core;
@@ -14,11 +16,13 @@ namespace Coflnet.Sky.Indexer.Controllers;
 public class AuctionsController : ControllerBase
 {
     private readonly ILogger<AuctionsController> _logger;
+    private ConcurrentQueue<AuctionResult> endedQueue;
     HypixelContext db;
-    public AuctionsController(ILogger<AuctionsController> logger, HypixelContext db)
+    public AuctionsController(ILogger<AuctionsController> logger, HypixelContext db, ConcurrentQueue<AuctionResult> endedQueue)
     {
         _logger = logger;
         this.db = db;
+        this.endedQueue = endedQueue;
     }
 
     /// <summary>
@@ -53,6 +57,18 @@ public class AuctionsController : ControllerBase
             db.Update(auction);
         }
         return await db.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Returns recently added auctions previw 
+    /// </summary>
+    /// <returns></returns>
+    [Route("ended")]
+    [HttpGet]
+    [ProducesResponseType(typeof(List<AuctionResult>), 200)]
+    public async Task<string> GetEnded()
+    {
+        return MessagePack.MessagePackSerializer.ToJson(endedQueue.ToArray());
     }
 }
 

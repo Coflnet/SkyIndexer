@@ -81,7 +81,6 @@ namespace Coflnet.Sky.Indexer
                     bidNumberTask = Task.Run(NumberBids);
                     await NumberAuctions(context);
 
-
                     auctionsWithoutId.Set(context.Auctions.Count(a => a.SellerId == 0));
                 }
 

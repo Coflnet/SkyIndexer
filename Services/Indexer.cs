@@ -23,7 +23,6 @@ namespace Coflnet.Sky.Indexer
         private static bool abort;
         private static bool minimumOutput;
         public static int IndexedAmount => count;
-        public static int QueueCount => auctionsQueue.Count;
 
         public static readonly string MissingAuctionsTopic = SimplerConfig.Config.Instance["TOPICS:MISSING_AUCTION"];
         public static readonly string SoldAuctionTopic = SimplerConfig.Config.Instance["TOPICS:SOLD_AUCTION"];
@@ -34,12 +33,13 @@ namespace Coflnet.Sky.Indexer
         private static int count;
         public static DateTime LastFinish { get; internal set; }
 
-        private static ConcurrentQueue<SaveAuction> auctionsQueue = new ConcurrentQueue<SaveAuction>();
+        private  ConcurrentQueue<AuctionResult> endedAuctionsQueue;
         private IConfiguration config;
 
-        public Indexer(IConfiguration config)
+        public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue)
         {
             this.config = config;
+            this.endedAuctionsQueue = endedAuctionsQueue;
         }
 
         static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert", "Tracks the count of inserted auctions");
@@ -74,7 +74,8 @@ namespace Coflnet.Sky.Indexer
                 var earlybreak = 100;
                 foreach (var item in work)
                 {
-                    await ToDb(item);
+                    throw new Exception("uhm not used?");
+                    //  await ToDb(item);
                     if (earlybreak-- <= 0)
                         break;
                 }
@@ -170,13 +171,22 @@ namespace Coflnet.Sky.Indexer
 
         public static int highestPlayerId = 1;
 
-        private static async Task ToDb(IEnumerable<SaveAuction> auctions)
+        private async Task ToDb(IEnumerable<SaveAuction> auctions)
         {
             auctions = auctions.GroupBy(a => a.UId).Select(g => g.OrderByDescending(a => a.Bids?.Count).First()).ToList();
             lock (nameof(highestPlayerId))
             {
                 if (highestPlayerId == 1)
                     LoadFromDB();
+            }
+
+            foreach (var item in auctions)
+            {
+                if (item.End > DateTime.UtcNow)
+                    continue;
+                endedAuctionsQueue.Enqueue(new AuctionResult(item));
+                if (endedAuctionsQueue.Count > 40)
+                    endedAuctionsQueue.TryDequeue(out var _);
             }
 
             for (int i = 0; i < 5; i++)

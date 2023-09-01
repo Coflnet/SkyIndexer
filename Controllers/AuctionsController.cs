@@ -68,7 +68,7 @@ public class AuctionsController : ControllerBase
     [ProducesResponseType(typeof(List<AuctionResult>), 200)]
     public async Task<string> GetEnded()
     {
-        return MessagePack.MessagePackSerializer.ToJson(endedQueue.ToArray());
+        return JsonConvert.SerializeObject(endedQueue.ToArray());
     }
 }
 

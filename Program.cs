@@ -25,6 +25,7 @@ namespace Coflnet.Sky.Indexer
             }
             ItemDetails.Instance.LoadFromDB();
             Task.Run(Coflnet.Sky.Core.Program.MakeSureRedisIsInitialized);
+            (NBT.Instance as NBT).CanWriteToDb = true;
 
             Console.WriteLine("booting db dependend stuff");
 

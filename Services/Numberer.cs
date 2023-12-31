@@ -13,14 +13,14 @@ namespace Coflnet.Sky.Indexer
 {
     public class Numberer : BackgroundService
     {
-        private ActivitySource activitySource;
-        private ILogger<Numberer> logger;
-        Gauge bidsWithoutId = Metrics.CreateGauge("sky_indexer_bids_without_id", "Number of Bids that don't yet have a player id");
-        Gauge auctionsWithoutId = Metrics.CreateGauge("sky_indexer_auctions_without_id", "Number of Auctions that don't yet have a player id");
-        Counter auctionsNumbered = Metrics.CreateCounter("sky_indexer_auctions_numbered", "Number of Auctions that have been numbered");
-        Counter bidsNumbered = Metrics.CreateCounter("sky_indexer_bids_numbered", "Number of Bids that have been numbered");
-        Counter playersNumbered = Metrics.CreateCounter("sky_indexer_players_numbered", "Number of Players that have been numbered");
-        Counter doublePlayersReset = Metrics.CreateCounter("sky_indexer_double_players_reset", "Number of Players that have been reset");
+        private readonly ActivitySource activitySource;
+        private readonly ILogger<Numberer> logger;
+        readonly Gauge bidsWithoutId = Metrics.CreateGauge("sky_indexer_bids_without_id", "Number of Bids that don't yet have a player id");
+        readonly Gauge auctionsWithoutId = Metrics.CreateGauge("sky_indexer_auctions_without_id", "Number of Auctions that don't yet have a player id");
+        readonly Counter auctionsNumbered = Metrics.CreateCounter("sky_indexer_auctions_numbered", "Number of Auctions that have been numbered");
+        readonly Counter bidsNumbered = Metrics.CreateCounter("sky_indexer_bids_numbered", "Number of Bids that have been numbered");
+        readonly Counter playersNumbered = Metrics.CreateCounter("sky_indexer_players_numbered", "Number of Players that have been numbered");
+        readonly Counter doublePlayersReset = Metrics.CreateCounter("sky_indexer_double_players_reset", "Number of Players that have been reset");
 
         public Numberer(ActivitySource activitySource, ILogger<Numberer> logger)
         {
@@ -182,7 +182,7 @@ namespace Coflnet.Sky.Indexer
             context.Auctions.Update(auction);
         }
 
-        static int batchSize = 2000;
+        static readonly int batchSize = 2000;
 
         public Numberer()
         {

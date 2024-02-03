@@ -33,7 +33,7 @@ namespace Coflnet.Sky.Indexer
             foreach (var player in players)
             {
                 var uuid = player.UuId;
-                await Task.Delay(400);
+                await Task.Delay(500);
                 _ = Task.Run(async () =>
                 {
                     try

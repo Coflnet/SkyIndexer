@@ -43,64 +43,6 @@ namespace Coflnet.Sky.Indexer
         }
 
         static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert", "Tracks the count of inserted auctions");
-
-
-
-        public static async Task LastHourIndex()
-        {
-
-            DateTime indexStart;
-            string targetTmp, pullPath;
-            VariableSetup(out indexStart, out targetTmp, out pullPath);
-            //DeleteDir(targetTmp);
-            if (!Directory.Exists(pullPath) && !Directory.Exists(targetTmp))
-            {
-                // update first
-                if (!Sky.Core.Program.FullServerMode)
-                    Console.WriteLine("nothing to build indexes from, run again with option u first");
-                return;
-            }
-            // only copy the pull path if there is no temp work path yet
-            if (!Directory.Exists(targetTmp))
-                Directory.Move(pullPath, targetTmp);
-            else
-                Console.WriteLine("Resuming work");
-
-            try
-            {
-                Console.WriteLine("working");
-
-                var work = PullData();
-                var earlybreak = 100;
-                foreach (var item in work)
-                {
-                    throw new Exception("uhm not used?");
-                    //  await ToDb(item);
-                    if (earlybreak-- <= 0)
-                        break;
-                }
-
-                Console.WriteLine($"Indexing done, Indexed: {count} NameRequests: {Sky.Core.Program.RequestsSinceStart}");
-
-                if (!abort)
-                    // successful made this index save the startTime
-                    FileController.SaveAs("lastIndex", indexStart);
-            }
-            catch (System.AggregateException e)
-            {
-                // oh no an error occured
-                Logger.Instance.Error($"An error occured while indexing, abording: {e.Message} {e.StackTrace}");
-                return;
-                //FileController.DeleteFolder("auctionpull");
-
-                //Directory.Move(FileController.GetAbsolutePath("awork"),FileController.GetAbsolutePath("auctionpull"));
-
-            }
-            LastFinish = DateTime.Now;
-
-            DeleteDir(targetTmp);
-        }
-
         protected override async Task ExecuteAsync(CancellationToken stopToken)
         {
             var tokenSource = new CancellationTokenSource();
@@ -127,47 +69,6 @@ namespace Coflnet.Sky.Indexer
 
         }
 
-        private static void VariableSetup(out DateTime indexStart, out string targetTmp, out string pullPath)
-        {
-            indexStart = DateTime.Now;
-            if (!Sky.Core.Program.FullServerMode)
-                Console.WriteLine($"{indexStart}");
-            var lastIndexStart = new DateTime(2020, 4, 25);
-            if (FileController.Exists("lastIndex"))
-                lastIndexStart = FileController.LoadAs<DateTime>("lastIndex");
-            lastIndexStart = lastIndexStart - new TimeSpan(0, 20, 0);
-            targetTmp = FileController.GetAbsolutePath("awork");
-            pullPath = FileController.GetAbsolutePath("apull");
-        }
-
-        static IEnumerable<List<SaveAuction>> PullData()
-        {
-            var path = "awork";
-            foreach (var item in FileController.FileNames("*", path))
-            {
-                if (abort)
-                {
-                    Console.WriteLine("Stopped indexer");
-                    yield break;
-                }
-                var fullPath = $"{path}/{item}";
-                List<SaveAuction> data = null;
-                try
-                {
-                    data = FileController.LoadAs<List<SaveAuction>>(fullPath);
-                }
-                catch (Exception)
-                {
-                    Console.WriteLine("could not load downloaded auction-buffer");
-                    FileController.Move(fullPath, "correupted/" + fullPath);
-                }
-                if (data != null)
-                {
-                    yield return data;
-                    FileController.Delete(fullPath);
-                }
-            }
-        }
 
         public static int highestPlayerId = 1;
 

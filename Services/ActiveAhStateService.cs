@@ -10,9 +10,9 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Newtonsoft.Json;
-using OpenTracing.Util;
 using RestSharp;
 using Coflnet.Kafka;
+using System.Diagnostics;
 
 namespace Coflnet.Sky.Indexer
 {
@@ -23,11 +23,13 @@ namespace Coflnet.Sky.Indexer
         private const int LoadedFromDB = 8001;
         public AhStateSumary LastUpdate => RecentUpdates.LastOrDefault();
         private KafkaCreator kafkaCreator;
+        private ActivitySource source;
 
-        public ActiveAhStateService(IConfiguration config, KafkaCreator kafkaCreator)
+        public ActiveAhStateService(IConfiguration config, KafkaCreator kafkaCreator, ActivitySource source)
         {
             this.config = config;
             this.kafkaCreator = kafkaCreator;
+            this.source = source;
         }
 
 
@@ -41,7 +43,7 @@ namespace Coflnet.Sky.Indexer
         {
             using (var context = new HypixelContext())
             {
-                using var spancontext = GlobalTracer.Instance.BuildSpan("LoadActive").StartActive();
+                using var spancontext = source.StartActivity("LoadActive");
                 try
                 {
                     var activeList = await context.Auctions.Where(a => a.Id > context.Auctions.Max(auc => auc.Id) - 4500000 && a.End > Now)
@@ -90,7 +92,7 @@ namespace Coflnet.Sky.Indexer
                         if (sum.Time < Now - TimeSpan.FromMinutes(50))
                             return;
                         Console.WriteLine($"\n-->Consumed update sumary {sum.Time} {sum.ActiveAuctions.Count}");
-                        using var spancontext = GlobalTracer.Instance.BuildSpan("AhSumaryUpdate").StartActive();
+                        using var spancontext = source.StartActivity("AhSumaryUpdate");
                         await ProcessSummary(sum);
 
                     }, stoppingToken, "sky-indexer", AutoOffsetReset.Latest);

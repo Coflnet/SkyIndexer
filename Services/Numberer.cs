@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using System.Diagnostics;
 using Prometheus;
 using System.Collections.Generic;
+using fNbt.Tags;
 
 namespace Coflnet.Sky.Indexer
 {
@@ -90,7 +91,7 @@ namespace Coflnet.Sky.Indexer
                 foreach (var auction in batch)
                 {
                     var tag = auction.NbtData.Root();
-                    tag.Add(new fNbt.NbtString("id", auction.Tag));
+                    tag.Add(new NbtString("id", auction.Tag));
                     auction.Tag = NBT.ItemIdFromExtra(tag);
                     // renumber in next iteration
                     auction.ItemId = 0;

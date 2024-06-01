@@ -2,6 +2,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Coflnet.Sky.Core;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace Coflnet.Sky.Indexer.Controllers;
@@ -36,5 +37,16 @@ public class UserController : ControllerBase
         {
             creationLock.Release();
         }
+    }
+
+    [HttpDelete("{email}")]
+    public async Task<string> DeleteUser(string email, string id)
+    {
+        using var context = new HypixelContext();
+        var user = await context.Users.FirstOrDefaultAsync(u => u.Email == email && u.GoogleId == id) 
+            ?? throw new CoflnetException("user_not_found", "User not found");
+        context.Users.Remove(user);
+        await context.SaveChangesAsync();
+        return user.Id.ToString();
     }
 }

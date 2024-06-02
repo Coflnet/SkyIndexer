@@ -83,14 +83,14 @@ public class AuctionsController : ControllerBase
         foreach (var auction in auctions)
         {
             auction.SellerId = 0;
-            auction.AuctioneerId = "00000000-0000-0000-0000-0000000000" + Random.Shared.Next(1, 254).ToString("X2").PadLeft(2, '0');
+            auction.AuctioneerId = Random.Shared.Next(1, 254).ToString("X2").PadLeft(32, '0');
             db.Update(auction);
         }
         var bids = await db.Bids.Where(b => b.BidderId == playerId).ToListAsync();
         foreach (var bid in bids)
         {
             bid.BidderId = 0;
-            bid.Bidder = "00000000-0000-0000-0000-0000000000" + Random.Shared.Next(1, 254).ToString("X2").PadLeft(2, '0');
+            bid.Bidder = Random.Shared.Next(1, 254).ToString("X2").PadLeft(32, '0');
             db.Update(bid);
         }
         return (await db.SaveChangesAsync(), auctions.Count, bids.Count);

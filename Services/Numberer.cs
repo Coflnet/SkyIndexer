@@ -231,6 +231,9 @@ namespace Coflnet.Sky.Indexer
 
             if (lookup != null && lookup.TryGetValue(uuid, out int lookupId))
                 return lookupId;
+            var numeric = long.Parse(uuid.Replace("-","").Substring(0, 15), System.Globalization.NumberStyles.HexNumber);
+            if (numeric == 0) // special flag uuid
+                return int.Parse(uuid.Split('-').Last(), System.Globalization.NumberStyles.HexNumber);
             var id = await context.Players.Where(p => p.UuId == uuid).Select(p => p.Id).FirstOrDefaultAsync();
             if (id == 0)
             {

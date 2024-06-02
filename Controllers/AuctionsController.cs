@@ -70,5 +70,31 @@ public class AuctionsController : ControllerBase
     {
         return JsonConvert.SerializeObject(endedQueue.ToArray());
     }
+
+    [Route("anonymize/{playerUuid}")]
+    [HttpDelete]
+    public async Task<(int, int, int)> Anonymize(string playerUuid, string email)
+    {
+        var user = await UserService.Instance.GetUserByEmail(email);
+        if (user == null)
+            return (0, 0, 0);
+        var playerId = await db.Players.Where(p => p.UuId == playerUuid).Select(p => p.Id).FirstOrDefaultAsync();
+        var auctions = await db.Auctions.Where(a => a.SellerId == playerId).ToListAsync();
+        foreach (var auction in auctions)
+        {
+            auction.SellerId = 0;
+            auction.AuctioneerId = "00000000-0000-0000-0000-0000000000" + Random.Shared.Next(1, 254).ToString("X2").PadLeft(2, '0');
+            db.Update(auction);
+        }
+        var bids = await db.Bids.Where(b => b.BidderId == playerId).ToListAsync();
+        foreach (var bid in bids)
+        {
+            bid.BidderId = 0;
+            bid.Bidder = "00000000-0000-0000-0000-0000000000" + Random.Shared.Next(1, 254).ToString("X2").PadLeft(2, '0');
+            db.Update(bid);
+        }
+        return (await db.SaveChangesAsync(), auctions.Count, bids.Count);
+
+    }
 }
 

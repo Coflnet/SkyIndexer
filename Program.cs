@@ -33,7 +33,7 @@ namespace Coflnet.Sky.Indexer
             //NameUpdater.Run();
             Task.Run(async () =>
             {
-                await Task.Delay(TimeSpan.FromMinutes(3));
+                await Task.Delay(TimeSpan.FromMinutes(1));
                 try
                 {
                     await ItemPrices.Instance.BackfillPrices();

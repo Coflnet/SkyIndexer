@@ -135,8 +135,7 @@ namespace Coflnet.Sky.Indexer
         {
             var auctionsWithoutSellerId = await context
                                     .Auctions.Where(a => a.SellerId == 0)
-                                   // .Include(a => a.Enchantments)
-                                   // .Include(a => a.NBTLookup)
+                                    .Include(a => a.Enchantments)
                                     .OrderByDescending(a => a.Id)
                                     .Take(1000).ToListAsync();
             if (auctionsWithoutSellerId.Count() > 0)

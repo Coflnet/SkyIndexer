@@ -24,20 +24,15 @@ namespace Coflnet.Sky.Indexer
         public AhStateSumary LastUpdate => RecentUpdates.LastOrDefault();
         private KafkaCreator kafkaCreator;
         private ActivitySource source;
+        private WhipedTracker whipedTracker;
 
-        public ActiveAhStateService(IConfiguration config, KafkaCreator kafkaCreator, ActivitySource source)
+        public ActiveAhStateService(IConfiguration config, KafkaCreator kafkaCreator, ActivitySource source, WhipedTracker whipedTracker)
         {
             this.config = config;
             this.kafkaCreator = kafkaCreator;
             this.source = source;
+            this.whipedTracker = whipedTracker;
         }
-
-
-        private static ProducerConfig producerConfig = new ProducerConfig
-        {
-            BootstrapServers = SimplerConfig.Config.Instance["KAFKA_HOST"],
-            LingerMs = 100,
-        };
 
         private async Task LoadActiveFromDb()
         {
@@ -204,7 +199,7 @@ namespace Coflnet.Sky.Indexer
             }
         }
 
-        private static async Task ReactiveFalsyDeactivated(AhStateSumary sumary, HypixelContext context)
+        private async Task ReactiveFalsyDeactivated(AhStateSumary sumary, HypixelContext context)
         {
             if (sumary.PartCount == LoadedFromDB)
                 return;
@@ -216,6 +211,13 @@ namespace Coflnet.Sky.Indexer
             Console.WriteLine($"No need to reactivate almost expired {almostEnded.Count()} {almostEnded.FirstOrDefault().Key}");
             // maximimum time considered in the past to require reactivation (sells can take up to 2 minutes to be saved)
             var maxExpiry = Now - TimeSpan.FromMinutes(1.5);
+            foreach (var item in toCheck.ToList())
+            {
+                if(!whipedTracker.IsWhiped(item))
+                    continue;
+                Console.WriteLine($"Whiped auction {item} found, skipping");
+                toCheck.Remove(item);
+            }
             var foundActiveAgain = await context.Auctions.Where(a => toCheck.Contains(a.UId) && a.End < maxExpiry && (a.Bids.Count() == 0 || !a.Bin)).ToListAsync();
             if(foundActiveAgain.Count > 100_000)
                 throw new Exception("impossible many auctions to reactivate, abording");

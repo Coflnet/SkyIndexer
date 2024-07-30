@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Coflnet.Sky.Core;
+using Coflnet.Sky.Indexer.Controllers;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
@@ -40,6 +41,7 @@ namespace Coflnet.Sky.Indexer
             services.AddSingleton<IConnectionMultiplexer>(provider => ConnectionMultiplexer.Connect(redisOptions));
             services.AddSingleton<NameUpdateService>();
             services.AddHostedService<Numberer>();
+            services.AddSingleton<WhipedTracker>();
             services.AddHostedService<Indexer>();
             services.AddSingleton<ConcurrentQueue<AuctionResult>>();
             services.AddSingleton<Kafka.KafkaCreator>();

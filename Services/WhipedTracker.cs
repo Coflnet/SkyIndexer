@@ -26,6 +26,7 @@ public class WhipedTracker
         if (whipedList.HasValue)
         {
             whipedProfiles = System.Text.Json.JsonSerializer.Deserialize<HashSet<(string playerUuid, string profileId)>>(whipedList);
+            logger.LogInformation("Loaded " + whipedProfiles.Count + " whiped profiles {list}", whipedList);
         }
         var profileUuidLookup = whipedProfiles.Select(p => p.profileId).ToHashSet();
         foreach (var (playerUuid, profileId) in whipedProfiles)

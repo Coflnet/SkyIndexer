@@ -86,7 +86,7 @@ public class WhipedTracker
         if (!whipedProfiles.Add((playerUuid, profileId)))
             return false;
         logger.LogInformation("Added whiped profile " + profileId + " for player " + playerUuid);
-        multiplexer.GetDatabase().StringSet("whipedProfiles", System.Text.Json.JsonSerializer.Serialize(whipedProfiles));
+        multiplexer.GetDatabase().StringSet("whipedProfiles", JsonConvert.SerializeObject(whipedProfiles));
         LoadWhipedAuctions(logger, whipedProfiles.Select(p => p.profileId).ToHashSet(), playerUuid, profileId);
         return true;
     }

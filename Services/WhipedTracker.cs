@@ -25,7 +25,7 @@ public class WhipedTracker
         var whipedList = multiplexer.GetDatabase().StringGet("whipedProfiles");
         if (whipedList.HasValue)
         {
-            whipedProfiles = System.Text.Json.JsonSerializer.Deserialize<HashSet<(string playerUuid, string profileId)>>(whipedList);
+            whipedProfiles = JsonConvert.DeserializeObject<HashSet<(string playerUuid, string profileId)>>(whipedList);
             logger.LogInformation("Loaded " + whipedProfiles.Count + " whiped profiles {list}", whipedList);
         }
         var profileUuidLookup = whipedProfiles.Select(p => p.profileId).ToHashSet();
@@ -76,7 +76,7 @@ public class WhipedTracker
         {
             return false;
         }
-        var request = new RestRequest("api/profile/" + playerUuid + "/hypixel");
+        var request = new RestRequest("api/profile/" + playerUuid + "/hypixel?maxAge=" + DateTimeOffset.UtcNow.AddHours(-1).ToUniversalTime());
         var response = await profileClient.GetAsync(request);
         var profile = JsonConvert.DeserializeObject<ProfileResponse>(response.Content);
         if (profile == null || profile.stats.SkyBlock.Profiles.ContainsKey(Guid.Parse(profileId).ToString("n")))

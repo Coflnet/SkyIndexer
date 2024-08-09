@@ -66,7 +66,6 @@ public class NbtFixer : BackgroundService
             // context.Add(matching.NbtData);
             var changeCount = await context.SaveChangesAsync();
             Console.WriteLine($"changed {changeCount} on {matching.Id}");
-            await Task.Delay(100_000);
         }
         Console.WriteLine($"checked dupplicate nbtdataId {indDb.Count} - {indDb.FirstOrDefault()?.Id}");
     }

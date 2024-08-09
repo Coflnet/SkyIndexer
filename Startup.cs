@@ -41,6 +41,7 @@ namespace Coflnet.Sky.Indexer
             services.AddSingleton<IConnectionMultiplexer>(provider => ConnectionMultiplexer.Connect(redisOptions));
             services.AddSingleton<NameUpdateService>();
             services.AddHostedService<Numberer>();
+            services.AddHostedService<NbtFixer>();
             services.AddSingleton<WhipedTracker>();
             services.AddHostedService<Indexer>();
             services.AddSingleton<ConcurrentQueue<AuctionResult>>();

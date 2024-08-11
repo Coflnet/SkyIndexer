@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Coflnet.Kafka;
 using Coflnet.Sky.Core;
 using Coflnet.Sky.Indexer.Controllers;
 using Microsoft.AspNetCore.Builder;
@@ -44,7 +45,7 @@ namespace Coflnet.Sky.Indexer
             services.AddSingleton<WhipedTracker>();
             services.AddHostedService<Indexer>();
             services.AddSingleton<ConcurrentQueue<AuctionResult>>();
-            services.AddSingleton<Kafka.KafkaCreator>();
+            services.AddSingleton<KafkaCreator>();
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.

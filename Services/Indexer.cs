@@ -50,7 +50,7 @@ namespace Coflnet.Sky.Indexer
             Console.WriteLine("Starting consuming updates");
             try
             {
-                await Coflnet.Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
+                await Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
                     config,
                     new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic },
                     ToDb,

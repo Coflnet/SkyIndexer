@@ -161,6 +161,7 @@ namespace Coflnet.Sky.Indexer
 
         static async Task FlagOldest()
         {
+            return;
             // this is a workaround, because the "updatedat" field is only updated when there is a change
             using (var context = new HypixelContext())
             {

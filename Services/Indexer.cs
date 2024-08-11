@@ -33,7 +33,7 @@ namespace Coflnet.Sky.Indexer
         private static int count;
         public static DateTime LastFinish { get; internal set; }
 
-        private  ConcurrentQueue<AuctionResult> endedAuctionsQueue;
+        private ConcurrentQueue<AuctionResult> endedAuctionsQueue;
         private IConfiguration config;
 
         public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue)

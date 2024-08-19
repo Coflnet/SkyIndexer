@@ -22,11 +22,11 @@ namespace Coflnet.Sky.Indexer
         Queue<AhStateSumary> RecentUpdates = new Queue<AhStateSumary>();
         private const int LoadedFromDB = 8001;
         public AhStateSumary LastUpdate => RecentUpdates.LastOrDefault();
-        private KafkaCreator kafkaCreator;
+        private Kafka.KafkaCreator kafkaCreator;
         private ActivitySource source;
         private WhipedTracker whipedTracker;
 
-        public ActiveAhStateService(IConfiguration config, KafkaCreator kafkaCreator, ActivitySource source, WhipedTracker whipedTracker)
+        public ActiveAhStateService(IConfiguration config, Kafka.KafkaCreator kafkaCreator, ActivitySource source, WhipedTracker whipedTracker)
         {
             this.config = config;
             this.kafkaCreator = kafkaCreator;

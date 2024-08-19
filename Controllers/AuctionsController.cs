@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Coflnet.Sky.Core;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -18,11 +19,13 @@ public class AuctionsController : ControllerBase
     private readonly ILogger<AuctionsController> _logger;
     private ConcurrentQueue<AuctionResult> endedQueue;
     HypixelContext db;
-    public AuctionsController(ILogger<AuctionsController> logger, HypixelContext db, ConcurrentQueue<AuctionResult> endedQueue)
+    private Indexer indexer;
+    public AuctionsController(ILogger<AuctionsController> logger, HypixelContext db, ConcurrentQueue<AuctionResult> endedQueue, Indexer indexer)
     {
         _logger = logger;
         this.db = db;
         this.endedQueue = endedQueue;
+        this.indexer = indexer;
     }
 
     /// <summary>
@@ -95,6 +98,39 @@ public class AuctionsController : ControllerBase
         }
         return (await db.SaveChangesAsync(), auctions.Count, bids.Count);
 
+    }
+
+    MessagePack.MessagePackSerializerOptions options = MessagePack.MessagePackSerializerOptions.Standard.WithResolver(MessagePack.Resolvers.ContractlessStandardResolver.Instance).WithCompression(MessagePack.MessagePackCompression.Lz4BlockArray);
+
+    [Route("export")]
+    [HttpGet]
+    public async Task<string> Export(DateTime start, DateTime end)
+    {
+        var auctions = await db.Auctions.Include(a => a.Bids).Include(a => a.NbtData).Include(a => a.Enchantments).Where(a => a.End > start && a.End < end && a.Id > db.Auctions.Max(au => au.Id) - 5_000_000).ToListAsync();
+        // set count in header 
+        Response.Headers["X-Total-Count"] = auctions.Count.ToString();
+        return Convert.ToBase64String(MessagePack.MessagePackSerializer.Serialize(auctions, options));
+    }
+
+    [Route("import")]
+    [HttpPost]
+    public async Task<int> Import([FromBody] string data)
+    {
+        var auctions = MessagePack.MessagePackSerializer.Deserialize<List<SaveAuction>>(Convert.FromBase64String(data), options);
+        foreach (var item in Batch(auctions, 50))
+        {
+            await indexer.ToDb(item);
+        }
+        return auctions.Count;
+    }
+
+    public static IEnumerable<IEnumerable<T>> Batch<T>(IEnumerable<T> values, int size)
+    {
+        List<T> valueList = values.ToList();
+        for (int i = 0; i < valueList.Count; i += size)
+        {
+            yield return valueList.GetRange(i, Math.Min(size, valueList.Count - i));
+        }
     }
 }
 

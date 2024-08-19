@@ -43,9 +43,10 @@ namespace Coflnet.Sky.Indexer
             services.AddSingleton<NameUpdateService>();
             services.AddHostedService<Numberer>();
             services.AddSingleton<WhipedTracker>();
-            services.AddHostedService<Indexer>();
+            services.AddSingleton<Indexer>();
+            services.AddHostedService<Indexer>(di=>di.GetRequiredService<Indexer>());
             services.AddSingleton<ConcurrentQueue<AuctionResult>>();
-            services.AddSingleton<KafkaCreator>();
+            services.AddSingleton<Kafka.KafkaCreator>();
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.

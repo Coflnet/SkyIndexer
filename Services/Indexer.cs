@@ -43,6 +43,7 @@ namespace Coflnet.Sky.Indexer
         }
 
         static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert", "Tracks the count of inserted auctions");
+        static Prometheus.Counter indexCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_consume", "Tracks the count of consumed auctions");
         protected override async Task ExecuteAsync(CancellationToken stopToken)
         {
             var tokenSource = new CancellationTokenSource();
@@ -107,6 +108,7 @@ namespace Coflnet.Sky.Indexer
 
                         var count = await context.SaveChangesAsync();
                         insertCount.Inc(count);
+                        indexCount.Inc(auctions.Count());
                         LastFinish = DateTime.Now;
                         return;
                     }

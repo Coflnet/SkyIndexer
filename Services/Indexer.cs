@@ -187,6 +187,7 @@ namespace Coflnet.Sky.Indexer
 
         private static void UpdateAuction(HypixelContext context, BidComparer comparer, SaveAuction auction, SaveAuction dbauction)
         {
+            string sum = GetComparisonKey(dbauction);
             foreach (var bid in auction.Bids)
             {
                 bid.Auction = dbauction;
@@ -220,9 +221,17 @@ namespace Coflnet.Sky.Indexer
                 dbauction.End = auction.End;
             if (dbauction.Category == Category.UNKNOWN)
                 dbauction.Category = auction.Category;
+            if (dbauction.StartingBid == 0 && auction.StartingBid != 0)
+                dbauction.StartingBid = auction.StartingBid;
 
-            // update
-            context.Auctions.Update(dbauction);
+            if (sum != GetComparisonKey(dbauction))
+                // update
+                context.Auctions.Update(dbauction);
+        }
+
+        private static string GetComparisonKey(SaveAuction dbauction)
+        {
+            return "" + dbauction.HighestBidAmount + dbauction.Bids.Count + dbauction.StartingBid + dbauction.Start + dbauction.ProfileId + dbauction.AuctioneerId + dbauction.End + dbauction.Category + dbauction.ItemName;
         }
 
         internal static void UpdateHighestBid(SaveAuction auction, SaveAuction dbauction)

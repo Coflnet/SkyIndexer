@@ -81,7 +81,7 @@ public class AuctionsController : ControllerBase
         var user = await UserService.Instance.GetUserByEmail(email);
         if (user == null)
             return (0, 0, 0);
-        var playerId = await db.Players.Where(p => p.UuId == playerUuid).Select(p => p.Id).FirstOrDefaultAsync();
+        var playerId = (await PlayerSearch.Instance.GetPlayerAsync(playerUuid)).Id;
         var auctions = await db.Auctions.Where(a => a.SellerId == playerId).ToListAsync();
         foreach (var auction in auctions)
         {

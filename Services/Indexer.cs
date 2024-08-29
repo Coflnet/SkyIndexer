@@ -81,6 +81,10 @@ namespace Coflnet.Sky.Indexer
                 if (highestPlayerId == 1)
                     LoadFromDB();
             }
+            if(auctions.All(a=>a.End<DateTime.UtcNow.AddDays(-4)))
+            {
+                return;
+            }
 
             foreach (var item in auctions)
             {

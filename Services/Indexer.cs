@@ -57,7 +57,7 @@ namespace Coflnet.Sky.Indexer
                     ToDb,
                     tokenSource.Token,
                     "sky-indexer",
-                    50
+                    200
                     );
             }
             catch (Exception e)

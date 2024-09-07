@@ -135,7 +135,7 @@ namespace Coflnet.Sky.Indexer
                         }
                     }
                     if (i >= 4)
-                        throw e;
+                        throw;
                 }
             }
         }
@@ -165,7 +165,7 @@ namespace Coflnet.Sky.Indexer
                     catch (Exception e)
                     {
                         Logger.Instance.Error($"Error on CreateLookup: {e.Message} \n{e.StackTrace} \n{JSON.Stringify(auction.NbtData.Data)}");
-                        throw e;
+                        throw;
                     }
                     if (auction.HighestBidAmount == 0 && auction.Bids.Count > 0)
                     {

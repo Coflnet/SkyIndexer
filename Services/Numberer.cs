@@ -75,7 +75,6 @@ namespace Coflnet.Sky.Indexer
                     await context.SaveChangesAsync();
                 }
 
-                using var transaction = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
                 if (unindexedPlayers.Count < 2000)
                 {
                     using var activity = activitySource.StartActivity("NumberAuctions");
@@ -88,7 +87,6 @@ namespace Coflnet.Sky.Indexer
                 }
 
                 await context.SaveChangesAsync();
-                await transaction.CommitAsync();
             }
             if (bidNumberTask != null)
                 await bidNumberTask;
@@ -123,6 +121,7 @@ namespace Coflnet.Sky.Indexer
 
         private async Task NumberAuctions(HypixelContext context)
         {
+            using var transaction = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.RepeatableRead);
             var auctionsWithoutSellerId = await context
                                     .Auctions.Where(a => a.SellerId == 0)
                                     .Include(a => a.Enchantments)
@@ -146,6 +145,7 @@ namespace Coflnet.Sky.Indexer
                 }
             }
             await context.SaveChangesAsync();
+            await transaction.CommitAsync();
             auctionsNumbered.Inc(auctionsWithoutSellerId.Count());
         }
 
@@ -184,10 +184,10 @@ namespace Coflnet.Sky.Indexer
             using var context = new HypixelContext();
             try
             {
-                using var transaction = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
                 var bidsWithoutSellerId = await context.Bids.Where(a => a.BidderId == 0).Take(batchSize).ToListAsync();
                 var uuids = bidsWithoutSellerId.Select(b => b.Bidder).Distinct().ToList();
                 Dictionary<string, int> bidderIds = await BatchLookupPlayerId(context, uuids);
+                using var transaction = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.RepeatableRead);
                 foreach (var bid in bidsWithoutSellerId)
                 {
 

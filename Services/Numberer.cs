@@ -75,9 +75,11 @@ namespace Coflnet.Sky.Indexer
                     await context.SaveChangesAsync();
                 }
 
+                using var transaction = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
                 if (unindexedPlayers.Count < 2000)
                 {
                     using var activity = activitySource.StartActivity("NumberAuctions");
+
                     // all players in the db have an id now
                     bidNumberTask = Task.Run(NumberBids);
                     await NumberAuctions(context);
@@ -86,8 +88,7 @@ namespace Coflnet.Sky.Indexer
                 }
 
                 await context.SaveChangesAsync();
-            
-
+                await transaction.CommitAsync();
             }
             if (bidNumberTask != null)
                 await bidNumberTask;
@@ -183,6 +184,7 @@ namespace Coflnet.Sky.Indexer
             using var context = new HypixelContext();
             try
             {
+                using var transaction = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
                 var bidsWithoutSellerId = await context.Bids.Where(a => a.BidderId == 0).Take(batchSize).ToListAsync();
                 var uuids = bidsWithoutSellerId.Select(b => b.Bidder).Distinct().ToList();
                 Dictionary<string, int> bidderIds = await BatchLookupPlayerId(context, uuids);
@@ -200,6 +202,7 @@ namespace Coflnet.Sky.Indexer
                 await context.SaveChangesAsync();
                 bidsWithoutId.Set(await context.Bids.Where(a => a.BidderId == 0).CountAsync());
                 bidsNumbered.Inc(bidsWithoutSellerId.Count(b => b.BidderId != 0));
+                await transaction.CommitAsync();
             }
             catch (Exception e)
             {
@@ -219,7 +222,7 @@ namespace Coflnet.Sky.Indexer
 
             if (lookup != null && lookup.TryGetValue(uuid, out int lookupId))
                 return lookupId;
-            var numeric = long.Parse(uuid.Replace("-","").Substring(0, 15), System.Globalization.NumberStyles.HexNumber);
+            var numeric = long.Parse(uuid.Replace("-", "").Substring(0, 15), System.Globalization.NumberStyles.HexNumber);
             if (numeric == 0) // special flag uuid
                 return int.Parse(uuid.Split('-').Last(), System.Globalization.NumberStyles.HexNumber);
             var id = await context.Players.Where(p => p.UuId == uuid).Select(p => p.Id).FirstOrDefaultAsync();

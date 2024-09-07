@@ -81,7 +81,7 @@ namespace Coflnet.Sky.Indexer
                 if (highestPlayerId == 1)
                     LoadFromDB();
             }
-            if(auctions.All(a=>a.End<DateTime.UtcNow.AddDays(-4)))
+            if (auctions.All(a => a.End < DateTime.UtcNow.AddDays(-4)))
             {
                 return;
             }
@@ -101,6 +101,8 @@ namespace Coflnet.Sky.Indexer
                 {
                     using (var context = new HypixelContext())
                     {
+                        // start isolated transaction
+                        using var transaction = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
                         Dictionary<string, SaveAuction> inDb = await GetExistingAuctions(auctions, context);
 
                         var comparer = new BidComparer();
@@ -114,6 +116,7 @@ namespace Coflnet.Sky.Indexer
                         insertCount.Inc(count);
                         indexCount.Inc(auctions.Count());
                         LastFinish = DateTime.Now;
+                        transaction.Commit();
                         return;
                     }
                 }

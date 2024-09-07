@@ -57,7 +57,7 @@ namespace Coflnet.Sky.Indexer
                     ToDb,
                     tokenSource.Token,
                     "sky-indexer",
-                    200
+                    50
                     );
             }
             catch (Exception e)
@@ -102,7 +102,7 @@ namespace Coflnet.Sky.Indexer
                     using (var context = new HypixelContext())
                     {
                         // start isolated transaction
-                        using var transaction = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+                        using var transaction = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.RepeatableRead);
                         Dictionary<string, SaveAuction> inDb = await GetExistingAuctions(auctions, context);
 
                         var comparer = new BidComparer();

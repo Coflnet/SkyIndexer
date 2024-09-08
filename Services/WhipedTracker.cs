@@ -76,8 +76,9 @@ public class WhipedTracker
         {
             return false;
         }
-        var request = new RestRequest("api/profile/" + playerUuid + "/hypixel?maxAge=" + DateTimeOffset.UtcNow.AddHours(-1).ToUniversalTime());
-        logger.LogInformation("Checking profile " + profileId + " for player " + playerUuid);
+        var path = "api/profile/" + playerUuid + "/hypixel?maxAge=" + DateTimeOffset.UtcNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ssZ");
+        var request = new RestRequest(path);
+        logger.LogInformation("Checking profile " + path);
         var response = await profileClient.GetAsync(request);
         var profile = JsonConvert.DeserializeObject<ProfileResponse>(response.Content);
         if (profile == null || profile.stats.SkyBlock.Profiles.ContainsKey(Guid.Parse(profileId).ToString("n")))

@@ -88,10 +88,10 @@ namespace Coflnet.Sky.Indexer
 
             foreach (var item in auctions)
             {
-                if (item.End > DateTime.UtcNow)
+                if (item.End > DateTime.UtcNow || item.End < DateTime.UtcNow.AddHours(-3))
                     continue;
                 endedAuctionsQueue.Enqueue(new AuctionResult(item));
-                if (endedAuctionsQueue.Count > 40)
+                if (endedAuctionsQueue.Count > 45)
                     endedAuctionsQueue.TryDequeue(out var _);
             }
 

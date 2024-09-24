@@ -49,12 +49,22 @@ namespace Coflnet.Sky.Indexer
             var tokenSource = new CancellationTokenSource();
             stopToken.Register(() => tokenSource.Cancel());
             Console.WriteLine("Starting consuming updates");
+            SemaphoreSlim semaphore = new SemaphoreSlim(1, 1);
             try
             {
+                var newConsumer = Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
+                    config,
+                    [SoldAuctionTopic, NewAuctionsTopic],
+                    LockedToDb(semaphore),
+                    tokenSource.Token,
+                    "sky-indexer-latest",
+                    100,
+                    AutoOffsetReset.Latest
+                    );
                 await Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
                     config,
                     new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic },
-                    ToDb,
+                    LockedToDb(semaphore),
                     tokenSource.Token,
                     "sky-indexer",
                     300
@@ -68,6 +78,21 @@ namespace Coflnet.Sky.Indexer
             tokenSource.Cancel();
             throw new Exception("Kafka consumer failed");
 
+            Func<IEnumerable<SaveAuction>, Task> LockedToDb(SemaphoreSlim semaphore)
+            {
+                return async enumerable =>
+                {
+                    await semaphore.WaitAsync();
+                    try
+                    {
+                        await ToDb(enumerable);
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                };
+            }
         }
 
 

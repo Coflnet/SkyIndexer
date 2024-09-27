@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Threading.Tasks;
 using Coflnet.Sky.Core;
 using Microsoft.AspNetCore.Mvc;
@@ -15,7 +16,7 @@ public class StatsController : ControllerBase
         using var context = new HypixelContext();
         return new LinkedInStats
         {
-            TotalUsers = await context.Players.MaxAsync(s => s.Id),
+            TotalUsers = await context.Players.Select(s=>s.Id).CountAsync(),
             TotalAuctions = await context.Auctions.MaxAsync(s => s.Id),
             TotalDistinctItems = ItemDetails.Instance.TagLookup.Count
         };

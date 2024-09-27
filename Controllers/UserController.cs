@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Coflnet.Sky.Core;
@@ -43,7 +44,7 @@ public class UserController : ControllerBase
     public async Task<string> DeleteUser(string email, string id)
     {
         using var context = new HypixelContext();
-        var user = await context.Users.FirstOrDefaultAsync(u => u.Email == email && u.GoogleId == id) 
+        var user = await context.Users.FirstOrDefaultAsync(u => u.Email == email && u.GoogleId == id)
             ?? throw new CoflnetException("user_not_found", "User not found");
         context.Users.Remove(user);
         await context.SaveChangesAsync();

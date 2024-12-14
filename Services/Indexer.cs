@@ -111,9 +111,12 @@ namespace Coflnet.Sky.Indexer
                 return;
             }
 
+            var existing = endedAuctionsQueue.ToLookup(a => a.AuctionId);
             foreach (var item in auctions)
             {
                 if (item.End > DateTime.UtcNow || item.End < DateTime.UtcNow.AddHours(-3))
+                    continue;
+                if(existing.Contains(item.Uuid))
                     continue;
                 endedAuctionsQueue.Enqueue(new AuctionResult(item));
                 if (endedAuctionsQueue.Count > 45)

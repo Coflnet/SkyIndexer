@@ -13,6 +13,7 @@ using Newtonsoft.Json;
 using Coflnet.Sky.Core;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
+using MessagePack;
 
 namespace Coflnet.Sky.Indexer
 {
@@ -61,6 +62,15 @@ namespace Coflnet.Sky.Indexer
                     100,
                     AutoOffsetReset.Latest
                     );
+                var deleteConsumer = Kafka.KafkaConsumer.ConsumeBatch<DeleteRequest>(
+                    config,
+                    ["sky-delete-auctions"],
+                    DeleteFromDb(semaphore),
+                    tokenSource.Token,
+                    "sky-indexer",
+                    50,
+                    AutoOffsetReset.Earliest
+                    );
                 await Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
                     config,
                     new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic },
@@ -95,6 +105,53 @@ namespace Coflnet.Sky.Indexer
             }
         }
 
+        private Func<IEnumerable<DeleteRequest>, Task> DeleteFromDb(SemaphoreSlim semaphore)
+        {
+            return async enumerable =>
+            {
+                Logger.Instance.Log("Delete request for " + enumerable.Count() + " auctions");
+                await semaphore.WaitAsync();
+                try
+                {
+                    using var context = new HypixelContext();
+                    var ids = enumerable.Select(d => d.Id).ToList();
+                    var checkSum = enumerable.Select(d => (d.Uuid, d.HighestBidAmount)).ToHashSet();
+                    var auctions = await context.Auctions.Where(a => ids.Contains(a.Id)).Include(a => a.Bids).Include(a => a.NBTLookup).Include(a => a.NbtData).Include(a => a.Enchantments).ToListAsync();
+                    foreach (var auction in auctions)
+                    {
+                        if (!checkSum.Contains((auction.Uuid, auction.HighestBidAmount)))
+                        {
+                            Logger.Instance.Error($"Delete request for {auction.Uuid} with different highest bid amount");
+                            continue;
+                        }
+                        if(auction.End > DateTime.UtcNow.AddYears(-3))
+                        {
+                            await Task.Delay(1000);
+                            Logger.Instance.Error($"Delete request for {auction.Uuid} to recent");
+                            continue;
+                        }
+                        context.Auctions.Remove(auction);
+                    }
+                    var count = await context.SaveChangesAsync();
+                    Logger.Instance.Info($"Deleted {count} auctions");
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            };
+        }
+
+        [MessagePackObject]
+        public class DeleteRequest
+        {
+            [Key(0)]
+            public string Uuid { get; set; }
+            [Key(1)]
+            public long HighestBidAmount { get; set; }
+            [Key(2)]
+            public int Id { get; set; }
+        }
 
         public static int highestPlayerId = 1;
 
@@ -116,7 +173,7 @@ namespace Coflnet.Sky.Indexer
             {
                 if (item.End > DateTime.UtcNow || item.End < DateTime.UtcNow.AddHours(-3))
                     continue;
-                if(existing.Contains(item.Uuid))
+                if (existing.Contains(item.Uuid))
                     continue;
                 endedAuctionsQueue.Enqueue(new AuctionResult(item));
                 if (endedAuctionsQueue.Count > 45)

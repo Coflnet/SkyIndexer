@@ -26,7 +26,7 @@ namespace Coflnet.Sky.Indexer
         {
             var targetAmount = 80;
             var players = PlayersToUpdate(targetAmount);
-            while(Sky.Core.Program.IsRatelimited())
+            while (Sky.Core.Program.IsRatelimited())
             {
                 await Task.Delay(5000);
             }
@@ -67,7 +67,7 @@ namespace Coflnet.Sky.Indexer
                 if (playerToUpdate.HitCount < 0)
                     playerToUpdate.HitCount = 0;
             }
-            else if (playerToUpdate.HitCount < -10)
+            else if (playerToUpdate.HitCount < -10 && playerToUpdate.Name == null)
                 playerToUpdate.Name = "!unobtainable";
             else if (playerToUpdate.Name == null && name == null)
                 playerToUpdate.HitCount--;

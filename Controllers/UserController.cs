@@ -40,6 +40,15 @@ public class UserController : ControllerBase
         }
     }
 
+    [HttpGet("{email}")]
+    public async Task<GoogleUser> GetUser(string email)
+    {
+        using var context = new HypixelContext();
+        var user = await context.Users.FirstOrDefaultAsync(u => u.Email == email || u.GoogleId == email)
+            ?? throw new CoflnetException("user_not_found", "User not found");
+        return user;
+    }
+
     [HttpDelete("{email}")]
     public async Task<string> DeleteUser(string email, string id)
     {

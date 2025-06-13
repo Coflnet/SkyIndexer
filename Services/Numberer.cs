@@ -16,6 +16,7 @@ namespace Coflnet.Sky.Indexer
     {
         private readonly ActivitySource activitySource;
         private readonly ILogger<Numberer> logger;
+        private readonly ItemDetails itemDetails;
         readonly Gauge bidsWithoutId = Metrics.CreateGauge("sky_indexer_bids_without_id", "Number of Bids that don't yet have a player id");
         readonly Gauge auctionsWithoutId = Metrics.CreateGauge("sky_indexer_auctions_without_id", "Number of Auctions that don't yet have a player id");
         readonly Counter auctionsNumbered = Metrics.CreateCounter("sky_indexer_auctions_numbered", "Number of Auctions that have been numbered");
@@ -23,10 +24,11 @@ namespace Coflnet.Sky.Indexer
         readonly Counter playersNumbered = Metrics.CreateCounter("sky_indexer_players_numbered", "Number of Players that have been numbered");
         readonly Counter doublePlayersReset = Metrics.CreateCounter("sky_indexer_double_players_reset", "Number of Players that have been reset");
 
-        public Numberer(ActivitySource activitySource, ILogger<Numberer> logger)
+        public Numberer(ActivitySource activitySource, ILogger<Numberer> logger, ItemDetails itemDetails)
         {
             this.activitySource = activitySource;
             this.logger = logger;
+            this.itemDetails = itemDetails;
         }
 
         protected override async Task ExecuteAsync(System.Threading.CancellationToken stoppingToken)
@@ -149,7 +151,7 @@ namespace Coflnet.Sky.Indexer
             auctionsNumbered.Inc(auctionsWithoutSellerId.Count());
         }
 
-        private static async Task NumberAuction(HypixelContext context, SaveAuction auction, Dictionary<string, int> lookup)
+        private async Task NumberAuction(HypixelContext context, SaveAuction auction, Dictionary<string, int> lookup)
         {
             auction.SellerId = await GetOrCreatePlayerId(context, auction.AuctioneerId, lookup);
 
@@ -159,7 +161,7 @@ namespace Coflnet.Sky.Indexer
 
             if (auction.ItemId == 0)
             {
-                var id = ItemDetails.Instance.GetOrCreateItemIdForAuction(auction, context);
+                var id = itemDetails.GetOrCreateItemIdForAuction(auction, context);
                 if (id == 0)
                     dev.Logger.Instance.Error("could not get itemid for " + auction.UId);
                 auction.ItemId = id;

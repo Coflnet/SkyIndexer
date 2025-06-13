@@ -32,21 +32,42 @@ namespace Coflnet.Sky.Indexer
         public static readonly string NewBidTopic = SimplerConfig.Config.Instance["TOPICS:NEW_BID"];
 
         private static int count;
+        private NBT nbt;
+        private ItemPrices itemPrices;
+        private ItemDetails itemDetails;
         public static DateTime LastFinish { get; internal set; }
 
         private ConcurrentQueue<AuctionResult> endedAuctionsQueue;
         private IConfiguration config;
 
-        public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue)
+        public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue, NBT nbt, ItemPrices itemPrices, ItemDetails itemDetails)
         {
             this.config = config;
             this.endedAuctionsQueue = endedAuctionsQueue;
+            this.nbt = nbt;
+            this.itemPrices = itemPrices;
+            this.itemDetails = itemDetails;
         }
 
         static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert", "Tracks the count of inserted auctions");
         static Prometheus.Counter indexCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_consume", "Tracks the count of consumed auctions");
         protected override async Task ExecuteAsync(CancellationToken stopToken)
         {
+            nbt.CanWriteToDb = true;
+            await itemDetails.LoadFromDB();
+            _ = Task.Run(async () =>
+           {
+               await Task.Delay(TimeSpan.FromMinutes(1));
+               try
+               {
+                   await itemPrices.BackfillPrices();
+
+               }
+               catch (Exception e)
+               {
+                   dev.Logger.Instance.Error(e, "Item Backfill failed");
+               }
+           }).ConfigureAwait(false);
             var tokenSource = new CancellationTokenSource();
             stopToken.Register(() => tokenSource.Cancel());
             Console.WriteLine("Starting consuming updates");
@@ -124,7 +145,7 @@ namespace Coflnet.Sky.Indexer
                             Logger.Instance.Error($"Delete request for {auction.Uuid} with different highest bid amount");
                             continue;
                         }
-                        if(auction.End > DateTime.UtcNow.AddYears(-3))
+                        if (auction.End > DateTime.UtcNow.AddYears(-3))
                         {
                             await Task.Delay(1000);
                             Logger.Instance.Error($"Delete request for {auction.Uuid} to recent");
@@ -228,7 +249,7 @@ namespace Coflnet.Sky.Indexer
             }
         }
 
-        private static void ProcessAuction(HypixelContext context, Dictionary<string, SaveAuction> inDb, BidComparer comparer, SaveAuction auction)
+        private void ProcessAuction(HypixelContext context, Dictionary<string, SaveAuction> inDb, BidComparer comparer, SaveAuction auction)
         {
             try
             {
@@ -248,7 +269,7 @@ namespace Coflnet.Sky.Indexer
                     try
                     {
                         if (auction.NBTLookup == null || auction.NBTLookup.Count() == 0)
-                            auction.NBTLookup = NBT.CreateLookup(auction);
+                            auction.NBTLookup = nbt.CreateLookup(auction);
                     }
                     catch (Exception e)
                     {

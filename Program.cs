@@ -23,27 +23,11 @@ namespace Coflnet.Sky.Indexer
                 // context.Database.EnsureCreated();
                 context.Database.Migrate();
             }
-            ItemDetails.Instance.LoadFromDB();
-            Task.Run(Coflnet.Sky.Core.Program.MakeSureRedisIsInitialized);
-            (NBT.Instance as NBT).CanWriteToDb = true;
 
             Console.WriteLine("booting db dependend stuff");
 
             Indexer.LoadFromDB();
             //NameUpdater.Run();
-            Task.Run(async () =>
-            {
-                await Task.Delay(TimeSpan.FromMinutes(1));
-                try
-                {
-                    await ItemPrices.Instance.BackfillPrices();
-
-                }
-                catch (Exception e)
-                {
-                    dev.Logger.Instance.Error(e, "Item Backfill failed");
-                }
-            }).ConfigureAwait(false);
             NameUpdater.Run();
 
 

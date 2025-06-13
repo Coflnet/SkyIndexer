@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Coflnet.Kafka;
 using Coflnet.Sky.Core;
 using Coflnet.Sky.Indexer.Controllers;
+using Coflnet.Sky.Items.Client.Api;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
@@ -36,6 +37,14 @@ namespace Coflnet.Sky.Indexer
 
             services.AddDbContext<HypixelContext>();
             services.AddSingleton<ActiveAhStateService>();
+            services.AddSingleton<ItemDetails>();
+            services.AddSingleton<ItemPrices>();
+            services.AddSingleton<NBT>();
+            services.AddSingleton<IItemsApi>(di=>
+            {
+                var config = di.GetRequiredService<IConfiguration>();
+                return new ItemsApi(config["ITEMS_BASE_URL"]);
+            });
             services.AddHostedService<ActiveAhStateService>(a => a.GetRequiredService<ActiveAhStateService>());
 
             var redisOptions = ConfigurationOptions.Parse(Configuration["REDIS_HOST"]);

@@ -10,6 +10,12 @@ namespace Coflnet.Sky.Indexer.Controllers;
 [Route("[controller]")]
 public class StatsController : ControllerBase
 {
+    private ItemDetails itemDetails { get; }
+
+    public StatsController(ItemDetails itemDetails)
+    {
+        this.itemDetails = itemDetails;
+    }
     [HttpGet]
     public async Task<LinkedInStats> GetStats()
     {
@@ -18,7 +24,7 @@ public class StatsController : ControllerBase
         {
             TotalUsers = await context.Players.Select(s=>s.Id).CountAsync(),
             TotalAuctions = await context.Auctions.MaxAsync(s => s.Id),
-            TotalDistinctItems = ItemDetails.Instance.TagLookup.Count
+            TotalDistinctItems = itemDetails.TagLookup.Count
         };
     }
 

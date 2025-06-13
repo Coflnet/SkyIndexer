@@ -18,14 +18,16 @@ public class AuctionsController : ControllerBase
 {
     private readonly ILogger<AuctionsController> _logger;
     private ConcurrentQueue<AuctionResult> endedQueue;
+    private NBT nbt;
     HypixelContext db;
     private Indexer indexer;
-    public AuctionsController(ILogger<AuctionsController> logger, HypixelContext db, ConcurrentQueue<AuctionResult> endedQueue, Indexer indexer)
+    public AuctionsController(ILogger<AuctionsController> logger, HypixelContext db, ConcurrentQueue<AuctionResult> endedQueue, Indexer indexer, NBT nbt)
     {
         _logger = logger;
         this.db = db;
         this.endedQueue = endedQueue;
         this.indexer = indexer;
+        this.nbt = nbt;
     }
 
     /// <summary>
@@ -40,7 +42,7 @@ public class AuctionsController : ControllerBase
         var uid = AuctionService.Instance.GetId(uuid);
         var auction = await db.Auctions.Where(a => a.UId == uid).Include(a => a.NbtData).Include(a => a.NBTLookup).FirstOrDefaultAsync();
         Console.WriteLine(JsonConvert.SerializeObject(auction.NBTLookup, Formatting.Indented));
-        auction.NBTLookup = NBT.CreateLookup(auction);
+        auction.NBTLookup = nbt.CreateLookup(auction);
         Console.WriteLine(JsonConvert.SerializeObject(auction.NBTLookup, Formatting.Indented));
         db.Update(auction);
         await db.SaveChangesAsync();

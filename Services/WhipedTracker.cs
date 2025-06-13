@@ -31,7 +31,28 @@ public class WhipedTracker
         var profileUuidLookup = whipedProfiles.Select(p => p.profileId).ToHashSet();
         foreach (var (playerUuid, profileId) in whipedProfiles)
         {
-            LoadWhipedAuctions(logger, profileUuidLookup, playerUuid, profileId);
+            try
+            {
+                LoadWhipedAuctions(logger, profileUuidLookup, playerUuid, profileId);
+            }
+            catch (System.Exception e)
+            {
+                logger.LogError(e, "Failed to load whiped auctions for profile {profileId} of player {playerUuid}", profileId, playerUuid);
+                Task.Run(async () =>
+                {
+                    while (true)
+                        try
+                        {
+                            await Task.Delay(600_000);
+                            LoadWhipedAuctions(logger, profileUuidLookup, playerUuid, profileId);
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "Failed to reload whiped auctions for profile {profileId} of player {playerUuid}", profileId, playerUuid);
+                        }
+                });
+            }
         }
 
         this.logger = logger;

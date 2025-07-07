@@ -339,9 +339,8 @@ namespace Coflnet.Sky.Indexer
             if (dbauction.StartingBid == 0 && auction.StartingBid != 0)
                 dbauction.StartingBid = auction.StartingBid;
 
-            if (sum != GetComparisonKey(dbauction))
-                // update
-                context.Auctions.Update(dbauction);
+            // update
+            context.Auctions.Update(dbauction);
         }
 
         private static string GetComparisonKey(SaveAuction dbauction)

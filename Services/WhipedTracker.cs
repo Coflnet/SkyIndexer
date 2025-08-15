@@ -66,7 +66,7 @@ public class WhipedTracker
                     .Where(a => a.SellerId == context.Players.Where(p => p.UuId == playerUuid).Select(p => p.Id).FirstOrDefault() && a.SellerId != 0 && a.End > endAfter).ToList();
         foreach (var auction in activeAuctionsToDeactivate)
         {
-            if (!profileUuidLookup.Contains(auction.ProfileId))
+            if (!profileUuidLookup.Contains(auction.ProfileId ?? auction.AuctioneerId))
             {
                 continue;
             }

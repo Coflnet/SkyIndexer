@@ -118,15 +118,24 @@ namespace Coflnet.Sky.Indexer
 
         static async Task RunForever()
         {
+            var lastResetRequests = DateTime.UtcNow;
+            var resetInterval = TimeSpan.FromMinutes(12);
+
             while (true)
             {
                 try
                 {
                     await FlagChanged();
                     var count = await UpdateFlaggedNames();
-                    if (count < 5)
+                    if (count < 2)
                         await FlagOldest();
                     Console.WriteLine($" - Updated flagged player names ({count}) - ");
+                    // periodically reset request counters (non-blocking)
+                    if ((DateTime.Now - lastResetRequests) >= resetInterval)
+                    {
+                        lastResetRequests = DateTime.UtcNow;
+                        Sky.Core.Program.ResetRequestsSinceStart();
+                    }
                 }
                 catch (Exception e)
                 {

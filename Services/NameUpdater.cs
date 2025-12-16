@@ -132,7 +132,7 @@ namespace Coflnet.Sky.Indexer
                 {
                     Logger.Instance.Error($"NameUpdater encountered an error \n {e.Message} {e.StackTrace} \n{e.InnerException?.Message} {e.InnerException?.StackTrace}");
                 }
-                await Task.Delay(1000);
+                await Task.Delay(2000);
             }
         }
 

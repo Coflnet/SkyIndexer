@@ -163,17 +163,6 @@ namespace Coflnet.Sky.Indexer
             };
         }
 
-        [MessagePackObject]
-        public class DeleteRequest
-        {
-            [Key(0)]
-            public string Uuid { get; set; }
-            [Key(1)]
-            public long HighestBidAmount { get; set; }
-            [Key(2)]
-            public int Id { get; set; }
-        }
-
         public static int highestPlayerId = 1;
 
         public async Task ToDb(IEnumerable<SaveAuction> auctions)
@@ -400,6 +389,17 @@ namespace Coflnet.Sky.Indexer
                     highestPlayerId = context.Players.Max(p => p.Id) + 1;
             }
         }
+    }
+
+    [MessagePackObject]
+    public class DeleteRequest
+    {
+        [Key(0)]
+        public string Uuid { get; set; }
+        [Key(1)]
+        public long HighestBidAmount { get; set; }
+        [Key(2)]
+        public int Id { get; set; }
     }
 
     class AuctionDeserializer : IDeserializer<SaveAuction>

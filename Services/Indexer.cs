@@ -257,8 +257,7 @@ namespace Coflnet.Sky.Indexer
                     }
                     try
                     {
-                        if (auction.NBTLookup == null || auction.NBTLookup.Count() == 0)
-                            auction.NBTLookup = nbt.CreateLookup(auction);
+                        auction.NBTLookup = PrepareNbtLookup(auction);
                     }
                     catch (Exception e)
                     {
@@ -284,8 +283,79 @@ namespace Coflnet.Sky.Indexer
             }
             catch (Exception e)
             {
-                Logger.Instance.Error($"Error {e.Message} on {auction.ItemName} {auction.Uuid} from {auction.AuctioneerId}");
-                Logger.Instance.Error(e.StackTrace);
+                DetachAuctionGraph(context, auction);
+                Logger.Instance.Error(e, $"Error processing {auction.ItemName} {auction.Uuid} from {auction.AuctioneerId}");
+            }
+        }
+
+        private NBTLookup[] PrepareNbtLookup(SaveAuction auction)
+        {
+            var lookups = auction.NBTLookup?.ToArray();
+            if (lookups == null || lookups.Length == 0)
+                lookups = nbt.CreateLookup(auction);
+
+            var deduplicated = DeduplicateNbtLookups(lookups);
+            if (deduplicated.Length == lookups.Length)
+                return deduplicated;
+
+            var conflictingKeys = lookups
+                .GroupBy(lookup => lookup.KeyId)
+                .Where(group => group.Skip(1).Any() && group.Select(lookup => lookup.Value).Distinct().Skip(1).Any())
+                .Select(group => group.Key)
+                .ToArray();
+
+            if (conflictingKeys.Length > 0)
+            {
+                Logger.Instance.Error($"Deduplicated conflicting NBT lookup keys {string.Join(",", conflictingKeys)} on {auction.ItemName} {auction.Uuid}");
+            }
+
+            return deduplicated;
+        }
+
+        internal static NBTLookup[] DeduplicateNbtLookups(IEnumerable<NBTLookup> lookups)
+        {
+            if (lookups == null)
+                return Array.Empty<NBTLookup>();
+
+            var lookupArray = lookups.ToArray();
+            if (lookupArray.Length < 2)
+                return lookupArray;
+
+            return lookupArray
+                // The auction schema only permits one row per key, so keep the first value.
+                .GroupBy(lookup => lookup.KeyId)
+                .Select(group => group.First())
+                .ToArray();
+        }
+
+        private static void DetachAuctionGraph(HypixelContext context, SaveAuction auction)
+        {
+            var graphEntities = new HashSet<object>(ReferenceEqualityComparer.Instance)
+            {
+                auction
+            };
+
+            if (auction.NbtData != null)
+                graphEntities.Add(auction.NbtData);
+
+            foreach (var bid in auction.Bids ?? Enumerable.Empty<SaveBids>())
+            {
+                graphEntities.Add(bid);
+            }
+
+            foreach (var enchantment in auction.Enchantments ?? Enumerable.Empty<Enchantment>())
+            {
+                graphEntities.Add(enchantment);
+            }
+
+            foreach (var lookup in auction.NBTLookup ?? Array.Empty<NBTLookup>())
+            {
+                graphEntities.Add(lookup);
+            }
+
+            foreach (var entry in context.ChangeTracker.Entries().Where(entry => graphEntities.Contains(entry.Entity)).ToList())
+            {
+                entry.State = EntityState.Detached;
             }
         }
 
@@ -341,7 +411,7 @@ namespace Coflnet.Sky.Indexer
         {
             var highestBid = auction.HighestBidAmount;
             // special case sometimes highest bid is not set
-            if (auction.Bids.Count > 0)
+            if (auction.Bids?.Count > 0)
                 highestBid = auction.Bids.Max(b => b.Amount);
             dbauction.HighestBidAmount = Math.Max(highestBid, dbauction.HighestBidAmount);
         }

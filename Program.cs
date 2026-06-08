@@ -1,12 +1,9 @@
 using Coflnet.Security.OpenBao;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 using Coflnet.Sky.Core;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -17,30 +14,21 @@ namespace Coflnet.Sky.Indexer
     {
         public static void Main(string[] args)
         {
+            var host = CreateHostBuilder(args).Build();
+            HypixelContext.SetConfiguration(host.Services.GetRequiredService<IConfiguration>());
+
             // migrations
             using (var context = new HypixelContext())
             {
-                // if you setup from scratch you may want to use EnsureCreated because for unkown reasons migrations don't want to create an empty db
-                // context.Database.EnsureCreated();
                 context.Database.Migrate();
             }
 
             Console.WriteLine("booting db dependend stuff");
 
             Indexer.LoadFromDB();
-            //NameUpdater.Run();
             NameUpdater.Run();
 
-
-            /*try
-            {
-                Coflnet.Sky.Core.Program.CleanDB();
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine($"Cleaning failed {e.Message}");
-            }*/
-            CreateHostBuilder(args).Build().Run();
+            host.Run();
         }
 
         private static void MarkAllForDeletion(HypixelContext context, List<dev.ProductInfo> products)

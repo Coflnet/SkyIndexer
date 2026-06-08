@@ -40,6 +40,8 @@ namespace Coflnet.Sky.Indexer
             services.AddSingleton<ItemDetails>();
             services.AddSingleton<ItemPrices>();
             services.AddSingleton<NBT>();
+            services.AddSingleton<ActiveAuctionIndexService>();
+            services.AddHostedService<ActiveAuctionIndexService>(a => a.GetRequiredService<ActiveAuctionIndexService>());
             services.AddSingleton<IItemsApi>(di=>
             {
                 var config = di.GetRequiredService<IConfiguration>();

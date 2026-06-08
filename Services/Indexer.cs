@@ -39,14 +39,16 @@ namespace Coflnet.Sky.Indexer
 
         private ConcurrentQueue<AuctionResult> endedAuctionsQueue;
         private IConfiguration config;
+        private ActiveAuctionIndexService activeAuctionIndex;
 
-        public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue, NBT nbt, ItemPrices itemPrices, ItemDetails itemDetails)
+        public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue, NBT nbt, ItemPrices itemPrices, ItemDetails itemDetails, ActiveAuctionIndexService activeAuctionIndex)
         {
             this.config = config;
             this.endedAuctionsQueue = endedAuctionsQueue;
             this.nbt = nbt;
             this.itemPrices = itemPrices;
             this.itemDetails = itemDetails;
+            this.activeAuctionIndex = activeAuctionIndex;
         }
 
         static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert", "Tracks the count of inserted auctions");
@@ -211,7 +213,8 @@ namespace Coflnet.Sky.Indexer
                         insertCount.Inc(count);
                         indexCount.Inc(auctions.Count());
                         LastFinish = DateTime.Now;
-                        transaction.Commit();
+                        await transaction.CommitAsync();
+                        await activeAuctionIndex.SyncAuctions(auctions.Select(auction => auction.UId));
                         return;
                     }
                 }

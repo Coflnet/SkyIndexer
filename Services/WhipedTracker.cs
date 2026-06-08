@@ -15,13 +15,15 @@ public class WhipedTracker
 {
     IConnectionMultiplexer multiplexer;
     ILogger<WhipedTracker> logger;
+    private ActiveAuctionIndexService activeAuctionIndex;
     private RestClient profileClient = null;
     private HashSet<(string playerUuid, string profileId)> whipedProfiles = new();
     private HashSet<long> auctionUids = new();
-    public WhipedTracker(IConfiguration config, IConnectionMultiplexer multiplexer, ILogger<WhipedTracker> logger)
+    public WhipedTracker(IConfiguration config, IConnectionMultiplexer multiplexer, ILogger<WhipedTracker> logger, ActiveAuctionIndexService activeAuctionIndex)
     {
         profileClient = new RestClient(config["PROFILE_BASE_URL"]);
         this.multiplexer = multiplexer;
+        this.activeAuctionIndex = activeAuctionIndex;
         var whipedList = multiplexer.GetDatabase().StringGet("whipedProfiles");
         if (whipedList.HasValue)
         {
@@ -64,6 +66,7 @@ public class WhipedTracker
         var endAfter = DateTime.UtcNow.AddDays(-14);
         var activeAuctionsToDeactivate = context.Auctions
                     .Where(a => a.SellerId == context.Players.Where(p => p.UuId == playerUuid).Select(p => p.Id).FirstOrDefault() && a.SellerId != 0 && a.End > endAfter).ToList();
+        var deactivatedUids = new List<long>();
         foreach (var auction in activeAuctionsToDeactivate)
         {
             if (!profileUuidLookup.Contains(auction.ProfileId ?? auction.AuctioneerId))
@@ -74,6 +77,7 @@ public class WhipedTracker
             {
                 auction.End = DateTime.UtcNow;
                 context.Auctions.Update(auction);
+                deactivatedUids.Add(auction.UId);
             }
             auctionUids.Add(auction.UId);
             logger.LogInformation("Deactivating whiped auction " + auction.UId + " for player " + playerUuid);
@@ -81,6 +85,7 @@ public class WhipedTracker
         if (activeAuctionsToDeactivate.Count > 0)
         {
             context.SaveChanges();
+            activeAuctionIndex.RemoveAuctions(deactivatedUids).GetAwaiter().GetResult();
         }
         else
         {

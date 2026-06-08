@@ -25,13 +25,15 @@ namespace Coflnet.Sky.Indexer
         private Kafka.KafkaCreator kafkaCreator;
         private ActivitySource source;
         private WhipedTracker whipedTracker;
+        private ActiveAuctionIndexService activeAuctionIndex;
 
-        public ActiveAhStateService(IConfiguration config, Kafka.KafkaCreator kafkaCreator, ActivitySource source, WhipedTracker whipedTracker)
+        public ActiveAhStateService(IConfiguration config, Kafka.KafkaCreator kafkaCreator, ActivitySource source, WhipedTracker whipedTracker, ActiveAuctionIndexService activeAuctionIndex)
         {
             this.config = config;
             this.kafkaCreator = kafkaCreator;
             this.source = source;
             this.whipedTracker = whipedTracker;
+            this.activeAuctionIndex = activeAuctionIndex;
         }
 
         private async Task LoadActiveFromDb()
@@ -189,6 +191,7 @@ namespace Coflnet.Sky.Indexer
                     Console.WriteLine("deactivated " + toUpdate.Count());
                     Console.WriteLine("from sellers: " + sumarised.Count());
                     await context.SaveChangesAsync();
+                    await activeAuctionIndex.RemoveAuctions(toUpdate.Select(auction => auction.UId));
                     RequestCheck(toUpdate);
                 }
                 catch (Exception e)
@@ -228,6 +231,7 @@ namespace Coflnet.Sky.Indexer
                 Console.WriteLine($"reactivated {item.Uuid}  {item.End}");
             }
             await context.SaveChangesAsync();
+            await activeAuctionIndex.SyncAuctions(foundActiveAgain.Select(auction => auction.UId));
             Console.WriteLine(foundActiveAgain.FirstOrDefault()?.Uuid + " found ended active " + foundActiveAgain.Count);
         }
 

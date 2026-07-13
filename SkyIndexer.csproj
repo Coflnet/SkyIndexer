@@ -13,7 +13,10 @@
 
   <ItemGroup>
     <PackageReference Include="CassandraCSharpDriver" Version="3.22.0" />
-    <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="10.0.8" />
+    <PackageReference Include="Coflnet.Sky.McConnect" Version="0.6.0" />
+    <PackageReference Include="Coflnet.Sky.PlayerState.Client" Version="0.16.0" />
+    <PackageReference Include="Coflnet.Sky.Settings.Client" Version="0.3.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="10.0.9" />
     <PackageReference Include="RateLimiter" Version="2.2.0" />
   </ItemGroup>
 

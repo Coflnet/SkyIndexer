@@ -47,6 +47,13 @@ namespace Coflnet.Sky.Indexer
                 var config = di.GetRequiredService<IConfiguration>();
                 return new ItemsApi(config["ITEMS_BASE_URL"]);
             });
+            // used to clean up the data of a user in the other services when the account is deleted
+            services.AddSingleton<Settings.Client.Api.ISettingsApi>(di =>
+                new Settings.Client.Api.SettingsApi(di.GetRequiredService<IConfiguration>()["SETTINGS_BASE_URL"]));
+            services.AddSingleton<McConnect.Api.IConnectApi>(di =>
+                new McConnect.Api.ConnectApi(di.GetRequiredService<IConfiguration>()["MCCONNECT_BASE_URL"]));
+            services.AddSingleton<PlayerState.Client.Api.IPlayerStateApi>(di =>
+                new PlayerState.Client.Api.PlayerStateApi(di.GetRequiredService<IConfiguration>()["PLAYERSTATE_BASE_URL"]));
             services.AddHostedService<ActiveAhStateService>(a => a.GetRequiredService<ActiveAhStateService>());
 
             var redisOptions = ConfigurationOptions.Parse(Configuration["REDIS_HOST"]);

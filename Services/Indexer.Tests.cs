@@ -42,4 +42,20 @@ public class IndexerTests
             Assert.That(deduplicated[1].Value, Is.EqualTo(3));
         });
     }
+
+    [TestCase("Ekwav", "Ekwav")]
+    [TestCase("abc_123", "abc_123")]
+    [TestCase("abcdefghijklmnop", "abcdefghijklmnop")]
+    [TestCase("  Ekwav\r\n", "Ekwav")]
+    [TestCase("", null)]
+    [TestCase("abcdefghijklmnopq", null)]
+    [TestCase("rate limit exceeded", null)]
+    [TestCase("{\"error\":\"blocked\"}", null)]
+    [TestCase("invalid-name", null)]
+    [TestCase("Ekwav!", null)]
+    [TestCase(null, null)]
+    public void NormalizeMinecraftUsernameRejectsInvalidProviderResponses(string response, string expected)
+    {
+        Assert.That(Coflnet.Sky.Core.Program.NormalizeMinecraftUsername(response), Is.EqualTo(expected));
+    }
 }

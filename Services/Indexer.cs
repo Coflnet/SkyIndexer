@@ -170,6 +170,8 @@ namespace Coflnet.Sky.Indexer
         public async Task ToDb(IEnumerable<SaveAuction> auctions)
         {
             auctions = auctions.GroupBy(a => a.UId).Select(g => g.OrderByDescending(a => a.Bids?.Count).First()).ToList();
+            foreach (var auction in auctions)
+                PermanentAnonymization.Apply(auction);
             lock (nameof(highestPlayerId))
             {
                 if (highestPlayerId == 1)

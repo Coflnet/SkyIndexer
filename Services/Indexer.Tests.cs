@@ -58,4 +58,34 @@ public class IndexerTests
     {
         Assert.That(Coflnet.Sky.Core.Program.NormalizeMinecraftUsername(response), Is.EqualTo(expected));
     }
+
+    [Test]
+    public void ProtectedPlayerIsRemovedFromIncomingAuctionData()
+    {
+        var auction = new SaveAuction
+        {
+            AuctioneerId = PermanentAnonymization.PlayerUuid,
+            SellerId = 42,
+            Bids = [new SaveBids { Bidder = PermanentAnonymization.PlayerUuid, BidderId = 42 }]
+        };
+
+        PermanentAnonymization.Apply(auction);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(auction.AuctioneerId, Is.Not.EqualTo(PermanentAnonymization.PlayerUuid));
+            Assert.That(auction.AuctioneerId, Has.Length.EqualTo(32));
+            Assert.That(auction.SellerId, Is.Zero);
+            Assert.That(auction.Bids[0].Bidder, Is.Not.EqualTo(PermanentAnonymization.PlayerUuid));
+            Assert.That(auction.Bids[0].Bidder, Has.Length.EqualTo(32));
+            Assert.That(auction.Bids[0].BidderId, Is.Zero);
+        });
+    }
+
+    [TestCase("f3c19fb53ea940f3921e90faab8e2b30")]
+    [TestCase("F3C19FB5-3EA9-40F3-921E-90FAAB8E2B30")]
+    public void ProtectedPlayerUuidMatchingIsFormatIndependent(string uuid)
+    {
+        Assert.That(PermanentAnonymization.IsProtectedPlayer(uuid), Is.True);
+    }
 }

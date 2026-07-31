@@ -29,6 +29,9 @@ public class PlayerController : ControllerBase
         if (uuid == null || uuid.Length != 32)
             return null;
 
+        if (PermanentAnonymization.IsProtectedPlayer(uuid))
+            name = null;
+
         NameUpdater.UpdateUUid(uuid, name);
         return new Player(uuid) { Name = name };
 

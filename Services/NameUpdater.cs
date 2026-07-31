@@ -54,6 +54,9 @@ namespace Coflnet.Sky.Indexer
 
         private static async Task UpdateNameFor(string uuid)
         {
+            if (PermanentAnonymization.IsProtectedPlayer(uuid))
+                return;
+
             var name = await Sky.Core.Program.GetPlayerNameFromUuid(uuid);
             using var context = new HypixelContext();
             var playerToUpdate = context.Players.Where(p => p.UuId == uuid).First();
@@ -92,7 +95,7 @@ namespace Coflnet.Sky.Indexer
             List<Player> players;
             using (var context = new HypixelContext())
             {
-                players = context.Players.Where(p => p.ChangedFlag && p.Id > 0)
+                players = context.Players.Where(p => p.ChangedFlag && p.Id > 0 && p.UuId != PermanentAnonymization.PlayerUuid)
                     .OrderBy(p => p.UpdatedAt)
                     .Take(targetAmount).ToList();
             }
@@ -113,6 +116,9 @@ namespace Coflnet.Sky.Indexer
 
         internal static void UpdateUUid(string id, string name = null)
         {
+            if (PermanentAnonymization.IsProtectedPlayer(id))
+                return;
+
             newPlayers.Enqueue(new IdAndName() { Name = name, Uuid = id });
         }
 
@@ -173,9 +179,9 @@ namespace Coflnet.Sky.Indexer
             // this is a workaround, because the "updatedat" field is only updated when there is a change
             using (var context = new HypixelContext())
             {
-                var players = context.Players.Where(p => p.Id > 0)
+                var players = context.Players.Where(p => p.Id > 0 && p.UuId != PermanentAnonymization.PlayerUuid)
                     .OrderBy(p => p.UpdatedAt).Take(10);
-                players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null).Take(15));
+                players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null && p.UuId != PermanentAnonymization.PlayerUuid).Take(15));
                 foreach (var p in players)
                 {
                     p.ChangedFlag = true;

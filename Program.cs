@@ -26,6 +26,8 @@ namespace Coflnet.Sky.Indexer
                 context.Database.Migrate();
             }
 
+            PermanentAnonymization.ScrubStoredData();
+
             Console.WriteLine("booting db dependend stuff");
 
             Indexer.LoadFromDB();

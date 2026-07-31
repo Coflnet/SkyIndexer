@@ -87,15 +87,13 @@ public class AuctionsController : ControllerBase
         var auctions = await db.Auctions.Where(a => a.SellerId == playerId).ToListAsync();
         foreach (var auction in auctions)
         {
-            auction.SellerId = 0;
-            auction.AuctioneerId = Random.Shared.Next(1, 254).ToString("X2").PadLeft(32, '0');
+            PermanentAnonymization.Anonymize(auction);
             db.Update(auction);
         }
         var bids = await db.Bids.Where(b => b.BidderId == playerId).ToListAsync();
         foreach (var bid in bids)
         {
-            bid.BidderId = 0;
-            bid.Bidder = Random.Shared.Next(1, 254).ToString("X2").PadLeft(32, '0');
+            PermanentAnonymization.Anonymize(bid);
             db.Update(bid);
         }
         return (await db.SaveChangesAsync(), auctions.Count, bids.Count);
@@ -135,4 +133,3 @@ public class AuctionsController : ControllerBase
         }
     }
 }
-

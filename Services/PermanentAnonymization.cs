@@ -34,31 +34,6 @@ internal static class PermanentAnonymization
         bid.Bidder = AnonymousUuid();
     }
 
-    internal static void ScrubStoredData()
-    {
-        using var context = new HypixelContext();
-        var player = context.Players.FirstOrDefault(player => player.UuId == PlayerUuid);
-        var playerId = player?.Id ?? 0;
-
-        if (player != null)
-        {
-            player.Name = null;
-            player.ChangedFlag = false;
-            context.Update(player);
-        }
-
-        if (playerId > 0)
-        {
-            foreach (var auction in context.Auctions.Where(auction => auction.SellerId == playerId))
-                Anonymize(auction);
-
-            foreach (var bid in context.Bids.Where(bid => bid.BidderId == playerId))
-                Anonymize(bid);
-        }
-
-        context.SaveChanges();
-    }
-
     private static string AnonymousUuid()
     {
         return Random.Shared.Next(1, 254).ToString("X2").PadLeft(32, '0');

@@ -47,13 +47,14 @@ internal static class PermanentAnonymization
             context.Update(player);
         }
 
-        foreach (var auction in context.Auctions.Where(auction =>
-                     auction.AuctioneerId == PlayerUuid || playerId > 0 && auction.SellerId == playerId))
-            Anonymize(auction);
+        if (playerId > 0)
+        {
+            foreach (var auction in context.Auctions.Where(auction => auction.SellerId == playerId))
+                Anonymize(auction);
 
-        foreach (var bid in context.Bids.Where(bid =>
-                     bid.Bidder == PlayerUuid || playerId > 0 && bid.BidderId == playerId))
-            Anonymize(bid);
+            foreach (var bid in context.Bids.Where(bid => bid.BidderId == playerId))
+                Anonymize(bid);
+        }
 
         context.SaveChanges();
     }

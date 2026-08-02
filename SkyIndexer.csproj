@@ -5,6 +5,7 @@
     <ErrorOnDuplicatePublishOutputFiles>false</ErrorOnDuplicatePublishOutputFiles>
     <GenerateProgramFile>false</GenerateProgramFile>
     <GenerateTestingPlatformEntryPoint>false</GenerateTestingPlatformEntryPoint>
+    <DefaultItemExcludes>$(DefaultItemExcludes);Client\**\*</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

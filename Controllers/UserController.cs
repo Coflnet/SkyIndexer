@@ -60,6 +60,18 @@ public class UserController : ControllerBase
         return user;
     }
 
+    [HttpPost("{userId:int}/terms")]
+    public Task<GoogleUser> AcceptTerms(int userId, [FromBody] TermsAcceptance acceptance)
+    {
+        return UserService.Instance.AcceptTerms(userId, acceptance);
+    }
+
+    [HttpPost("{userId:int}/agreements/{agreement}")]
+    public Task<GoogleUser> AcceptAgreement(int userId, string agreement, [FromBody] TermsAcceptance acceptance)
+    {
+        return UserService.Instance.AcceptAgreement(userId, agreement, acceptance);
+    }
+
     /// <summary>
     /// Deletes a user and everything the other services stored about them: the settings, the player
     /// state of every connected minecraft account and the account link itself.

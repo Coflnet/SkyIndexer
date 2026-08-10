@@ -55,7 +55,8 @@ public class UserController : ControllerBase
     public async Task<GoogleUser> GetUser(string email)
     {
         using var context = new HypixelContext();
-        var user = await context.Users.FirstOrDefaultAsync(u => u.Email == email || u.GoogleId == email)
+        int? numericId = int.TryParse(email, out var userId) ? userId : null;
+        var user = await context.Users.FirstOrDefaultAsync(u => u.Id == numericId || u.Email == email || u.GoogleId == email)
             ?? throw new CoflnetException("user_not_found", "User not found");
         return user;
     }

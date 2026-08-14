@@ -62,21 +62,22 @@ public class IndexerTests
     [Test]
     public void ProtectedPlayerIsRemovedFromIncomingAuctionData()
     {
+        var protectedPlayer = PermanentAnonymization.PlayerUuids[0];
         var auction = new SaveAuction
         {
-            AuctioneerId = PermanentAnonymization.PlayerUuid,
+            AuctioneerId = protectedPlayer,
             SellerId = 42,
-            Bids = [new SaveBids { Bidder = PermanentAnonymization.PlayerUuid, BidderId = 42 }]
+            Bids = [new SaveBids { Bidder = protectedPlayer, BidderId = 42 }]
         };
 
         PermanentAnonymization.Apply(auction);
 
         Assert.Multiple(() =>
         {
-            Assert.That(auction.AuctioneerId, Is.Not.EqualTo(PermanentAnonymization.PlayerUuid));
+            Assert.That(auction.AuctioneerId, Is.Not.EqualTo(protectedPlayer));
             Assert.That(auction.AuctioneerId, Has.Length.EqualTo(32));
             Assert.That(auction.SellerId, Is.Zero);
-            Assert.That(auction.Bids[0].Bidder, Is.Not.EqualTo(PermanentAnonymization.PlayerUuid));
+            Assert.That(auction.Bids[0].Bidder, Is.Not.EqualTo(protectedPlayer));
             Assert.That(auction.Bids[0].Bidder, Has.Length.EqualTo(32));
             Assert.That(auction.Bids[0].BidderId, Is.Zero);
         });
@@ -84,6 +85,7 @@ public class IndexerTests
 
     [TestCase("f3c19fb53ea940f3921e90faab8e2b30")]
     [TestCase("F3C19FB5-3EA9-40F3-921E-90FAAB8E2B30")]
+    [TestCase("69100d30114a474c82bcb3bc8fd6c9ac")]
     public void ProtectedPlayerUuidMatchingIsFormatIndependent(string uuid)
     {
         Assert.That(PermanentAnonymization.IsProtectedPlayer(uuid), Is.True);

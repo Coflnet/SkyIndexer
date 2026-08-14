@@ -95,7 +95,7 @@ namespace Coflnet.Sky.Indexer
             List<Player> players;
             using (var context = new HypixelContext())
             {
-                players = context.Players.Where(p => p.ChangedFlag && p.Id > 0 && p.UuId != PermanentAnonymization.PlayerUuid)
+                players = context.Players.Where(p => p.ChangedFlag && p.Id > 0 && !PermanentAnonymization.PlayerUuids.Contains(p.UuId))
                     .OrderBy(p => p.UpdatedAt)
                     .Take(targetAmount).ToList();
             }
@@ -179,9 +179,9 @@ namespace Coflnet.Sky.Indexer
             // this is a workaround, because the "updatedat" field is only updated when there is a change
             using (var context = new HypixelContext())
             {
-                var players = context.Players.Where(p => p.Id > 0 && p.UuId != PermanentAnonymization.PlayerUuid)
+                var players = context.Players.Where(p => p.Id > 0 && !PermanentAnonymization.PlayerUuids.Contains(p.UuId))
                     .OrderBy(p => p.UpdatedAt).Take(10);
-                players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null && p.UuId != PermanentAnonymization.PlayerUuid).Take(15));
+                players = players.Concat(context.Players.Where(p => !p.ChangedFlag && p.Name == null && !PermanentAnonymization.PlayerUuids.Contains(p.UuId)).Take(15));
                 foreach (var p in players)
                 {
                     p.ChangedFlag = true;

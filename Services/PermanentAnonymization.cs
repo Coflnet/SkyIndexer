@@ -6,11 +6,15 @@ namespace Coflnet.Sky.Indexer;
 
 internal static class PermanentAnonymization
 {
-    internal const string PlayerUuid = "f3c19fb53ea940f3921e90faab8e2b30";
+    internal static readonly string[] PlayerUuids =
+    [
+        "f3c19fb53ea940f3921e90faab8e2b30",
+        "69100d30114a474c82bcb3bc8fd6c9ac"
+    ];
 
     internal static bool IsProtectedPlayer(string uuid)
     {
-        return string.Equals(uuid?.Replace("-", ""), PlayerUuid, StringComparison.OrdinalIgnoreCase);
+        return PlayerUuids.Contains(uuid?.Replace("-", ""), StringComparer.OrdinalIgnoreCase);
     }
 
     internal static void Apply(SaveAuction auction)

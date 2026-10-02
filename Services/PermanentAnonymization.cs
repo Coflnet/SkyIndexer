@@ -9,7 +9,8 @@ internal static class PermanentAnonymization
     internal static readonly string[] PlayerUuids =
     [
         "f3c19fb53ea940f3921e90faab8e2b30",
-        "69100d30114a474c82bcb3bc8fd6c9ac"
+        "69100d30114a474c82bcb3bc8fd6c9ac",
+        "6bcdb39d787c456cb7cea5b33afd7d08"
     ];
 
     internal static bool IsProtectedPlayer(string uuid)

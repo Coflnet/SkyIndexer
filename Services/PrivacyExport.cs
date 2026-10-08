@@ -9,6 +9,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Coflnet.Security.OpenBao;
 using Coflnet.Sky.Core;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -265,7 +266,7 @@ internal sealed class PrivacyExport
     }
     private static void ConfigureDatabase()
     {
-        var config = new ConfigurationBuilder().AddJsonFile("appsettings.json", true).AddEnvironmentVariables().Build();
+        var config = new ConfigurationBuilder().AddJsonFile("appsettings.json", true).AddEnvironmentVariables().AddOpenBaoFromEnvironment().Build();
         HypixelContext.SetConfiguration(config);
     }
     internal static int Run(string[] args)

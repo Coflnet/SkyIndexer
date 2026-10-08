@@ -296,15 +296,15 @@ public class OptOutRequestsTests
         Assert.That(left.AuctioneerId, Is.EqualTo(Other));
     }
     [Test]
-    public async Task IngestionUpdateDeletesOptedOutCoopMemberRowFromDb()
+    public async Task IngestionDoesNotLoadCoopMembersOfExistingAuctions()
     {
+        // regression: including CoopMembers/ClaimedBids in the ingestion preload ran into command timeouts in production
         Seed();
         OptOut();
         var indexer = new Indexer(null, new ConcurrentQueue<AuctionResult>(), null, null, null, new ActiveAuctionIndexService(null));
         await indexer.ToDb([new SaveAuction { Uuid = AuctionUuid, UId = 123, AuctioneerId = Other, SellerId = 43, End = DateTime.UtcNow.AddHours(1), HighestBidAmount = 100, Bids = [] }]);
         using var fresh = Db();
-        Assert.That(fresh.Set<UuId>().Count(p => p.value == Uuid), Is.Zero, "row deleted, not just detached");
-        Assert.That(fresh.Set<UuId>().Count(p => p.value == Other), Is.EqualTo(1));
+        Assert.That(fresh.Set<UuId>().Count(p => p.value == Uuid), Is.Not.Zero, "coop rows are not touched by ingestion");
     }
     [Test]
     public void SaveFailureRollsBackEveryMutation()

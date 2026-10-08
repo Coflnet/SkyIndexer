@@ -428,9 +428,10 @@ namespace Coflnet.Sky.Indexer
         private static async Task<Dictionary<string, SaveAuction>> GetExistingAuctions(IEnumerable<SaveAuction> auctions, HypixelContext context)
         {
             // preload
-            // coop members and claimed bids are loaded so opted out players can be scrubbed from existing rows (persisted with the same SaveChanges)
+            // opted out players are scrubbed from what is loaded anyway (persisted with the same SaveChanges),
+            // coop members and claimed bids are not loaded here, that query timed out in production
             var existing = await context.Auctions.Where(a => auctions.Select(oa => oa.UId)
-                .Contains(a.UId)).Include(a => a.Bids).Include(a => a.CoopMembers).Include(a => a.ClaimedBids).AsSplitQuery().ToListAsync();
+                .Contains(a.UId)).Include(a => a.Bids).ToListAsync();
             foreach (var auction in existing)
                 PermanentAnonymization.MaskLoaded(auction, context);
             return existing.ToDictionary(a => a.Uuid);

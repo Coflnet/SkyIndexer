@@ -12,10 +12,11 @@ to null for every account linked to the player (the number is printed). The acco
 email and `AgreementAcceptances` are kept deliberately (compliance). `privacy check` writes
 nothing. Nothing else in `HypixelContext` is touched.
 
-Coop-member, claimed-bid and profile references of the player on auctions outside the export
-scope are not indexed, so they are not scanned for. They are removed lazily: whenever the
-indexer loads such an auction (ingestion of an update, `Auctions/export`, `Auctions/reindex`)
-the opted-out player is scrubbed from it and the change is saved.
+Bid and profile references of the player on auctions outside the export scope are not indexed,
+so they are not scanned for. They are removed lazily: whenever the indexer loads such an auction
+(ingestion of an update, `Auctions/export`, `Auctions/reindex`) the opted-out player is scrubbed
+from what was loaded and the change is saved. Coop-member and claimed-bid rows on auctions outside
+the export scope are not loaded by those paths and stay in SQL.
 
 ## Steps
 

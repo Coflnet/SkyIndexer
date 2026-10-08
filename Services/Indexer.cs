@@ -370,7 +370,11 @@ namespace Coflnet.Sky.Indexer
             foreach (var bid in auction.Bids)
             {
                 bid.Auction = dbauction;
-                if (!dbauction.Bids.Contains(bid, comparer))
+                // anonymized bids get a random uuid per call, so the comparer would never match them
+                var exists = PermanentAnonymization.IsAnonymousUuid(bid.Bidder)
+                    ? dbauction.Bids.Any(existing => PermanentAnonymization.IsAnonymousUuid(existing.Bidder) && existing.Timestamp == bid.Timestamp && existing.Amount == bid.Amount)
+                    : dbauction.Bids.Contains(bid, comparer);
+                if (!exists)
                 {
                     context.Bids.Add(bid);
                 }
@@ -424,9 +428,12 @@ namespace Coflnet.Sky.Indexer
         private static async Task<Dictionary<string, SaveAuction>> GetExistingAuctions(IEnumerable<SaveAuction> auctions, HypixelContext context)
         {
             // preload
-            return (await context.Auctions.Where(a => auctions.Select(oa => oa.UId)
-                .Contains(a.UId)).Include(a => a.Bids).ToListAsync())
-                .ToDictionary(a => a.Uuid);
+            // coop members and claimed bids are loaded so opted out players can be scrubbed from existing rows (persisted with the same SaveChanges)
+            var existing = await context.Auctions.Where(a => auctions.Select(oa => oa.UId)
+                .Contains(a.UId)).Include(a => a.Bids).Include(a => a.CoopMembers).Include(a => a.ClaimedBids).AsSplitQuery().ToListAsync();
+            foreach (var auction in existing)
+                PermanentAnonymization.MaskLoaded(auction, context);
+            return existing.ToDictionary(a => a.Uuid);
         }
 
         private static void DeleteDir(string path)

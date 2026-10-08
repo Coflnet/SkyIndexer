@@ -17,6 +17,11 @@ namespace Coflnet.Sky.Indexer
     {
         public static void Main(string[] args)
         {
+            if (args.Length > 0 && args[0] == "privacy")
+            {
+                Environment.ExitCode = PrivacyExport.Run(args);
+                return;
+            }
             var host = CreateHostBuilder(args).Build();
             HypixelContext.SetConfiguration(host.Services.GetRequiredService<IConfiguration>());
 
@@ -24,6 +29,7 @@ namespace Coflnet.Sky.Indexer
             using (var context = new HypixelContext())
             {
                 context.Database.Migrate();
+                PlayerOptOut.Reload(context);
             }
 
             Console.WriteLine("booting db dependend stuff");

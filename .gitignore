@@ -2,3 +2,7 @@ bin
 obj
 Client/out
 Client/*nupkg
+
+# Private local player exports and erasure plans
+out/
+__pycache__/

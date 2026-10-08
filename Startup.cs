@@ -36,6 +36,8 @@ namespace Coflnet.Sky.Indexer
             services.AddJaeger(Configuration);
 
             services.AddDbContext<HypixelContext>();
+            // loaded before the other hosted services start and refreshed hourly
+            services.AddPlayerOptOut();
             services.AddSingleton<ActiveAhStateService>();
             services.AddSingleton<ItemDetails>();
             services.AddSingleton<ItemPrices>();

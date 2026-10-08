@@ -41,6 +41,7 @@ public class AuctionsController : ControllerBase
     {
         var uid = AuctionService.Instance.GetId(uuid);
         var auction = await db.Auctions.Where(a => a.UId == uid).Include(a => a.NbtData).Include(a => a.NBTLookup).FirstOrDefaultAsync();
+        PermanentAnonymization.MaskLoaded(auction, db);
         Console.WriteLine(JsonConvert.SerializeObject(auction.NBTLookup, Formatting.Indented));
         auction.NBTLookup = nbt.CreateLookup(auction);
         Console.WriteLine(JsonConvert.SerializeObject(auction.NBTLookup, Formatting.Indented));
@@ -56,6 +57,7 @@ public class AuctionsController : ControllerBase
         var auctions = await db.Auctions.Include(a => a.Bids).Where(a => a.Id > max - amount - offset && a.Id < max - offset && a.Bin && a.Bids.Count > 0 && a.Bids.First().Timestamp != a.End).ToListAsync();
         foreach (var auction in auctions)
         {
+            PermanentAnonymization.MaskLoaded(auction, db);
             if (auction.End.RoundDown(TimeSpan.FromMinutes(1)) == auction.Bids.First().Timestamp.RoundDown(TimeSpan.FromMinutes(1)))
                 continue;
             auction.End = auction.Bids.First().Timestamp;
@@ -76,30 +78,6 @@ public class AuctionsController : ControllerBase
         return JsonConvert.SerializeObject(endedQueue.ToArray());
     }
 
-    [Route("anonymize/{playerUuid}")]
-    [HttpDelete]
-    public async Task<(int, int, int)> Anonymize(string playerUuid, string email)
-    {
-        var user = await UserService.Instance.GetUserByEmail(email);
-        if (user == null)
-            return (0, 0, 0);
-        var playerId = (await PlayerSearch.Instance.GetPlayerAsync(playerUuid)).Id;
-        var auctions = await db.Auctions.Where(a => a.SellerId == playerId).ToListAsync();
-        foreach (var auction in auctions)
-        {
-            PermanentAnonymization.Anonymize(auction);
-            db.Update(auction);
-        }
-        var bids = await db.Bids.Where(b => b.BidderId == playerId).ToListAsync();
-        foreach (var bid in bids)
-        {
-            PermanentAnonymization.Anonymize(bid);
-            db.Update(bid);
-        }
-        return (await db.SaveChangesAsync(), auctions.Count, bids.Count);
-
-    }
-
     MessagePack.MessagePackSerializerOptions options = MessagePack.MessagePackSerializerOptions.Standard.WithResolver(MessagePack.Resolvers.ContractlessStandardResolver.Instance).WithCompression(MessagePack.MessagePackCompression.Lz4BlockArray);
 
     [Route("export")]
@@ -107,6 +85,12 @@ public class AuctionsController : ControllerBase
     public async Task<string> Export(DateTime start, DateTime end)
     {
         var auctions = await db.Auctions.Include(a => a.Bids).Include(a => a.NbtData).Include(a => a.Enchantments).Where(a => a.End > start && a.End < end && a.Id > db.Auctions.Max(au => au.Id) - 5_000_000).ToListAsync();
+        // scrub what is loaded, persist when something changed
+        var scrubbed = false;
+        foreach (var auction in auctions)
+            scrubbed |= PermanentAnonymization.MaskLoaded(auction, db);
+        if (scrubbed)
+            await db.SaveChangesAsync();
         // set count in header 
         Response.Headers["X-Total-Count"] = auctions.Count.ToString();
         return Convert.ToBase64String(MessagePack.MessagePackSerializer.Serialize(auctions, options));

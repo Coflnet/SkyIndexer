@@ -42,6 +42,20 @@ public class PlayerController : ControllerBase
         return await nameUpdateService.GetPlayersToUpdate(count);
     }
 
+    /// <summary>
+    /// Persists an opt-out of processing and refreshes the in-memory set of this (single) indexer instance immediately; other services pick it up with their next hourly refresh
+    /// </summary>
+    [Route("optout/{uuid}")]
+    [HttpPost]
+    public IActionResult OptOut(string uuid)
+    {
+        if (!PrivacyExport.CanonicalUuid(uuid))
+            return BadRequest("uuid must be 32 lowercase hex characters without dashes");
+        using var context = new HypixelContext();
+        PlayerOptOut.Add(context, uuid);
+        return Ok();
+    }
+
     [Route("{uuid}/{profile}/whiped")]
     [HttpPatch]
     public async Task WhipedProfile(string uuid, string profile)

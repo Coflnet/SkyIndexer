@@ -27,6 +27,8 @@ the export scope are not loaded by those paths and stay in SQL.
    SkyAuctions, SkyFlipTracker) hold the same list in memory, loaded at startup and
    reloaded hourly, so they pick the opt-out up within an hour. They read the table with
    `DBReadOnlyConnection` (a read-only DB user), falling back to `DBConnection` when unset.
+   Services without database access (SkyFlipTracker) load the same
+   list from the indexer's `GET Player/optout` (JSON array of uuids, base url `INDEXER_BASE_URL`).
    The uuid must be 32 lowercase hex characters without dashes.
 
    ```sh

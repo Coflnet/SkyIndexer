@@ -56,6 +56,16 @@ public class PlayerController : ControllerBase
         return Ok();
     }
 
+    /// <summary>
+    /// The current in-memory opt-out list (JSON array of 32 character lowercase hex uuids), for services without database access
+    /// </summary>
+    [Route("optout")]
+    [HttpGet]
+    public string[] GetOptOuts()
+    {
+        return PlayerOptOut.PlayerUuids;
+    }
+
     [Route("{uuid}/{profile}/whiped")]
     [HttpPatch]
     public async Task WhipedProfile(string uuid, string profile)

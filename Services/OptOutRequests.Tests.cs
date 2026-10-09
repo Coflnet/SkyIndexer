@@ -3,6 +3,8 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using Coflnet.Sky.Core;
@@ -441,5 +443,91 @@ public class PlayerOptOutRefresherTests
             new ConfigurationBuilder().AddInMemoryCollection(values.ToDictionary(v => v.Item1, v => v.Item2)).Build());
         Assert.That(Resolve(("DBConnection", "rw"), ("DBReadOnlyConnection", "ro")), Is.EqualTo("ro"));
         Assert.That(Resolve(("DBConnection", "rw")), Is.EqualTo("rw"));
+    }
+}
+
+[TestFixture, NonParallelizable]
+public class PlayerOptOutIndexerLoaderTests
+{
+    private const string Other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    private sealed class FakeHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
+    {
+        public List<Uri> Requests { get; } = [];
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Requests.Add(request.RequestUri);
+            return Task.FromResult(respond(request));
+        }
+    }
+
+    private static HttpResponseMessage Json(string body, HttpStatusCode status = HttpStatusCode.OK) =>
+        new(status) { Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json") };
+
+    [SetUp]
+    public void Reset() => PlayerOptOut.ResetMemory();
+    [TearDown]
+    public void TearDown() => PlayerOptOut.ResetMemory();
+
+    [Test]
+    public async Task LoadReplacesSnapshotAndKeepsLegacy()
+    {
+        var handler = new FakeHandler(_ => Json($"[\"{Other}\",\"{Other.ToUpperInvariant()}\",\"not-a-uuid\"]"));
+        await PlayerOptOut.LoadFromIndexerAsync(new HttpClient(handler), "http://indexer:8000");
+        Assert.That(PlayerOptOut.IsOptedOut(Other), Is.True);
+        Assert.That(PlayerOptOut.PlayerUuids, Is.EqualTo(PlayerOptOut.LegacyPlayerUuids.Append(Other)));
+        Assert.That(handler.Requests.Single().ToString(), Is.EqualTo("http://indexer:8000/Player/optout"));
+    }
+
+    [Test]
+    public async Task TrailingSlashHitsSamePath()
+    {
+        var handler = new FakeHandler(_ => Json("[]"));
+        await PlayerOptOut.LoadFromIndexerAsync(new HttpClient(handler), "http://indexer:8000/");
+        Assert.That(handler.Requests.Single().ToString(), Is.EqualTo("http://indexer:8000/Player/optout"));
+        Assert.That(PlayerOptOut.PlayerUuids, Is.EqualTo(PlayerOptOut.LegacyPlayerUuids));
+    }
+
+    [TestCase(HttpStatusCode.InternalServerError, "[]")]
+    [TestCase(HttpStatusCode.OK, "{\"a\":1}")]
+    [TestCase(HttpStatusCode.OK, "[1,2]")]
+    [TestCase(HttpStatusCode.OK, "[null]")]
+    [TestCase(HttpStatusCode.OK, "not json")]
+    [TestCase(HttpStatusCode.OK, "")]
+    public async Task FailureThrowsAndKeepsPreviousSnapshot(HttpStatusCode status, string body)
+    {
+        await PlayerOptOut.LoadFromIndexerAsync(new HttpClient(new FakeHandler(_ => Json($"[\"{Other}\"]"))), "http://indexer");
+        var failing = new HttpClient(new FakeHandler(_ => Json(body, status)));
+        Assert.CatchAsync(() => PlayerOptOut.LoadFromIndexerAsync(failing, "http://indexer"));
+        Assert.That(PlayerOptOut.IsOptedOut(Other), Is.True);
+    }
+
+    private static IConfiguration Config(params (string, string)[] values) =>
+        new ConfigurationBuilder().AddInMemoryCollection(values.ToDictionary(v => v.Item1, v => v.Item2)).Build();
+
+    [Test]
+    public void IndexerBaseUrlPrefersConfigurationOverEnvironmentAndThrowsWhenMissing()
+    {
+        const string key = "INDEXER_BASE_URL";
+        var previous = Environment.GetEnvironmentVariable(key);
+        try
+        {
+            Environment.SetEnvironmentVariable(key, null);
+            var ex = Assert.Throws<InvalidOperationException>(() => PlayerOptOut.ResolveIndexerBaseUrl(Config()));
+            Assert.That(ex.Message, Does.Contain("INDEXER_BASE_URL"));
+            Environment.SetEnvironmentVariable(key, "http://env");
+            Assert.That(PlayerOptOut.ResolveIndexerBaseUrl(Config()), Is.EqualTo("http://env"));
+            Assert.That(PlayerOptOut.ResolveIndexerBaseUrl(Config((key, "http://config"))), Is.EqualTo("http://config"));
+        }
+        finally { Environment.SetEnvironmentVariable(key, previous); }
+    }
+
+    [Test]
+    public void ControllerReturnsInMemoryList()
+    {
+        var controller = new Coflnet.Sky.Indexer.Controllers.PlayerController(null, null, null);
+        Assert.That(controller.GetOptOuts(), Is.EqualTo(PlayerOptOut.LegacyPlayerUuids));
+        var uuids = controller.GetOptOuts();
+        Assert.That(uuids, Has.All.Length.EqualTo(32).And.All.Matches("^[0-9a-f]{32}$"));
     }
 }

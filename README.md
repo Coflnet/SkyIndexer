@@ -30,7 +30,7 @@ Closed months of MariaDB auctions are archived as immutable blobs in R2 (`Auctio
 
 **Config**
 - `S3:ENABLED`, `S3:ENDPOINT`, `S3:REGION`, `S3:BUCKET`, `S3:ACCESS_KEY`, `S3:SECRET_KEY`, `S3:USE_PATH_STYLE` (same as SkyBazaar; with an endpoint the region is only used for signing), optional `S3:CACHE_SIZE_BYTES` (default 256 MB).
-- `ARCHIVE:ENABLED`, `START_DELAY_SECONDS`, `CLOSED_MARGIN_DAYS` (a month is closed 14 days after it ends), `OLDEST_MONTH`, `MAX_ROWS_PER_PART`, `PAGE_SIZE`, `PAGE_PAUSE_MS`, `TAG_PAUSE_MS`, `MONTH_PAUSE_MS`, `IDLE_PAUSE_MINUTES`.
+- `ARCHIVE:ENABLED`, `START_DELAY_SECONDS`, `CLOSED_MARGIN_DAYS` (a month is closed 14 days after it ends), `OLDEST_MONTH` (default 2019-06, SkyBlock launch; raise it as the backfill completes months), `MAX_ROWS_PER_PART`, `PAGE_SIZE`, `PAGE_PAUSE_MS`, `TAG_PAUSE_MS`, `MONTH_PAUSE_MS`, `IDLE_PAUSE_MINUTES`.
 - Retention: `ARCHIVE:DELETE_MARIADB`, `WINDOW_YEARS`, `MAX_DELETE_MONTHS_PER_DAY`, `DELETE_BATCH_SIZE`, `DELETE_PAUSE_MS`, `MAX_BINLOG_GB`, `MAX_HISTORY_LIST_LENGTH`, `REQUIRE_HEALTH_CHECKS` (the gate needs `SHOW BINARY LOGS` and `information_schema.INNODB_METRICS`, i.e. the `BINLOG MONITOR`/`REPLICATION CLIENT` and `PROCESS` privileges; without them nothing is deleted while this is true).
 
 **Rollout order**

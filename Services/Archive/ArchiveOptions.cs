@@ -15,7 +15,8 @@ namespace Coflnet.Sky.Indexer.Archive
         public int MaxRowsPerPart { get; init; } = 50000;
         public int PageSize { get; init; } = 2000;
         public int PagePauseMs { get; init; } = 200;
-        public int TagPauseMs { get; init; } = 1000;
+        /// <summary>Pause after an ItemId-month that had rows; each visit is one keyset page query on (ItemId, End).</summary>
+        public int TagPauseMs { get; init; } = 100;
         public int MonthPauseMs { get; init; } = 60000;
         public int IdlePauseMinutes { get; init; } = 60;
         public bool DeleteMariaDb { get; init; }
@@ -25,8 +26,12 @@ namespace Coflnet.Sky.Indexer.Archive
         public double MaxBinlogGb { get; init; } = 100;
         public long MaxHistoryListLength { get; init; } = 1_000_000;
         public bool RequireHealthChecks { get; init; } = true;
-        /// <summary><c>yyyyMM</c> parsed from <c>OLDEST_MONTH</c> (<c>yyyy-MM</c>).</summary>
-        public int OldestMonth { get; init; } = 201901;
+        /// <summary>
+        /// <c>yyyyMM</c> parsed from <c>OLDEST_MONTH</c> (<c>yyyy-MM</c>). SkyBlock launched on 2019-06-11, so no auction
+        /// ends before 2019-06; every empty month still costs one page query per ItemId. Raise this default as the
+        /// backfill completes months, so a fresh pass does not re-walk them.
+        /// </summary>
+        public int OldestMonth { get; init; } = 201906;
 
         /// <summary>Read <c>ARCHIVE:*</c>; missing or invalid values fall back to the defaults.</summary>
         public static ArchiveOptions From(IConfiguration config)

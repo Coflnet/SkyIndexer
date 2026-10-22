@@ -34,12 +34,14 @@ public class AuctionArchiveJobTests
         public TestableArchiveJob(IAuctionBlobStore store, IConfiguration config, List<string> events, Microsoft.Extensions.Logging.ILogger<AuctionArchiveJob> logger = null)
             : base(store, config, logger ?? NullLogger<AuctionArchiveJob>.Instance) => Events = events;
 
-        protected override Task<IReadOnlyCollection<int>> GetAuctionItemIdsAsync(CancellationToken cancellationToken)
+        public readonly List<TimeSpan> Delays = new();
+
+        protected override Task<IReadOnlyDictionary<int, DateTime>> GetAuctionItemFirstEndsAsync(CancellationToken cancellationToken)
         {
             ItemIdScans++;
             if (ItemIdsFailure != null)
                 throw ItemIdsFailure;
-            return Task.FromResult<IReadOnlyCollection<int>>(Auctions.Select(a => a.ItemId).Distinct().ToList());
+            return Task.FromResult<IReadOnlyDictionary<int, DateTime>>(Auctions.GroupBy(a => a.ItemId).ToDictionary(g => g.Key, g => g.Min(a => a.End)));
         }
 
         protected override Task EnsureSchemaAsync(CancellationToken cancellationToken)
@@ -102,7 +104,11 @@ public class AuctionArchiveJobTests
             return Task.CompletedTask;
         }
 
-        protected override Task Delay(TimeSpan delay, CancellationToken cancellationToken) => Task.CompletedTask;
+        protected override Task Delay(TimeSpan delay, CancellationToken cancellationToken)
+        {
+            Delays.Add(delay);
+            return Task.CompletedTask;
+        }
 
         public Task<int> Run(DateTime now) => RunOnceAsync(now, CancellationToken.None);
     }
@@ -147,6 +153,26 @@ public class AuctionArchiveJobTests
     }
 
     private static SaveBids Bid(int bidderId, long amount) => new() { BidderId = bidderId, Bidder = bidderId.ToString("x32"), Amount = amount, Timestamp = new DateTime(2026, 8, 3) };
+
+    [Test]
+    public async Task ItemsFirstSeenLater_AreSkippedWithoutAQuery_AndEmptyItemMonthsDoNotPause()
+    {
+        // 4,771 ItemIds x 88 months with one query + a pause each made the backfill mostly sleep; items released later
+        // must not be paged for the months before their first auction, and an empty ItemId-month must not pause.
+        var job = Job(("ARCHIVE:OLDEST_MONTH", "2026-07"), ("ARCHIVE:TAG_PAUSE_MS", "100"), ("ARCHIVE:PAGE_PAUSE_MS", "200"), ("ARCHIVE:MONTH_PAUSE_MS", "60000"));
+        job.Auctions.Add(Auction(1, "HYPERION", new DateTime(2026, 7, 3)));
+        job.Auctions.Add(Auction(1, "HYPERION", new DateTime(2026, 9, 3)));   // item 1 exists in july, has nothing in august
+        job.Auctions.Add(Auction(2, "TERMINATOR", new DateTime(2026, 9, 5))); // item 2 is first seen in september
+
+        var completed = await job.Run(Now);
+
+        Assert.That(completed, Is.EqualTo(3), "july, august and september are complete");
+        Assert.That(job.Pages.Where(p => p.item == 2).Select(p => ArchiveMonths.MonthOf(p.cursor)).Distinct(), Is.EqualTo(new[] { Sep }), "item 2 is only paged from its first month on");
+        Assert.That(job.Pages.Where(p => p.item == 1).Select(p => ArchiveMonths.MonthOf(p.cursor)).Distinct(), Is.EquivalentTo(new[] { 202607, 202608, Sep }), "an existing item is still checked in a month without rows");
+        Assert.That(job.Delays.Where(d => d.TotalMilliseconds == 200), Is.Empty, "no page pause after an empty ItemId-month");
+        Assert.That(job.Delays.Count(d => d.TotalMilliseconds == 100), Is.EqualTo(3), "one tag pause per ItemId-month with rows");
+        Assert.That(store.Objects.Keys, Does.Contain("auctions/v2/TERMINATOR/2026-09/000.msgpack.br"));
+    }
 
     [Test]
     public async Task ArchivesClosedMonthsOldestFirstWithIndexMarkerAndSentinel()

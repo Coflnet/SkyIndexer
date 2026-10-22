@@ -47,6 +47,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private static readonly Prometheus.Counter indexRowsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_archive_index_rows", "auction_locations rows written");
         private static readonly Prometheus.Counter bidderRowsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_archive_bidder_rows", "auction_bidders rows written");
         private static readonly Prometheus.Counter bidsWithoutBidder = Prometheus.Metrics.CreateCounter("sky_indexer_archive_bids_without_bidder", "Bids skipped for auction_bidders because BidderId is 0");
+        private static readonly Prometheus.Counter itemMonthsSkipped = Prometheus.Metrics.CreateCounter("sky_indexer_archive_item_months_skipped", "ItemId-months skipped because the item's first auction ends in a later month");
         private static readonly Prometheus.Counter pages = Prometheus.Metrics.CreateCounter("sky_indexer_archive_pages", "Auction pages read from MariaDB");
         private static readonly Prometheus.Counter errors = Prometheus.Metrics.CreateCounter("sky_indexer_archive_errors", "Archive errors (tag-months that failed with an exception, tag collisions)");
         private static readonly Prometheus.Gauge currentMonth = Prometheus.Metrics.CreateGauge("sky_indexer_archive_current_month", "Month (yyyyMM) being archived");
@@ -128,6 +129,7 @@ namespace Coflnet.Sky.Indexer.Archive
             var newest = ArchiveMonths.NewestClosed(nowUtc, options.ClosedMarginDays);
             var completed = 0;
             IReadOnlyList<int> itemIds = null;
+            IReadOnlyDictionary<int, int> firstMonths = null;
             for (var month = options.OldestMonth; month <= newest; month = ArchiveMonths.Next(month))
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -136,10 +138,13 @@ namespace Coflnet.Sky.Indexer.Archive
                     continue;
                 if (itemIds == null)
                 {
-                    // the ItemIds that occur in Auctions, loaded once per pass; without the list no month may be marked complete
+                    // the ItemIds that occur in Auctions with the month of their first auction, loaded once per pass; without the
+                    // list no month may be marked complete. Items released later are skipped for the months before their first auction.
                     try
                     {
-                        itemIds = (await GetAuctionItemIdsAsync(cancellationToken).ConfigureAwait(false)).Distinct().OrderBy(i => i).ToList();
+                        var firstEnds = await GetAuctionItemFirstEndsAsync(cancellationToken).ConfigureAwait(false);
+                        firstMonths = firstEnds.ToDictionary(kv => kv.Key, kv => ArchiveMonths.MonthOf(kv.Value));
+                        itemIds = firstMonths.Keys.OrderBy(i => i).ToList();
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
                     {
@@ -155,8 +160,9 @@ namespace Coflnet.Sky.Indexer.Archive
                     }
                 }
                 currentMonth.Set(month);
-                logger.LogInformation("Archiving auctions of {Month} ({Items} item ids)", month, itemIds.Count);
-                if (await ArchiveMonthAsync(month, itemIds, options, cancellationToken).ConfigureAwait(false))
+                var laterItems = firstMonths.Values.Count(first => first > month);
+                logger.LogInformation("Archiving auctions of {Month} ({Items} item ids, {Later} first seen later)", month, itemIds.Count - laterItems, laterItems);
+                if (await ArchiveMonthAsync(month, itemIds, options, cancellationToken, firstMonths).ConfigureAwait(false))
                 {
                     await WriteMonthSentinelAsync(month, cancellationToken).ConfigureAwait(false);
                     monthsTotal.Inc();
@@ -181,16 +187,25 @@ namespace Coflnet.Sky.Indexer.Archive
         /// (<c>archived_months</c>, R2 tag index) are written last, after every ItemId has been paged and every part verified.
         /// False when a part did not verify or a row has no tag (nothing is marked, the month is retried next pass).
         /// </summary>
-        internal async Task<bool> ArchiveMonthAsync(int month, IReadOnlyList<int> itemIds, ArchiveOptions options, CancellationToken cancellationToken)
+        /// <param name="firstMonths">Month (<c>yyyyMM</c>) of each ItemId's first auction; items first seen after <paramref name="month"/>
+        /// are skipped without a query. Null skips nothing.</param>
+        internal async Task<bool> ArchiveMonthAsync(int month, IReadOnlyList<int> itemIds, ArchiveOptions options, CancellationToken cancellationToken, IReadOnlyDictionary<int, int> firstMonths = null)
         {
             var runs = new Dictionary<string, TagMonthRun>(StringComparer.Ordinal);
             foreach (var itemId in itemIds)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (firstMonths != null && firstMonths.TryGetValue(itemId, out var first) && first > month)
+                {
+                    itemMonthsSkipped.Inc();
+                    continue;
+                }
                 var (ok, rows) = await ArchiveItemMonthAsync(itemId, month, runs, options, cancellationToken).ConfigureAwait(false);
                 if (!ok)
                     return false;
-                await Delay(TimeSpan.FromMilliseconds(rows > 0 ? options.TagPauseMs : options.PagePauseMs), cancellationToken).ConfigureAwait(false);
+                // an empty ItemId-month was one cheap index lookup; only pause after real work
+                if (rows > 0)
+                    await Delay(TimeSpan.FromMilliseconds(options.TagPauseMs), cancellationToken).ConfigureAwait(false);
             }
             foreach (var run in runs.Values.OrderBy(r => r.Tag, StringComparer.Ordinal))
                 await FinalizeTagMonthAsync(run, cancellationToken).ConfigureAwait(false);
@@ -374,12 +389,14 @@ namespace Coflnet.Sky.Indexer.Archive
             await db.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        /// <summary>Distinct <c>ItemId</c>s of <c>Auctions</c> (loose index scan on <c>IX_Auctions_ItemId_End</c>, a few thousand rows).</summary>
-        protected virtual async Task<IReadOnlyCollection<int>> GetAuctionItemIdsAsync(CancellationToken cancellationToken)
+        /// <summary>Distinct <c>ItemId</c>s of <c>Auctions</c> with the <c>End</c> of their first auction (loose index scan on
+        /// <c>IX_Auctions_ItemId_End</c>, a few thousand rows).</summary>
+        protected virtual async Task<IReadOnlyDictionary<int, DateTime>> GetAuctionItemFirstEndsAsync(CancellationToken cancellationToken)
         {
             using var db = new HypixelContext();
             db.Database.SetCommandTimeout(TimeSpan.FromMinutes(10));
-            return await db.Auctions.AsNoTracking().Select(a => a.ItemId).Distinct().ToListAsync(cancellationToken).ConfigureAwait(false);
+            var rows = await db.Auctions.AsNoTracking().GroupBy(a => a.ItemId).Select(g => new { ItemId = g.Key, First = g.Min(a => a.End) }).ToListAsync(cancellationToken).ConfigureAwait(false);
+            return rows.ToDictionary(r => r.ItemId, r => r.First);
         }
 
         /// <summary>Sentinel and verified tags of a month.</summary>

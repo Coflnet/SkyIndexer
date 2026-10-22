@@ -32,6 +32,29 @@ public class ArchiveOptionsTests
     }
 
     [Test]
+    public void ShippedAppsettings_MatchTheCodeDefaults()
+    {
+        // appsettings.json wins over the code defaults; the first rollout of the 2019-06 default was silently
+        // overridden by the "2019-01" / 1000 ms values still shipped in the file.
+        var dir = new System.IO.DirectoryInfo(System.AppContext.BaseDirectory);
+        string path = null;
+        for (; dir != null && path == null; dir = dir.Parent)
+        {
+            var candidate = System.IO.Path.Combine(dir.FullName, "appsettings.json");
+            if (System.IO.File.Exists(candidate) && System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "SkyIndexer.csproj")))
+                path = candidate;
+        }
+        Assert.That(path, Is.Not.Null, "appsettings.json next to SkyIndexer.csproj not found");
+        var shipped = ArchiveOptions.From(new ConfigurationBuilder().AddJsonFile(path).Build());
+        var defaults = new ArchiveOptions();
+        Assert.That(shipped.OldestMonth, Is.EqualTo(defaults.OldestMonth));
+        Assert.That(shipped.TagPauseMs, Is.EqualTo(defaults.TagPauseMs));
+        Assert.That(shipped.PagePauseMs, Is.EqualTo(defaults.PagePauseMs));
+        Assert.That(shipped.StartDelaySeconds, Is.EqualTo(defaults.StartDelaySeconds));
+        Assert.That(shipped.MaxRowsPerPart, Is.EqualTo(defaults.MaxRowsPerPart));
+    }
+
+    [Test]
     public void From_OldestMonthOverride_IsParsed()
     {
         var o = ArchiveOptions.From(Config(("OLDEST_MONTH", "2021-03")));

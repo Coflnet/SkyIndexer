@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using Coflnet.Kafka;
 using Coflnet.Sky.Core;
+using Coflnet.Sky.Core.Archive;
+using Coflnet.Sky.Indexer.Archive;
 using Coflnet.Sky.Indexer.Controllers;
 using Coflnet.Sky.Items.Client.Api;
 using Microsoft.AspNetCore.Builder;
@@ -67,6 +69,16 @@ namespace Coflnet.Sky.Indexer
             services.AddHostedService<Indexer>(di=>di.GetRequiredService<Indexer>());
             services.AddSingleton<ConcurrentQueue<AuctionResult>>();
             services.AddSingleton<Kafka.KafkaCreator>();
+
+            // auction archive (README "Auction archive"): blob store always registered, background work only behind the flags
+            ArchiveContext.SetConfiguration(Configuration);
+            services.AddSingleton<IAuctionBlobStore, S3AuctionBlobStore>();
+            var archiveEnabled = bool.TryParse(Configuration["ARCHIVE:ENABLED"], out var archive) && archive;
+            var s3Enabled = bool.TryParse(Configuration["S3:ENABLED"], out var s3) && s3;
+            if (archiveEnabled && s3Enabled)
+                services.AddHostedService<AuctionArchiveJob>();
+            if (archiveEnabled)
+                services.AddHostedService<AuctionRetentionWorker>();
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.

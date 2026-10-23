@@ -10,12 +10,20 @@ using Microsoft.Extensions.Configuration;
 namespace Coflnet.Sky.Indexer.Archive;
 
 /// <summary>Dictionary-backed <see cref="IAuctionBlobStore"/> that stores the real compressed wire format.</summary>
-internal class InMemoryAuctionBlobStore : IAuctionBlobStore
+internal class InMemoryAuctionBlobStore : IAuctionBlobStore, IArchiveMetaStore
 {
     public readonly Dictionary<string, byte[]> Objects = new();
     public readonly List<string> Events;
     /// <summary>When set, uncached block reads flip one item byte, like a corrupted upload.</summary>
     public bool CorruptReadBack;
+
+    /// <summary>Version per conditionally written key (tag indexes, meta objects); the ETag is <c>"v{n}"</c>.</summary>
+    private readonly Dictionary<string, int> versions = new();
+    /// <summary>Runs once before the next conditional meta write is checked (another writer in between).</summary>
+    public Func<string, Task> BeforeMetaWrite;
+    /// <summary>Runs once before the next index write is checked, e.g. another writer updating the same tag index in between.</summary>
+    public Func<ArchivedTagIndex, Task> BeforeIndexWrite;
+    public int IndexConflicts;
 
     public InMemoryAuctionBlobStore(List<string> events = null) => Events = events ?? new List<string>();
 
@@ -41,14 +49,80 @@ internal class InMemoryAuctionBlobStore : IAuctionBlobStore
         => Task.FromResult(Objects.ContainsKey(AuctionBlobKeys.Block(tag, month, part)));
 
     public Task<ArchivedTagIndex> ReadIndexAsync(string tag, CancellationToken cancellationToken = default)
-        => Task.FromResult(Get<ArchivedTagIndex>(AuctionBlobKeys.Index(tag)));
-
-    public Task WriteIndexAsync(ArchivedTagIndex index, CancellationToken cancellationToken = default)
     {
+        var key = AuctionBlobKeys.Index(tag);
+        var index = Get<ArchivedTagIndex>(key);
+        if (index != null)
+            index.ETag = ETagOf(key);
+        return Task.FromResult(index);
+    }
+
+    /// <summary>Conditional like the S3 store: If-Match the read ETag, If-None-Match * for a new index.</summary>
+    public async Task WriteIndexAsync(ArchivedTagIndex index, CancellationToken cancellationToken = default)
+    {
+        var hook = BeforeIndexWrite;
+        BeforeIndexWrite = null;
+        if (hook != null)
+            await hook(index);
+        var key = AuctionBlobKeys.Index(index.Tag);
+        CheckCondition(key, index.ETag, index.Tag, $"tag_index_conflict:{index.Tag}");
         Events.Add($"tag_index:{index.Tag}");
-        Put(AuctionBlobKeys.Index(index.Tag), index);
+        index.ETag = PutVersioned(key, index);
+    }
+
+    public Task<T> ReadMetaAsync<T>(string key, CancellationToken cancellationToken = default) where T : class
+        => Task.FromResult(Get<T>(AuctionBlobKeys.Meta(key)));
+
+    public Task<(T Value, string ETag)> ReadMetaVersionedAsync<T>(string key, CancellationToken cancellationToken = default) where T : class
+    {
+        var full = AuctionBlobKeys.Meta(key);
+        var value = Get<T>(full);
+        return Task.FromResult((value, value == null ? null : ETagOf(full)));
+    }
+
+    public Task WriteMetaAsync<T>(string key, T value, CancellationToken cancellationToken = default) where T : class
+    {
+        Events.Add("meta:" + key);
+        PutVersioned(AuctionBlobKeys.Meta(key), value);
         return Task.CompletedTask;
     }
+
+    public async Task<string> WriteMetaConditionalAsync<T>(string key, T value, string etag, CancellationToken cancellationToken = default) where T : class
+    {
+        var full = AuctionBlobKeys.Meta(key);
+        var hook = BeforeMetaWrite;
+        BeforeMetaWrite = null;
+        if (hook != null)
+            await hook(full);
+        CheckCondition(full, etag, full, "meta_conflict:" + key);
+        Events.Add("meta:" + key);
+        return PutVersioned(full, value);
+    }
+
+    public Task<IReadOnlyList<string>> ListMetaKeysAsync(string prefix, CancellationToken cancellationToken = default)
+    {
+        var full = AuctionBlobKeys.Meta(prefix);
+        IReadOnlyList<string> keys = Objects.Keys.Where(k => k.StartsWith(full, StringComparison.Ordinal)).OrderBy(k => k, StringComparer.Ordinal).ToList();
+        return Task.FromResult(keys);
+    }
+
+    private void CheckCondition(string key, string etag, string name, string conflictEvent)
+    {
+        if (etag == ETagOf(key))
+            return;
+        IndexConflicts++;
+        Events.Add(conflictEvent);
+        throw new ArchiveIndexConflictException(name);
+    }
+
+    private string PutVersioned<T>(string key, T value)
+    {
+        Put(key, value);
+        versions[key] = versions.GetValueOrDefault(key) + 1;
+        return ETagOf(key);
+    }
+
+    private string ETagOf(string key) => Objects.ContainsKey(key) && versions.TryGetValue(key, out var v) ? $"\"v{v}\"" : null;
 
     private void Put<T>(string key, T value)
     {

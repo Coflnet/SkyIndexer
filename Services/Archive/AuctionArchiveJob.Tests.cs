@@ -174,6 +174,50 @@ public class AuctionArchiveJobTests
         Assert.That(store.Objects.Keys, Does.Contain("auctions/v2/TERMINATOR/2026-09/000.msgpack.br"));
     }
 
+    /// <summary>Another writer (the SkyAuctions Scylla sweep, an older month) updates the same tag index between our read and write.</summary>
+    private Func<ArchivedTagIndex, Task> ConcurrentWriter(string tag, int month, int times = 1)
+    {
+        return async _ =>
+        {
+            var other = await store.ReadIndexAsync(tag) ?? new ArchivedTagIndex { Tag = tag };
+            other.Upsert(new ArchivedMonthEntry { Month = month, Parts = 1, Rows = 99, PartSha256 = new() { "aa" }, Source = ArchivedAuctionBlock.SourceMerged });
+            await store.WriteIndexAsync(other);
+            if (--times > 0)
+                store.BeforeIndexWrite = ConcurrentWriter(tag, month, times);
+        };
+    }
+
+    [Test]
+    public async Task ConcurrentTagIndexWriter_BothMonthEntriesSurvive()
+    {
+        var job = Job();
+        job.Auctions.Add(Auction(1, "HYPERION", new DateTime(2026, 8, 3)));
+        store.BeforeIndexWrite = ConcurrentWriter("HYPERION", 202003);
+
+        Assert.That(await job.Run(Now), Is.EqualTo(2));
+
+        Assert.That(store.IndexConflicts, Is.EqualTo(1));
+        var index = await store.ReadIndexAsync("HYPERION");
+        Assert.That(index.Months.Select(m => m.Month), Is.EqualTo(new[] { 202003, Aug }), "the other writer's month is not lost");
+        Assert.That(index.Find(202003).Rows, Is.EqualTo(99));
+        Assert.That(job.Months[(job.Tags["HYPERION"], ArchiveMonths.ToIndex(Aug))].VerifiedAt, Is.Not.Null);
+    }
+
+    [Test]
+    public async Task TagIndexThatKeepsChanging_FailsTheTagMonthWithoutMarker()
+    {
+        var job = Job();
+        job.Auctions.Add(Auction(1, "HYPERION", new DateTime(2026, 8, 3)));
+        store.BeforeIndexWrite = ConcurrentWriter("HYPERION", 202003, times: ArchiveIndexConflictException.MaxWriteAttempts);
+
+        await job.Run(Now);
+
+        Assert.That(store.IndexConflicts, Is.EqualTo(ArchiveIndexConflictException.MaxWriteAttempts));
+        Assert.That(job.Months.ContainsKey((job.Tags["HYPERION"], ArchiveMonths.ToIndex(Aug))), Is.False, "no archived_months marker");
+        Assert.That(job.Months.ContainsKey((0, ArchiveMonths.ToIndex(Aug))), Is.False, "no sentinel");
+        Assert.That((await store.ReadIndexAsync("HYPERION")).Find(Aug), Is.Null);
+    }
+
     [Test]
     public async Task ArchivesClosedMonthsOldestFirstWithIndexMarkerAndSentinel()
     {

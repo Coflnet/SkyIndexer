@@ -19,6 +19,8 @@ namespace Coflnet.Sky.Indexer.Archive
         public int TagPauseMs { get; init; } = 100;
         public int MonthPauseMs { get; init; } = 60000;
         public int IdlePauseMinutes { get; init; } = 60;
+        /// <summary>Minutes between scans of the Scylla month manifests SkyAuctions hands over (<see cref="ScyllaArchiveImportWorker"/>).</summary>
+        public int ImportPollMinutes { get; init; } = 5;
         public bool DeleteMariaDb { get; init; }
         public int MaxDeleteMonthsPerDay { get; init; } = 1;
         public int DeleteBatchSize { get; init; } = 5000;
@@ -50,6 +52,7 @@ namespace Coflnet.Sky.Indexer.Archive
                 TagPauseMs = Int(s["TAG_PAUSE_MS"], d.TagPauseMs),
                 MonthPauseMs = Int(s["MONTH_PAUSE_MS"], d.MonthPauseMs),
                 IdlePauseMinutes = Int(s["IDLE_PAUSE_MINUTES"], d.IdlePauseMinutes),
+                ImportPollMinutes = System.Math.Max(1, Int(s["IMPORT_POLL_MINUTES"], d.ImportPollMinutes)),
                 DeleteMariaDb = Bool(s["DELETE_MARIADB"], false),
                 MaxDeleteMonthsPerDay = Int(s["MAX_DELETE_MONTHS_PER_DAY"], d.MaxDeleteMonthsPerDay),
                 DeleteBatchSize = System.Math.Max(1, Int(s["DELETE_BATCH_SIZE"], d.DeleteBatchSize)),

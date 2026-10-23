@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,7 +21,7 @@ namespace Coflnet.Sky.Indexer.Archive
     /// <c>S3:BUCKET</c>, <c>S3:ACCESS_KEY</c>, <c>S3:SECRET_KEY</c>, <c>S3:USE_PATH_STYLE</c>.
     /// Blocks are cached in a dedicated bytes-bounded <see cref="MemoryCache"/>; indexes are never cached.
     /// </summary>
-    public class S3AuctionBlobStore : IAuctionBlobStore, IDisposable
+    public class S3AuctionBlobStore : IAuctionBlobStore, IArchiveMetaStore, IDisposable
     {
         private readonly ILogger<S3AuctionBlobStore> logger;
         private readonly MemoryCache cache;
@@ -29,6 +30,8 @@ namespace Coflnet.Sky.Indexer.Archive
         private readonly bool enabled;
         private readonly TimeSpan cacheTtl;
         private readonly long perEntryOverheadBytes;
+        /// <summary>Set once the endpoint answered 501 to a conditional PUT; index writes are unconditional from then on.</summary>
+        private volatile bool conditionalWritesUnsupported;
 
         private static readonly Prometheus.Counter blobReads = Prometheus.Metrics.CreateCounter("sky_indexer_blob_reads", "Archive blob reads (cached or not)");
         private static readonly Prometheus.Counter blobReadHits = Prometheus.Metrics.CreateCounter("sky_indexer_blob_read_hits", "Archive blob reads that returned data from storage");
@@ -37,6 +40,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private static readonly Prometheus.Counter blobReadErrors = Prometheus.Metrics.CreateCounter("sky_indexer_blob_read_errors", "Archive blob reads that failed with an unexpected error");
         private static readonly Prometheus.Counter blobWrites = Prometheus.Metrics.CreateCounter("sky_indexer_blob_writes", "Archive blob writes");
         private static readonly Prometheus.Counter blobWriteErrors = Prometheus.Metrics.CreateCounter("sky_indexer_blob_write_errors", "Archive blob writes that failed");
+        private static readonly Prometheus.Counter indexConflicts = Prometheus.Metrics.CreateCounter("sky_indexer_blob_index_conflicts", "Conditional tag index writes rejected because another writer changed the index");
         private static readonly Prometheus.Histogram blobWriteBytes = Prometheus.Metrics.CreateHistogram("sky_indexer_blob_write_bytes", "Compressed archive blob size on write",
             new Prometheus.HistogramConfiguration { Buckets = Prometheus.Histogram.ExponentialBuckets(256, 4, 12) });
 
@@ -133,7 +137,7 @@ namespace Coflnet.Sky.Indexer.Archive
                 blobReadCacheHits.Inc();
                 return cached;
             }
-            var (block, compressedBytes) = await GetAsync<ArchivedAuctionBlock>(AuctionBlobKeys.Block(tag, month, part), cancellationToken).ConfigureAwait(false);
+            var (block, compressedBytes, _) = await GetAsync<ArchivedAuctionBlock>(AuctionBlobKeys.Block(tag, month, part), cancellationToken).ConfigureAwait(false);
             if (block != null)
                 CacheBlock(cacheKey, block, compressedBytes);
             else
@@ -177,19 +181,116 @@ namespace Coflnet.Sky.Indexer.Archive
             if (!enabled)
                 return null;
             blobReads.Inc();
-            var (index, _) = await GetAsync<ArchivedTagIndex>(AuctionBlobKeys.Index(tag), cancellationToken).ConfigureAwait(false);
+            var (index, _, etag) = await GetAsync<ArchivedTagIndex>(AuctionBlobKeys.Index(tag), cancellationToken).ConfigureAwait(false);
+            if (index != null)
+                index.ETag = etag;
             return index;
         }
 
         /// <inheritdoc/>
-        public Task WriteIndexAsync(ArchivedTagIndex index, CancellationToken cancellationToken = default)
+        public async Task WriteIndexAsync(ArchivedTagIndex index, CancellationToken cancellationToken = default)
         {
             if (index == null)
                 throw new ArgumentNullException(nameof(index));
-            return PutAsync(AuctionBlobKeys.Index(index.Tag), index, cancellationToken);
+            index.ETag = await PutConditionalAsync(AuctionBlobKeys.Index(index.Tag), index, index.ETag, index.Tag, cancellationToken).ConfigureAwait(false);
         }
 
-        private async Task<(T value, long compressedBytes)> GetAsync<T>(string key, CancellationToken cancellationToken) where T : class
+        /// <summary>
+        /// PUT replacing only the version that was read (If-Match <paramref name="etag"/>), or creating only if nobody else created
+        /// it meanwhile (If-None-Match: * for a null etag). Returns the new ETag. 412/409 conflicts become
+        /// <see cref="ArchiveIndexConflictException"/>; an endpoint without conditional PUT (501) is warned about once and written unconditionally.
+        /// </summary>
+        private async Task<string> PutConditionalAsync<T>(string key, T value, string etag, string conflictName, CancellationToken cancellationToken)
+        {
+            if (!conditionalWritesUnsupported)
+            {
+                try
+                {
+                    var response = await PutAsync(key, value, cancellationToken, request =>
+                    {
+                        if (etag != null)
+                            request.IfMatch = etag;
+                        else
+                            request.IfNoneMatch = "*";
+                    }).ConfigureAwait(false);
+                    return response?.ETag;
+                }
+                catch (AmazonS3Exception ex) when (IsPreconditionFailure(ex))
+                {
+                    indexConflicts.Inc();
+                    throw new ArchiveIndexConflictException(conflictName, ex);
+                }
+                catch (AmazonS3Exception ex) when (IsNotImplemented(ex))
+                {
+                    conditionalWritesUnsupported = true;
+                    logger.LogWarning(ex, "The S3 endpoint does not support conditional PUT (If-Match/If-None-Match); tag index and manifest writes fall back to unconditional PUTs, concurrent writers can lose entries");
+                }
+            }
+            var plain = await PutAsync(key, value, cancellationToken).ConfigureAwait(false);
+            return plain?.ETag;
+        }
+
+        /// <inheritdoc/>
+        public async Task<T> ReadMetaAsync<T>(string key, CancellationToken cancellationToken = default) where T : class
+            => (await ReadMetaVersionedAsync<T>(key, cancellationToken).ConfigureAwait(false)).Value;
+
+        /// <inheritdoc/>
+        public async Task<(T Value, string ETag)> ReadMetaVersionedAsync<T>(string key, CancellationToken cancellationToken = default) where T : class
+        {
+            if (!enabled)
+                return (null, null);
+            blobReads.Inc();
+            var (value, _, etag) = await GetAsync<T>(AuctionBlobKeys.Meta(key), cancellationToken).ConfigureAwait(false);
+            return (value, value == null ? null : etag);
+        }
+
+        /// <inheritdoc/>
+        public async Task WriteMetaAsync<T>(string key, T value, CancellationToken cancellationToken = default) where T : class
+        {
+            if (value == null)
+                throw new ArgumentNullException(nameof(value));
+            await PutAsync(AuctionBlobKeys.Meta(key), value, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc/>
+        public Task<string> WriteMetaConditionalAsync<T>(string key, T value, string etag, CancellationToken cancellationToken = default) where T : class
+        {
+            if (value == null)
+                throw new ArgumentNullException(nameof(value));
+            var fullKey = AuctionBlobKeys.Meta(key);
+            return PutConditionalAsync(fullKey, value, etag, fullKey, cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public async Task<IReadOnlyList<string>> ListMetaKeysAsync(string prefix, CancellationToken cancellationToken = default)
+        {
+            if (!enabled)
+                return Array.Empty<string>();
+            var fullPrefix = AuctionBlobKeys.Meta(prefix);
+            var keys = new List<string>();
+            var request = new ListObjectsV2Request { BucketName = bucket, Prefix = fullPrefix };
+            ListObjectsV2Response response;
+            do
+            {
+                response = await client.ListObjectsV2Async(request, cancellationToken).ConfigureAwait(false);
+                foreach (var o in response.S3Objects ?? new List<S3Object>())
+                    keys.Add(o.Key);
+                request.ContinuationToken = response.NextContinuationToken;
+            } while (response.IsTruncated == true && !string.IsNullOrEmpty(response.NextContinuationToken));
+            keys.Sort(StringComparer.Ordinal);
+            return keys;
+        }
+
+        /// <summary>412, or the PreconditionFailed / ConditionalRequestConflict error codes (409 when two conditional writes race).</summary>
+        internal static bool IsPreconditionFailure(AmazonS3Exception ex)
+            => ex.StatusCode == HttpStatusCode.PreconditionFailed
+               || string.Equals(ex.ErrorCode, "PreconditionFailed", StringComparison.OrdinalIgnoreCase)
+               || ex.StatusCode == HttpStatusCode.Conflict && string.Equals(ex.ErrorCode, "ConditionalRequestConflict", StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsNotImplemented(AmazonS3Exception ex)
+            => ex.StatusCode == HttpStatusCode.NotImplemented || string.Equals(ex.ErrorCode, "NotImplemented", StringComparison.OrdinalIgnoreCase);
+
+        private async Task<(T value, long compressedBytes, string etag)> GetAsync<T>(string key, CancellationToken cancellationToken) where T : class
         {
             try
             {
@@ -197,12 +298,12 @@ namespace Coflnet.Sky.Indexer.Archive
                 using var stream = response.ResponseStream;
                 var value = await ArchiveBlobCodec.ReadAsync<T>(stream, cancellationToken).ConfigureAwait(false);
                 blobReadHits.Inc();
-                return (value, response.ContentLength);
+                return (value, response.ContentLength, response.ETag);
             }
             catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.NotFound)
             {
                 blobReadMisses.Inc();
-                return (null, 0);
+                return (null, 0, null);
             }
             catch (OperationCanceledException)
             {
@@ -216,7 +317,7 @@ namespace Coflnet.Sky.Indexer.Archive
             }
         }
 
-        private async Task PutAsync<T>(string key, T value, CancellationToken cancellationToken)
+        private async Task<PutObjectResponse> PutAsync<T>(string key, T value, CancellationToken cancellationToken, Action<PutObjectRequest> conditions = null)
         {
             if (!enabled)
                 throw new InvalidOperationException("S3 auction archive store is not enabled");
@@ -227,7 +328,7 @@ namespace Coflnet.Sky.Indexer.Archive
                 ArchiveBlobCodec.Write(payload, value, cancellationToken);
                 payload.Position = 0;
                 var length = payload.Length;
-                await client.PutObjectAsync(new PutObjectRequest
+                var request = new PutObjectRequest
                 {
                     BucketName = bucket,
                     Key = key,
@@ -238,13 +339,20 @@ namespace Coflnet.Sky.Indexer.Archive
                     // signing. We sign headers but not the body; integrity is covered by HTTPS
                     // and by the uncached read-back verification of the archive job.
                     DisablePayloadSigning = true,
-                }, cancellationToken).ConfigureAwait(false);
+                };
+                conditions?.Invoke(request);
+                var response = await client.PutObjectAsync(request, cancellationToken).ConfigureAwait(false);
                 blobWrites.Inc();
                 blobWriteBytes.Observe(length);
+                return response;
             }
             catch (OperationCanceledException)
             {
                 throw;
+            }
+            catch (AmazonS3Exception ex) when (conditions != null && (IsPreconditionFailure(ex) || IsNotImplemented(ex)))
+            {
+                throw; // handled by WriteIndexAsync
             }
             catch (Exception ex)
             {

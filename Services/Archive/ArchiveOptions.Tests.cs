@@ -52,6 +52,8 @@ public class ArchiveOptionsTests
         Assert.That(shipped.PagePauseMs, Is.EqualTo(defaults.PagePauseMs));
         Assert.That(shipped.StartDelaySeconds, Is.EqualTo(defaults.StartDelaySeconds));
         Assert.That(shipped.MaxRowsPerPart, Is.EqualTo(defaults.MaxRowsPerPart));
+        Assert.That(shipped.ImportPollMinutes, Is.EqualTo(defaults.ImportPollMinutes));
+        Assert.That(defaults.ImportPollMinutes, Is.EqualTo(5));
     }
 
     [Test]

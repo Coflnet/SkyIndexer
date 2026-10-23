@@ -1,9 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Linq;
 using System.Linq.Expressions;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Coflnet.Sky.Core;
@@ -31,7 +29,7 @@ namespace Coflnet.Sky.Indexer.Archive
         /// <summary>Hash stored for tag-months without rows and for month sentinels (SHA-256 of nothing).</summary>
         public static readonly string EmptySha256 = ArchivedAuctionBlock.CombinedSha256(Array.Empty<string>());
         /// <summary>Rows per INSERT of the index tables.</summary>
-        public const int IndexBatchSize = 5000;
+        public const int IndexBatchSize = ArchiveIndexSql.BatchSize;
         private const int MaxConsecutiveItemFailures = 5;
 
         private readonly IAuctionBlobStore store;
@@ -207,9 +205,10 @@ namespace Coflnet.Sky.Indexer.Archive
                 if (rows > 0)
                     await Delay(TimeSpan.FromMilliseconds(options.TagPauseMs), cancellationToken).ConfigureAwait(false);
             }
+            var allFinalized = true;
             foreach (var run in runs.Values.OrderBy(r => r.Tag, StringComparer.Ordinal))
-                await FinalizeTagMonthAsync(run, cancellationToken).ConfigureAwait(false);
-            return true;
+                allFinalized &= await FinalizeTagMonthAsync(run, cancellationToken).ConfigureAwait(false);
+            return allFinalized;
         }
 
         /// <summary>Page one ItemId of a month into the per-tag runs; the index rows of the item are written after its parts verified.</summary>
@@ -269,13 +268,16 @@ namespace Coflnet.Sky.Indexer.Archive
             return (true, total);
         }
 
-        /// <summary>The R2 tag index and the verified <c>archived_months</c> marker of a tag-month (written last).</summary>
-        private async Task FinalizeTagMonthAsync(TagMonthRun run, CancellationToken cancellationToken)
+        /// <summary>
+        /// The R2 tag index and the verified <c>archived_months</c> marker of a tag-month (written last). The index write is
+        /// conditional (the SkyAuctions Scylla sweep writes the same per-tag object); on a conflict the index is re-read and the
+        /// entry re-applied, up to <see cref="ArchiveIndexConflictException.MaxWriteAttempts"/> times. False (no marker) when it never got through.
+        /// </summary>
+        private async Task<bool> FinalizeTagMonthAsync(TagMonthRun run, CancellationToken cancellationToken)
         {
             var tagId = await GetOrCreateTagIdAsync(run.Tag, cancellationToken).ConfigureAwait(false);
             var now = DateTime.UtcNow;
-            var index = await store.ReadIndexAsync(run.Tag, cancellationToken).ConfigureAwait(false) ?? new ArchivedTagIndex { Tag = run.Tag };
-            index.Upsert(new ArchivedMonthEntry
+            var entry = new ArchivedMonthEntry
             {
                 Month = run.Month,
                 Parts = run.PartHashes.Count,
@@ -284,8 +286,27 @@ namespace Coflnet.Sky.Indexer.Archive
                 PartSha256 = run.PartHashes.ToList(),
                 Source = ArchivedAuctionBlock.SourceMariaDb,
                 VerifiedAt = now,
-            });
-            await store.WriteIndexAsync(index, cancellationToken).ConfigureAwait(false);
+            };
+            for (var attempt = 1; ; attempt++)
+            {
+                var index = await store.ReadIndexAsync(run.Tag, cancellationToken).ConfigureAwait(false) ?? new ArchivedTagIndex { Tag = run.Tag };
+                index.Upsert(entry);
+                try
+                {
+                    await store.WriteIndexAsync(index, cancellationToken).ConfigureAwait(false);
+                    break;
+                }
+                catch (ArchiveIndexConflictException) when (attempt < ArchiveIndexConflictException.MaxWriteAttempts)
+                {
+                    logger.LogInformation("Tag index of {Tag} changed while archiving {Month} (attempt {Attempt}); re-reading", run.Tag, run.Month, attempt);
+                }
+                catch (ArchiveIndexConflictException)
+                {
+                    errors.Inc();
+                    logger.LogError("Tag index of {Tag} kept changing ({Attempts} attempts); {Month} not marked, retried next pass", run.Tag, attempt, run.Month);
+                    return false;
+                }
+            }
             await UpsertArchivedMonthAsync(new ArchivedMonth
             {
                 TagId = tagId,
@@ -302,6 +323,7 @@ namespace Coflnet.Sky.Indexer.Archive
                 Note = run.BidsWithoutBidder > 0 ? $"{run.BidsWithoutBidder} bids without bidder id not indexed" : null,
             }, cancellationToken).ConfigureAwait(false);
             logger.LogInformation("Archived {Rows} auctions of {Tag} {Month} in {Parts} parts", run.Rows, run.Tag, run.Month, run.PartHashes.Count);
+            return true;
         }
 
         /// <summary>Write the buffered rows of a tag as that tag-month's next part, verify by uncached read-back and collect the index rows. Clears <paramref name="rows"/>.</summary>
@@ -584,46 +606,12 @@ ON DUPLICATE KEY UPDATE `rows` = VALUES(`rows`), sold_rows = VALUES(sold_rows), 
             return delay <= TimeSpan.Zero ? Task.CompletedTask : Task.Delay(delay, cancellationToken);
         }
 
-        // ---------------------------------------------------------------- SQL builders (pure, unit tested)
+        // ---------------------------------------------------------------- SQL builders (moved to core ArchiveIndexSql, shared with SkyAuctions)
 
         internal static IEnumerable<string> BuildLocationInserts(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations)
-        {
-            for (var offset = 0; offset < locations.Count; offset += IndexBatchSize)
-            {
-                var sb = new StringBuilder("INSERT INTO auction_locations (uid, tag_id, month, part) VALUES ");
-                var end = Math.Min(locations.Count, offset + IndexBatchSize);
-                for (var i = offset; i < end; i++)
-                {
-                    if (i > offset)
-                        sb.Append(',');
-                    sb.Append('(').Append(locations[i].uid.ToString(CultureInfo.InvariantCulture)).Append(',')
-                      .Append(tagId.ToString(CultureInfo.InvariantCulture)).Append(',')
-                      .Append(month.ToString(CultureInfo.InvariantCulture)).Append(',')
-                      .Append(locations[i].part.ToString(CultureInfo.InvariantCulture)).Append(')');
-                }
-                sb.Append(" ON DUPLICATE KEY UPDATE tag_id = VALUES(tag_id), month = VALUES(month), part = VALUES(part)");
-                yield return sb.ToString();
-            }
-        }
+            => ArchiveIndexSql.BuildLocationInserts(tagId, month, locations);
 
         internal static IEnumerable<string> BuildBidderInserts(IReadOnlyList<AuctionBidder> bidders)
-        {
-            for (var offset = 0; offset < bidders.Count; offset += IndexBatchSize)
-            {
-                var sb = new StringBuilder("INSERT IGNORE INTO auction_bidders (bidder_id, `end`, uid, amount) VALUES ");
-                var end = Math.Min(bidders.Count, offset + IndexBatchSize);
-                for (var i = offset; i < end; i++)
-                {
-                    if (i > offset)
-                        sb.Append(',');
-                    var b = bidders[i];
-                    sb.Append('(').Append(b.BidderId.ToString(CultureInfo.InvariantCulture)).Append(',')
-                      .Append(b.End.ToString(CultureInfo.InvariantCulture)).Append(',')
-                      .Append(b.Uid.ToString(CultureInfo.InvariantCulture)).Append(',')
-                      .Append(b.Amount.ToString(CultureInfo.InvariantCulture)).Append(')');
-                }
-                yield return sb.ToString();
-            }
-        }
+            => ArchiveIndexSql.BuildBidderInserts(bidders);
     }
 }

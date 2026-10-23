@@ -72,11 +72,17 @@ namespace Coflnet.Sky.Indexer
 
             // auction archive (README "Auction archive"): blob store always registered, background work only behind the flags
             ArchiveContext.SetConfiguration(Configuration);
-            services.AddSingleton<IAuctionBlobStore, S3AuctionBlobStore>();
+            services.AddSingleton<S3AuctionBlobStore>();
+            services.AddSingleton<IAuctionBlobStore>(p => p.GetRequiredService<S3AuctionBlobStore>());
+            services.AddSingleton<IArchiveMetaStore>(p => p.GetRequiredService<S3AuctionBlobStore>());
             var archiveEnabled = bool.TryParse(Configuration["ARCHIVE:ENABLED"], out var archive) && archive;
             var s3Enabled = bool.TryParse(Configuration["S3:ENABLED"], out var s3) && s3;
             if (archiveEnabled && s3Enabled)
+            {
                 services.AddHostedService<AuctionArchiveJob>();
+                // indexes the Scylla months SkyAuctions hands over in R2 manifests (SkyAuctions may not write MariaDB)
+                services.AddHostedService<ScyllaArchiveImportWorker>();
+            }
             if (archiveEnabled)
                 services.AddHostedService<AuctionRetentionWorker>();
         }

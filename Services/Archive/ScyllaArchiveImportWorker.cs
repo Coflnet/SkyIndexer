@@ -19,9 +19,10 @@ namespace Coflnet.Sky.Indexer.Archive
     /// Imports the Scylla months that SkyAuctions' sweep archived to R2 (SkyAuctions' MariaDB user is read-only). Every
     /// <c>ARCHIVE:IMPORT_POLL_MINUTES</c> it lists <c>auctions/v2/_meta/scylla/</c>; for each <see cref="ScyllaMonthManifest"/> whose
     /// month sentinel exists without <c>scylla_at</c>, and each tag entry whose <c>archived_months</c> row has no <c>scylla_at</c>:
-    /// the new parts are read uncached and their SHA-256 must equal the manifest's (and the tag index must end with them), then
-    /// <c>auction_locations</c> (never moving another tag-month's location) and <c>auction_bidders</c> are written and the
-    /// <c>archived_months</c> row is upserted with the merged totals and <c>scylla_at</c> (written last). When the manifest is
+    /// the new parts are read uncached, one at a time, in two passes. Pass 1 verifies that every SHA-256 equals the manifest's
+    /// (and the tag index ends with them) and that the row count matches, writing nothing. Pass 2 re-reads and re-verifies each part
+    /// and writes its <c>auction_locations</c> (never moving another tag-month's location) and <c>auction_bidders</c>, so memory is
+    /// bounded by one part; then the <c>archived_months</c> row is upserted with the merged totals and <c>scylla_at</c> (written last). When the manifest is
     /// completed and every entry is imported, the sentinel gets <c>scylla_at</c>, which lets the sweep start the next month.
     /// Idempotent: a re-run skips imported tags; an interrupted tag is imported again (upserted locations, INSERT IGNORE bidders).
     /// </summary>
@@ -196,10 +197,7 @@ namespace Coflnet.Sky.Indexer.Archive
             if (row != null && !string.Equals(ArchivedAuctionBlock.CombinedSha256(allHashes.Take(phaseOneParts).ToList()), row.Sha256, StringComparison.OrdinalIgnoreCase))
                 return Reject("the tag index's phase-1 hashes no longer combine to archived_months.sha256", hashMismatch: true);
 
-            // read and verify every new part before anything is written
-            var locations = new List<(long uid, byte part)>();
-            var bids = new Dictionary<(string bidder, long uid), (uint end, ulong amount)>();
-            long withoutBidder = 0;
+            // pass 1: verify every new part (one block in memory at a time), nothing is written
             var rows = 0;
             var sold = 0;
             for (var i = 0; i < entry.NewParts; i++)
@@ -214,6 +212,28 @@ namespace Coflnet.Sky.Indexer.Archive
                 partsVerified.Inc();
                 rows += block.RowCount;
                 sold += block.IsSold.Count(s => s);
+            }
+            if (rows != entry.NewRows)
+                return Reject($"the parts hold {rows} rows, the manifest says {entry.NewRows}");
+
+            // pass 2: write the index rows part by part (idempotent, so a crash here is safe for the re-run)
+            var tagId = await GetOrCreateTagIdAsync(entry.Tag, cancellationToken).ConfigureAwait(false);
+            var monthIndex = ArchiveMonths.ToIndex(month);
+            long locationCount = 0;
+            long bidderCount = 0;
+            long withoutBidder = 0;
+            for (var i = 0; i < entry.NewParts; i++)
+            {
+                var part = entry.FirstNewPart + i;
+                var block = await store.ReadBlockAsync(entry.Tag, month, part, uncached: true, cancellationToken).ConfigureAwait(false);
+                if (block == null)
+                    return Reject($"part {part} is missing");
+                var sha = block.Sha256();
+                if (!string.Equals(sha, newHashes[i], StringComparison.OrdinalIgnoreCase))
+                    return Reject($"part {part} hashes to {sha}, the manifest says {newHashes[i]}", hashMismatch: true);
+                var locations = new List<(long uid, byte part)>();
+                var bids = new Dictionary<(string bidder, long uid), (uint end, ulong amount)>();
+                long partWithoutBidder = 0;
                 foreach (var auction in block.ToAuctions())
                 {
                     locations.Add((auction.UId, (byte)part));
@@ -222,7 +242,7 @@ namespace Coflnet.Sky.Indexer.Archive
                     {
                         if (bid.Amount < 0 || !IsPlayerUuid(bid.Bidder))
                         {
-                            withoutBidder++;
+                            partWithoutBidder++;
                             continue;
                         }
                         var key = (bid.Bidder, auction.UId);
@@ -230,20 +250,18 @@ namespace Coflnet.Sky.Indexer.Archive
                             bids[key] = (end, (ulong)bid.Amount);
                     }
                 }
+                var bidders = await ResolveBiddersAsync(bids, cancellationToken).ConfigureAwait(false);
+                partWithoutBidder += bids.Count - bidders.Count;
+                await WriteIndexRowsAsync(tagId, monthIndex, locations, bidders, cancellationToken).ConfigureAwait(false);
+                indexRowsWritten.Inc(locations.Count);
+                bidderRowsWritten.Inc(bidders.Count);
+                locationCount += locations.Count;
+                bidderCount += bidders.Count;
+                withoutBidder += partWithoutBidder;
             }
-            if (rows != entry.NewRows)
-                return Reject($"the parts hold {rows} rows, the manifest says {entry.NewRows}");
-
-            var bidders = await ResolveBiddersAsync(bids, cancellationToken).ConfigureAwait(false);
-            withoutBidder += bids.Count - bidders.Count;
             bidsWithoutBidder.Inc(withoutBidder);
 
-            // writes: index rows, then the archived_months row with scylla_at (the marker, last)
-            var tagId = await GetOrCreateTagIdAsync(entry.Tag, cancellationToken).ConfigureAwait(false);
-            var monthIndex = ArchiveMonths.ToIndex(month);
-            await WriteIndexRowsAsync(tagId, monthIndex, locations, bidders, cancellationToken).ConfigureAwait(false);
-            indexRowsWritten.Inc(locations.Count);
-            bidderRowsWritten.Inc(bidders.Count);
+            // the archived_months row with scylla_at (the marker) last
             var now = DateTime.UtcNow;
             await UpsertArchivedMonthAsync(new ArchivedMonth
             {
@@ -257,8 +275,8 @@ namespace Coflnet.Sky.Indexer.Archive
                 ArchivedAt = row?.ArchivedAt ?? entry.VerifiedAt,
                 VerifiedAt = now,
                 // the retention worker deletes MariaDB rows only while index_rows == rows; both grow by the new rows
-                IndexRows = (row?.IndexRows ?? 0) + (uint)locations.Count,
-                IndexBidderRows = (row?.IndexBidderRows ?? 0) + (uint)bidders.Count,
+                IndexRows = (row?.IndexRows ?? 0) + (uint)locationCount,
+                IndexBidderRows = (row?.IndexBidderRows ?? 0) + (uint)bidderCount,
                 DeletedRows = row?.DeletedRows,
                 DeletedAt = row?.DeletedAt,
                 Note = BuildNote(row?.Note, rows, entry.NewParts, withoutBidder),
@@ -266,7 +284,7 @@ namespace Coflnet.Sky.Indexer.Archive
             }, cancellationToken).ConfigureAwait(false);
             tagsImported.Inc();
             logger.LogInformation("Scylla import {Tag} {Month}: +{Rows} rows in {Parts} parts, {Locations} locations, {Bidders} bidder rows",
-                entry.Tag, monthText, rows, entry.NewParts, locations.Count, bidders.Count);
+                entry.Tag, monthText, rows, entry.NewParts, locationCount, bidderCount);
             return true;
         }
 

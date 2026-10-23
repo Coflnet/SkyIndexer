@@ -27,6 +27,7 @@ public class ScyllaArchiveImportWorkerTests
         public readonly Dictionary<string, int> Players = new();
         public readonly List<int> BidderChunks = new();
         public readonly List<string> Events;
+        public readonly List<(List<(long uid, byte part)> locations, int bidders)> WriteCalls = new();
 
         public TestableImportWorker(InMemoryAuctionBlobStore store, List<string> events, Microsoft.Extensions.Logging.ILogger<ScyllaArchiveImportWorker> logger)
             : base(store, store, ArchiveTestConfig.Build(), logger) => Events = events;
@@ -57,6 +58,7 @@ public class ScyllaArchiveImportWorkerTests
         protected override Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, CancellationToken cancellationToken)
         {
             Events.Add($"index_rows:{tagId}");
+            WriteCalls.Add((locations.ToList(), bidders.Count));
             foreach (var (uid, part) in locations)
                 if (!Locations.TryGetValue(uid, out var existing) || existing.tag == tagId && existing.month == month)
                     Locations[uid] = (tagId, month, part); // keepOtherTagMonths semantics, see BuildIndexSql test
@@ -158,7 +160,7 @@ public class ScyllaArchiveImportWorkerTests
         Assert.That(await worker.Run(), Is.EqualTo(1));
 
         Assert.That(events.Where(e => !e.StartsWith("read:")), Is.EqualTo(new[] { "index_rows:1", "archived_month:1", "index_rows:2", "archived_month:2", "sentinel_scylla_at:" + Sep }));
-        Assert.That(events.Where(e => e.StartsWith("read:")), Is.EqualTo(new[] { $"read:{Hyperion}:{Sep}:1:uncached", $"read:{Terminator}:{Sep}:0:uncached" }), "only the new parts, uncached");
+        Assert.That(events.Where(e => e.StartsWith("read:")), Is.EqualTo(new[] { $"read:{Hyperion}:{Sep}:1:uncached", $"read:{Hyperion}:{Sep}:1:uncached", $"read:{Terminator}:{Sep}:0:uncached", $"read:{Terminator}:{Sep}:0:uncached" }), "only the new parts, uncached, once per pass");
 
         var hyperion = worker.Row(Hyperion, Sep);
         var index = (await store.ReadIndexAsync(Hyperion)).Find(Sep);
@@ -288,6 +290,86 @@ public class ScyllaArchiveImportWorkerTests
         Assert.That(worker.BidderChunks.Sum(), Is.EqualTo(250));
         Assert.That(worker.Bidders, Has.Count.EqualTo(200));
         Assert.That(worker.Row(Terminator, Sep).Note, Does.Contain("50 bids without bidder"));
+    }
+
+    /// <summary>A tag with three Scylla parts (uids 10-11, 20-21, 30-31), each part with one resolvable bid; returns the manifest entry.</summary>
+    private ScyllaTagImport ThreePartScenario(int manifestRows = 6, int corruptPart = -1)
+    {
+        var shas = new List<string>();
+        for (var p = 0; p < 3; p++)
+        {
+            var uid = 10 * (p + 1);
+            shas.Add(WriteBlock(Terminator, p, ArchivedAuctionBlock.SourceScylla,
+                Auction(uid, 1, Terminator, (600 + p, 5)), Auction(uid + 1, 2, Terminator, (0, 1))));
+            worker.Players[Hex(600 + p)] = 60 + p;
+        }
+        var real = shas.ToList();
+        if (corruptPart >= 0)
+            shas[corruptPart] = new string('a', 64);
+        store.WriteIndexAsync(new ArchivedTagIndex { Tag = Terminator }.Upsert(new ArchivedMonthEntry { Month = Sep, Parts = 3, Rows = 6, PartSha256 = shas, Source = ArchivedAuctionBlock.SourceScylla })).Wait();
+        worker.Months[(0, SepIndex)] = new ArchivedMonth { TagId = 0, Month = SepIndex, Source = "mariadb", Sha256 = new string('0', 64) };
+        events.Clear();
+        return new ScyllaTagImport { Tag = Terminator, FirstNewPart = 0, NewParts = 3, NewRows = manifestRows, NewSold = 0, NewPartSha256 = shas, VerifiedAt = Now };
+    }
+
+    [Test]
+    public async Task ImportTag_WritesIndexRowsOncePerPart()
+    {
+        var entry = ThreePartScenario();
+
+        Assert.That(await worker.ImportTagAsync(Sep, entry, null, CancellationToken.None), Is.True);
+
+        Assert.That(worker.WriteCalls.Select(c => c.locations), Is.EqualTo(new[]
+        {
+            new[] { (10L, (byte)0), (11L, (byte)0) },
+            new[] { (20L, (byte)1), (21L, (byte)1) },
+            new[] { (30L, (byte)2), (31L, (byte)2) },
+        }));
+        Assert.That(worker.WriteCalls.Select(c => c.bidders), Is.EqualTo(new[] { 1, 1, 1 }));
+        var row = worker.Row(Terminator, Sep);
+        Assert.Multiple(() =>
+        {
+            Assert.That((row.Parts, row.Rows, row.SoldRows), Is.EqualTo(((byte)3, 6u, 6u)));
+            Assert.That((row.IndexRows, row.IndexBidderRows), Is.EqualTo((6u, 3u)));
+            Assert.That(row.ScyllaAt, Is.Not.Null);
+        });
+    }
+
+    [Test]
+    public async Task ImportTag_HashMismatchInLaterPart_WritesNothing()
+    {
+        var entry = ThreePartScenario(corruptPart: 2);
+
+        Assert.That(await worker.ImportTagAsync(Sep, entry, null, CancellationToken.None), Is.False);
+
+        Assert.That(worker.WriteCalls, Is.Empty);
+        Assert.That(events.Any(e => e.StartsWith("archived_month:")), Is.False);
+        Assert.That(log.Entries.Any(e => e.message.Contains("part 2 hashes to")), Is.True);
+    }
+
+    [Test]
+    public async Task ImportTag_PartChangedAfterIndexedHash_WritesNothing()
+    {
+        var entry = ThreePartScenario();
+        await store.WriteBlockAsync(ArchivedAuctionBlock.FromAuctions(Terminator, Sep, 2, ArchivedAuctionBlock.SourceScylla, new[] { Auction(30, 1, Terminator), Auction(31, 2, Terminator) }));
+
+        Assert.That(await worker.ImportTagAsync(Sep, entry, null, CancellationToken.None), Is.False);
+
+        Assert.That(worker.WriteCalls, Is.Empty, "part 2 is verified before part 0 is written");
+        Assert.That(events.Any(e => e.StartsWith("archived_month:")), Is.False);
+        Assert.That(log.Entries.Any(e => e.message.Contains("part 2 hashes to")), Is.True);
+    }
+
+    [Test]
+    public async Task ImportTag_RowCountMismatch_WritesNothing()
+    {
+        var entry = ThreePartScenario(manifestRows: 7);
+
+        Assert.That(await worker.ImportTagAsync(Sep, entry, null, CancellationToken.None), Is.False);
+
+        Assert.That(worker.WriteCalls, Is.Empty);
+        Assert.That(events.Any(e => e.StartsWith("archived_month:")), Is.False);
+        Assert.That(log.Entries.Any(e => e.message.Contains("the parts hold 6 rows, the manifest says 7")), Is.True);
     }
 
     [Test]

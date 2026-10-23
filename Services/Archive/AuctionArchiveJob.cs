@@ -450,38 +450,78 @@ namespace Coflnet.Sky.Indexer.Archive
                 .ToListAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        /// <summary>Load bids, item bytes, nbt lookups, enchantments, coop members and claimed bidders of a page with one query per table.</summary>
+        /// <summary>
+        /// Number of auction ids per <c>IN (...)</c> list of the child queries in <see cref="LoadChildrenAsync"/>.
+        /// MariaDB's <c>eq_range_index_dive_limit</c> defaults to 200: with that many IN values or more the optimizer
+        /// stops doing index dives and uses index statistics instead. On an all-NULL indexed column such as
+        /// <c>UuId.SaveAuctionId</c> the statistics say "every value matches every row", which produced a full index
+        /// scan over 583M rows (command timeout, month 2020-10 failed 52 times). Keep this well below 200.
+        /// </summary>
+        internal const int ChildQueryBatchSize = 100;
+
+        /// <summary>Split <paramref name="items"/> into consecutive lists of at most <paramref name="size"/>, preserving order.</summary>
+        internal static IEnumerable<List<T>> Chunk<T>(IReadOnlyList<T> items, int size)
+        {
+            if (size <= 0)
+                throw new ArgumentOutOfRangeException(nameof(size));
+            for (int i = 0; i < items.Count; i += size)
+            {
+                var chunk = new List<T>(Math.Min(size, items.Count - i));
+                for (int j = i; j < Math.Min(i + size, items.Count); j++)
+                    chunk.Add(items[j]);
+                yield return chunk;
+            }
+        }
+
+        /// <summary>Load bids, item bytes, nbt lookups, enchantments, coop members and claimed bidders of a page with one query per table and <see cref="ChildQueryBatchSize"/> ids.</summary>
         protected virtual async Task LoadChildrenAsync(List<SaveAuction> page, CancellationToken cancellationToken)
         {
             var ids = page.Select(a => a.Id).ToList();
-            var nullableIds = ids.Select(i => (int?)i).ToList();
             var nbtIds = page.Where(a => a.NbtDataId != null).Select(a => a.NbtDataId.Value).Distinct().ToList();
             using var db = new HypixelContext();
-            var bids = await db.Bids.AsNoTracking()
-                .Where(b => nullableIds.Contains(EF.Property<int?>(b, "Uuid")))
-                .OrderBy(b => b.Id)
-                .Select(b => new { AuctionId = EF.Property<int?>(b, "Uuid"), Bid = b })
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var nbt = nbtIds.Count == 0 ? new Dictionary<int, NbtData>() : await db.Set<NbtData>().AsNoTracking()
-                .Where(n => nbtIds.Contains(n.Id))
-                .ToDictionaryAsync(n => n.Id, cancellationToken).ConfigureAwait(false);
-            var lookups = await db.NBTLookups.AsNoTracking()
-                .Where(l => ids.Contains(l.AuctionId))
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var enchantments = await db.Enchantment.AsNoTracking()
-                .Where(e => ids.Contains(e.SaveAuctionId))
-                .OrderBy(e => e.Id)
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var coop = await db.Set<UuId>().AsNoTracking()
-                .Where(u => nullableIds.Contains(EF.Property<int?>(u, "SaveAuctionId1")))
-                .OrderBy(u => u.Id)
-                .Select(u => new { AuctionId = EF.Property<int?>(u, "SaveAuctionId1"), u.value })
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var claimed = await db.Set<UuId>().AsNoTracking()
-                .Where(u => nullableIds.Contains(EF.Property<int?>(u, "SaveAuctionId")))
-                .OrderBy(u => u.Id)
-                .Select(u => new { AuctionId = EF.Property<int?>(u, "SaveAuctionId"), u.value })
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var bids = new List<(int? AuctionId, SaveBids Bid)>();
+            var nbt = new Dictionary<int, NbtData>();
+            var lookups = new List<NBTLookup>();
+            var enchantments = new List<Enchantment>();
+            var coop = new List<(int? AuctionId, string value)>();
+            var claimed = new List<(int? AuctionId, string value)>();
+            foreach (var chunk in Chunk(ids, ChildQueryBatchSize))
+            {
+                var nullableIds = chunk.Select(i => (int?)i).ToList();
+                var chunkBids = await db.Bids.AsNoTracking()
+                    .Where(b => nullableIds.Contains(EF.Property<int?>(b, "Uuid")))
+                    .OrderBy(b => b.Id)
+                    .Select(b => new { AuctionId = EF.Property<int?>(b, "Uuid"), Bid = b })
+                    .ToListAsync(cancellationToken).ConfigureAwait(false);
+                bids.AddRange(chunkBids.Select(b => (b.AuctionId, b.Bid)));
+                lookups.AddRange(await db.NBTLookups.AsNoTracking()
+                    .Where(l => chunk.Contains(l.AuctionId))
+                    .ToListAsync(cancellationToken).ConfigureAwait(false));
+                enchantments.AddRange(await db.Enchantment.AsNoTracking()
+                    .Where(e => chunk.Contains(e.SaveAuctionId))
+                    .OrderBy(e => e.Id)
+                    .ToListAsync(cancellationToken).ConfigureAwait(false));
+                var chunkCoop = await db.Set<UuId>().AsNoTracking()
+                    .Where(u => nullableIds.Contains(EF.Property<int?>(u, "SaveAuctionId1")))
+                    .OrderBy(u => u.Id)
+                    .Select(u => new { AuctionId = EF.Property<int?>(u, "SaveAuctionId1"), u.value })
+                    .ToListAsync(cancellationToken).ConfigureAwait(false);
+                coop.AddRange(chunkCoop.Select(c => (c.AuctionId, c.value)));
+                var chunkClaimed = await db.Set<UuId>().AsNoTracking()
+                    .Where(u => nullableIds.Contains(EF.Property<int?>(u, "SaveAuctionId")))
+                    .OrderBy(u => u.Id)
+                    .Select(u => new { AuctionId = EF.Property<int?>(u, "SaveAuctionId"), u.value })
+                    .ToListAsync(cancellationToken).ConfigureAwait(false);
+                claimed.AddRange(chunkClaimed.Select(c => (c.AuctionId, c.value)));
+            }
+            foreach (var chunk in Chunk(nbtIds, ChildQueryBatchSize))
+            {
+                var rows = await db.Set<NbtData>().AsNoTracking()
+                    .Where(n => chunk.Contains(n.Id))
+                    .ToListAsync(cancellationToken).ConfigureAwait(false);
+                foreach (var n in rows)
+                    nbt[n.Id] = n;
+            }
 
             var bidsBy = bids.ToLookup(b => b.AuctionId, b => b.Bid);
             var lookupsBy = lookups.ToLookup(l => l.AuctionId);

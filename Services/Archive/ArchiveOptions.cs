@@ -14,6 +14,8 @@ namespace Coflnet.Sky.Indexer.Archive
         public int ClosedMarginDays { get; init; } = 14;
         public int MaxRowsPerPart { get; init; } = 50000;
         public int PageSize { get; init; } = 2000;
+        /// <summary>Auction ids per child-table IN list (6 statements per chunk). Raise above 100 only after <c>ANALYZE TABLE UuId</c> on the primary.</summary>
+        public int ChildQueryBatchSize { get; init; } = 100;
         public int PagePauseMs { get; init; } = 200;
         /// <summary>Pause after an ItemId-month that had rows; each visit is one keyset page query on (ItemId, End).</summary>
         public int TagPauseMs { get; init; } = 100;
@@ -48,6 +50,7 @@ namespace Coflnet.Sky.Indexer.Archive
                 ClosedMarginDays = Int(s["CLOSED_MARGIN_DAYS"], d.ClosedMarginDays),
                 MaxRowsPerPart = System.Math.Max(1, Int(s["MAX_ROWS_PER_PART"], d.MaxRowsPerPart)),
                 PageSize = System.Math.Max(1, Int(s["PAGE_SIZE"], d.PageSize)),
+                ChildQueryBatchSize = System.Math.Max(1, Int(s["CHILD_QUERY_BATCH_SIZE"], d.ChildQueryBatchSize)),
                 PagePauseMs = Int(s["PAGE_PAUSE_MS"], d.PagePauseMs),
                 TagPauseMs = Int(s["TAG_PAUSE_MS"], d.TagPauseMs),
                 MonthPauseMs = Int(s["MONTH_PAUSE_MS"], d.MonthPauseMs),

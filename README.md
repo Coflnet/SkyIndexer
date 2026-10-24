@@ -30,8 +30,10 @@ Closed months of MariaDB auctions are archived as immutable blobs in R2 (`Auctio
 
 **Config**
 - `S3:ENABLED`, `S3:ENDPOINT`, `S3:REGION`, `S3:BUCKET`, `S3:ACCESS_KEY`, `S3:SECRET_KEY`, `S3:USE_PATH_STYLE` (same as SkyBazaar; with an endpoint the region is only used for signing), optional `S3:CACHE_SIZE_BYTES` (default 256 MB).
-- `ARCHIVE:ENABLED`, `START_DELAY_SECONDS`, `CLOSED_MARGIN_DAYS` (a month is closed 14 days after it ends), `OLDEST_MONTH` (default 2019-06, SkyBlock launch; raise it as the backfill completes months), `MAX_ROWS_PER_PART`, `PAGE_SIZE`, `PAGE_PAUSE_MS`, `TAG_PAUSE_MS`, `MONTH_PAUSE_MS`, `IDLE_PAUSE_MINUTES`.
+- `ARCHIVE:ENABLED`, `START_DELAY_SECONDS`, `CLOSED_MARGIN_DAYS` (a month is closed 14 days after it ends), `OLDEST_MONTH` (default 2019-06, SkyBlock launch; raise it as the backfill completes months), `MAX_ROWS_PER_PART`, `PAGE_SIZE`, `CHILD_QUERY_BATCH_SIZE`, `PAGE_PAUSE_MS`, `TAG_PAUSE_MS`, `MONTH_PAUSE_MS`, `IDLE_PAUSE_MINUTES`.
 - Retention: `ARCHIVE:DELETE_MARIADB`, `WINDOW_YEARS`, `MAX_DELETE_MONTHS_PER_DAY`, `DELETE_BATCH_SIZE`, `DELETE_PAUSE_MS`, `MAX_BINLOG_GB`, `MAX_HISTORY_LIST_LENGTH`, `REQUIRE_HEALTH_CHECKS` (the gate needs `SHOW BINARY LOGS` and `information_schema.INNODB_METRICS`, i.e. the `BINLOG MONITOR`/`REPLICATION CLIENT` and `PROCESS` privileges; without them nothing is deleted while this is true).
+
+- Read replica: the archive job (reads only; `ArchiveContext` writes and the retention worker stay on the primary) uses `DBReadOnlyConnection` when set and non-blank, else `DBConnection`. Set `DBReadOnlyConnection` in the indexer's OpenBao secret (`kv/sky/sky-indexer`) to the replica and restart; the job logs which server it reads from at start. `ARCHIVE__CHILD_QUERY_BATCH_SIZE` (default 100) may be raised only after `ANALYZE TABLE UuId` on the primary: `IX_UuId_SaveAuctionId` reports cardinality 2, so large IN lists otherwise full-scan.
 
 **Rollout order**
 1. `S3__*` and `ARCHIVE__ENABLED=true` (`DELETE_MARIADB` stays false): the job archives oldest month first. Watch `sky_indexer_archive_*` (`verify_failures` must stay 0, `months_total` grows) and spot check blobs and `archived_months`.

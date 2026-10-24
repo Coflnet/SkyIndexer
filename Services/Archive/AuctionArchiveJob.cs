@@ -89,6 +89,7 @@ namespace Coflnet.Sky.Indexer.Archive
             {
                 return;
             }
+            logger.LogInformation("Auction archive job reads from {Source}", ArchiveReadContext.ReadConnectionDescription(config));
             logger.LogInformation("Auction archive job started; oldest month {Oldest}, margin {Margin} days, max {Rows} rows per part", options.OldestMonth, options.ClosedMarginDays, options.MaxRowsPerPart);
 
             while (!stoppingToken.IsCancellationRequested)
@@ -415,7 +416,7 @@ namespace Coflnet.Sky.Indexer.Archive
         /// <c>IX_Auctions_ItemId_End</c>, a few thousand rows).</summary>
         protected virtual async Task<IReadOnlyDictionary<int, DateTime>> GetAuctionItemFirstEndsAsync(CancellationToken cancellationToken)
         {
-            using var db = new HypixelContext();
+            using var db = ArchiveReadContext.Open(config);
             db.Database.SetCommandTimeout(TimeSpan.FromMinutes(10));
             var rows = await db.Auctions.AsNoTracking().GroupBy(a => a.ItemId).Select(g => new { ItemId = g.Key, First = g.Min(a => a.End) }).ToListAsync(cancellationToken).ConfigureAwait(false);
             return rows.ToDictionary(r => r.ItemId, r => r.First);
@@ -464,7 +465,7 @@ namespace Coflnet.Sky.Indexer.Archive
         /// <summary>One keyset page of auctions without children, see <see cref="PageFilter"/>.</summary>
         protected virtual async Task<List<SaveAuction>> LoadPageAsync(int itemId, DateTime cursorEnd, int cursorId, DateTime monthEnd, int pageSize, CancellationToken cancellationToken)
         {
-            using var db = new HypixelContext();
+            using var db = ArchiveReadContext.Open(config);
             return await db.Auctions.AsNoTracking()
                 .Where(PageFilter(itemId, cursorEnd, cursorId, monthEnd))
                 .OrderBy(a => a.End).ThenBy(a => a.Id)
@@ -479,8 +480,6 @@ namespace Coflnet.Sky.Indexer.Archive
         /// <c>UuId.SaveAuctionId</c> the statistics say "every value matches every row", which produced a full index
         /// scan over 583M rows (command timeout, month 2020-10 failed 52 times). Keep this well below 200.
         /// </summary>
-        internal const int ChildQueryBatchSize = 100;
-
         /// <summary>Split <paramref name="items"/> into consecutive lists of at most <paramref name="size"/>, preserving order.</summary>
         internal static IEnumerable<List<T>> Chunk<T>(IReadOnlyList<T> items, int size)
         {
@@ -495,19 +494,20 @@ namespace Coflnet.Sky.Indexer.Archive
             }
         }
 
-        /// <summary>Load bids, item bytes, nbt lookups, enchantments, coop members and claimed bidders of a page with one query per table and <see cref="ChildQueryBatchSize"/> ids.</summary>
+        /// <summary>Load bids, item bytes, nbt lookups, enchantments, coop members and claimed bidders of a page with one query per table and <see cref="ArchiveOptions.ChildQueryBatchSize"/> ids.</summary>
         protected virtual async Task LoadChildrenAsync(List<SaveAuction> page, CancellationToken cancellationToken)
         {
             var ids = page.Select(a => a.Id).ToList();
             var nbtIds = page.Where(a => a.NbtDataId != null).Select(a => a.NbtDataId.Value).Distinct().ToList();
-            using var db = new HypixelContext();
+            using var db = ArchiveReadContext.Open(config);
+            var batchSize = ArchiveOptions.From(config).ChildQueryBatchSize;
             var bids = new List<(int? AuctionId, SaveBids Bid)>();
             var nbt = new Dictionary<int, NbtData>();
             var lookups = new List<NBTLookup>();
             var enchantments = new List<Enchantment>();
             var coop = new List<(int? AuctionId, string value)>();
             var claimed = new List<(int? AuctionId, string value)>();
-            foreach (var chunk in Chunk(ids, ChildQueryBatchSize))
+            foreach (var chunk in Chunk(ids, batchSize))
             {
                 var nullableIds = chunk.Select(i => (int?)i).ToList();
                 var chunkBids = await db.Bids.AsNoTracking()
@@ -536,7 +536,7 @@ namespace Coflnet.Sky.Indexer.Archive
                     .ToListAsync(cancellationToken).ConfigureAwait(false);
                 claimed.AddRange(chunkClaimed.Select(c => (c.AuctionId, c.value)));
             }
-            foreach (var chunk in Chunk(nbtIds, ChildQueryBatchSize))
+            foreach (var chunk in Chunk(nbtIds, batchSize))
             {
                 var rows = await db.Set<NbtData>().AsNoTracking()
                     .Where(n => chunk.Contains(n.Id))

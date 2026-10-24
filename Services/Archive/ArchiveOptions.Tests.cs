@@ -70,4 +70,12 @@ public class ArchiveOptionsTests
         Assert.That(o.TagPauseMs, Is.EqualTo(250));
         Assert.That(o.PagePauseMs, Is.EqualTo(200));
     }
+
+    [Test]
+    public void From_ChildQueryBatchSize_DefaultOverrideAndMinimum()
+    {
+        Assert.That(ArchiveOptions.From(Config()).ChildQueryBatchSize, Is.EqualTo(100));
+        Assert.That(ArchiveOptions.From(Config(("CHILD_QUERY_BATCH_SIZE", "150"))).ChildQueryBatchSize, Is.EqualTo(150));
+        Assert.That(ArchiveOptions.From(Config(("CHILD_QUERY_BATCH_SIZE", "0"))).ChildQueryBatchSize, Is.EqualTo(1));
+    }
 }

@@ -167,8 +167,25 @@ namespace Coflnet.Sky.Indexer
 
         public static int highestPlayerId = 1;
 
+        /// <summary>
+        /// Cancellation stubs (MISSING_AUCTION, produced by the seller re-check) carry only UId/AuctioneerId/End.
+        /// They must never reach the insert path: a stub whose uuid does not match the stored row would be
+        /// inserted as a new auction and fail on the unique UId index, poisoning the whole batch.
+        /// The ActiveAuctionSetService consumer ends such auctions separately.
+        /// </summary>
+        internal static List<SaveAuction> DropCancelledStubs(IEnumerable<SaveAuction> auctions)
+        {
+            return auctions.Where(a => a != null
+                && !(a.Context?.ContainsKey("cancelled") ?? false)
+                && !string.IsNullOrEmpty(a.Uuid)
+                && a.UId != 0).ToList();
+        }
+
         public async Task ToDb(IEnumerable<SaveAuction> auctions)
         {
+            auctions = DropCancelledStubs(auctions);
+            if (!auctions.Any())
+                return;
             auctions = auctions.GroupBy(a => a.UId).Select(g => g.OrderByDescending(a => a.Bids?.Count).First()).ToList();
             foreach (var auction in auctions)
                 PermanentAnonymization.Apply(auction);

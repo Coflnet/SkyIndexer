@@ -39,16 +39,16 @@ namespace Coflnet.Sky.Indexer
 
         private ConcurrentQueue<AuctionResult> endedAuctionsQueue;
         private IConfiguration config;
-        private ActiveAuctionIndexService activeAuctionIndex;
+        private ActiveAuctionSetService activeAuctionSet;
 
-        public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue, NBT nbt, ItemPrices itemPrices, ItemDetails itemDetails, ActiveAuctionIndexService activeAuctionIndex)
+        public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue, NBT nbt, ItemPrices itemPrices, ItemDetails itemDetails, ActiveAuctionSetService activeAuctionSet)
         {
             this.config = config;
             this.endedAuctionsQueue = endedAuctionsQueue;
             this.nbt = nbt;
             this.itemPrices = itemPrices;
             this.itemDetails = itemDetails;
-            this.activeAuctionIndex = activeAuctionIndex;
+            this.activeAuctionSet = activeAuctionSet;
         }
 
         static Prometheus.Counter insertCount = Prometheus.Metrics.CreateCounter("sky_indexer_auction_insert", "Tracks the count of inserted auctions");
@@ -216,7 +216,7 @@ namespace Coflnet.Sky.Indexer
                         indexCount.Inc(auctions.Count());
                         LastFinish = DateTime.Now;
                         await transaction.CommitAsync();
-                        await activeAuctionIndex.SyncAuctions(auctions.Select(auction => auction.UId));
+                        SyncActiveSet(auctions);
                         return;
                     }
                 }
@@ -240,6 +240,24 @@ namespace Coflnet.Sky.Indexer
                     if (i >= 4)
                         throw;
                 }
+            }
+        }
+
+        private void SyncActiveSet(IEnumerable<SaveAuction> auctions)
+        {
+            if (activeAuctionSet == null)
+                return;
+            try
+            {
+                var now = DateTime.UtcNow;
+                var active = auctions.Where(a => a.End > now && a.AuctioneerId != null).ToList();
+                activeAuctionSet.UpsertActive(active, "indexer");
+                foreach (var group in auctions.Except(active).GroupBy(a => a.Bids?.Count > 0 || a.HighestBidAmount > 0 && a.Bin ? RemoveReason.Sold : RemoveReason.Ended))
+                    activeAuctionSet.RemoveActive(group.Select(a => a.UId), group.Key);
+            }
+            catch (Exception e)
+            {
+                Logger.Instance.Error(e, "syncing the active auction set failed");
             }
         }
 

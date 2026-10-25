@@ -25,15 +25,15 @@ namespace Coflnet.Sky.Indexer
         private Kafka.KafkaCreator kafkaCreator;
         private ActivitySource source;
         private WhipedTracker whipedTracker;
-        private ActiveAuctionIndexService activeAuctionIndex;
+        private ActiveAuctionSetService activeAuctionSet;
 
-        public ActiveAhStateService(IConfiguration config, Kafka.KafkaCreator kafkaCreator, ActivitySource source, WhipedTracker whipedTracker, ActiveAuctionIndexService activeAuctionIndex)
+        public ActiveAhStateService(IConfiguration config, Kafka.KafkaCreator kafkaCreator, ActivitySource source, WhipedTracker whipedTracker, ActiveAuctionSetService activeAuctionSet)
         {
             this.config = config;
             this.kafkaCreator = kafkaCreator;
             this.source = source;
             this.whipedTracker = whipedTracker;
-            this.activeAuctionIndex = activeAuctionIndex;
+            this.activeAuctionSet = activeAuctionSet;
         }
 
         private async Task LoadActiveFromDb()
@@ -111,6 +111,8 @@ namespace Coflnet.Sky.Indexer
                 await ReactiveFalsyDeactivated(sum, context);
             }
 
+            await ReconcileSet(sum);
+
             if (RecentUpdates.Min(r => r.Time) > Now - TimeSpan.FromMinutes(5))
                 return;
             if (RecentUpdates.Count < 6)
@@ -121,6 +123,25 @@ namespace Coflnet.Sky.Indexer
                 return;
             await UpdateInactiveAuctions(missing);
             KeepQueueSizeInCheck();
+        }
+
+        private async Task ReconcileSet(AhStateSumary sum)
+        {
+            if (activeAuctionSet == null || sum.PartCount == LoadedFromDB)
+                return;
+            try
+            {
+                // all parts of the current refresh share the same time
+                var parts = RecentUpdates.Where(r => r.Time == sum.Time && r.PartCount != LoadedFromDB).ToList();
+                if (sum.PartCount <= 0 || parts.Select(p => p.Part).Distinct().Count() < sum.PartCount)
+                    return;
+                var uids = parts.SelectMany(p => p.ActiveAuctions.Keys).Distinct().ToList();
+                await activeAuctionSet.TryReconcileWithSummaryAsync(uids, CancellationToken.None);
+            }
+            catch (Exception e)
+            {
+                dev.Logger.Instance.Error(e, "reconciling the active set with the summary");
+            }
         }
 
         private void KeepQueueSizeInCheck()
@@ -191,7 +212,7 @@ namespace Coflnet.Sky.Indexer
                     Console.WriteLine("deactivated " + toUpdate.Count());
                     Console.WriteLine("from sellers: " + sumarised.Count());
                     await context.SaveChangesAsync();
-                    await activeAuctionIndex.RemoveAuctions(toUpdate.Select(auction => auction.UId));
+                    activeAuctionSet?.RemoveActive(toUpdate.Select(auction => auction.UId).ToList(), RemoveReason.Summary);
                     RequestCheck(toUpdate);
                 }
                 catch (Exception e)
@@ -231,7 +252,13 @@ namespace Coflnet.Sky.Indexer
                 Console.WriteLine($"reactivated {item.Uuid}  {item.End}");
             }
             await context.SaveChangesAsync();
-            await activeAuctionIndex.SyncAuctions(foundActiveAgain.Select(auction => auction.UId));
+            if (foundActiveAgain.Count > 0 && activeAuctionSet != null)
+            {
+                var uids = foundActiveAgain.Select(a => a.UId).ToList();
+                var reloaded = await context.Auctions.AsNoTracking().Where(a => uids.Contains(a.UId))
+                    .Include(a => a.Enchantments).Include(a => a.NbtData).Include(a => a.Bids).AsSplitQuery().ToListAsync();
+                activeAuctionSet.UpsertActive(reloaded, "reactivated");
+            }
             Console.WriteLine(foundActiveAgain.FirstOrDefault()?.Uuid + " found ended active " + foundActiveAgain.Count);
         }
 

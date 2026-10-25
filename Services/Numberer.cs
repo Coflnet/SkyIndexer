@@ -17,6 +17,7 @@ namespace Coflnet.Sky.Indexer
         private readonly ActivitySource activitySource;
         private readonly ILogger<Numberer> logger;
         private readonly ItemDetails itemDetails;
+        private readonly ActiveAuctionSetService activeAuctionSet;
         readonly Gauge bidsWithoutId = Metrics.CreateGauge("sky_indexer_bids_without_id", "Number of Bids that don't yet have a player id");
         readonly Gauge auctionsWithoutId = Metrics.CreateGauge("sky_indexer_auctions_without_id", "Number of Auctions that don't yet have a player id");
         readonly Counter auctionsNumbered = Metrics.CreateCounter("sky_indexer_auctions_numbered", "Number of Auctions that have been numbered");
@@ -24,11 +25,12 @@ namespace Coflnet.Sky.Indexer
         readonly Counter playersNumbered = Metrics.CreateCounter("sky_indexer_players_numbered", "Number of Players that have been numbered");
         readonly Counter doublePlayersReset = Metrics.CreateCounter("sky_indexer_double_players_reset", "Number of Players that have been reset");
 
-        public Numberer(ActivitySource activitySource, ILogger<Numberer> logger, ItemDetails itemDetails)
+        public Numberer(ActivitySource activitySource, ILogger<Numberer> logger, ItemDetails itemDetails, ActiveAuctionSetService activeAuctionSet = null)
         {
             this.activitySource = activitySource;
             this.logger = logger;
             this.itemDetails = itemDetails;
+            this.activeAuctionSet = activeAuctionSet;
         }
 
         protected override async Task ExecuteAsync(System.Threading.CancellationToken stoppingToken)
@@ -172,6 +174,11 @@ namespace Coflnet.Sky.Indexer
                 }
             }
             context.Auctions.Update(auction);
+            if (activeAuctionSet != null && activeAuctionSet.Set.TryGet(auction.UId, out var inSet))
+            {
+                inSet.ItemId = auction.ItemId;
+                inSet.SellerId = auction.SellerId;
+            }
         }
 
         static readonly int batchSize = 2000;

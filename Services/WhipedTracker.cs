@@ -15,15 +15,15 @@ public class WhipedTracker
 {
     IConnectionMultiplexer multiplexer;
     ILogger<WhipedTracker> logger;
-    private ActiveAuctionIndexService activeAuctionIndex;
+    private ActiveAuctionSetService activeAuctionSet;
     private RestClient profileClient = null;
     private HashSet<(string playerUuid, string profileId)> whipedProfiles = new();
     private HashSet<long> auctionUids = new();
-    public WhipedTracker(IConfiguration config, IConnectionMultiplexer multiplexer, ILogger<WhipedTracker> logger, ActiveAuctionIndexService activeAuctionIndex)
+    public WhipedTracker(IConfiguration config, IConnectionMultiplexer multiplexer, ILogger<WhipedTracker> logger, ActiveAuctionSetService activeAuctionSet)
     {
         profileClient = new RestClient(config["PROFILE_BASE_URL"]);
         this.multiplexer = multiplexer;
-        this.activeAuctionIndex = activeAuctionIndex;
+        this.activeAuctionSet = activeAuctionSet;
         var whipedList = multiplexer.GetDatabase().StringGet("whipedProfiles");
         if (whipedList.HasValue)
         {
@@ -85,7 +85,7 @@ public class WhipedTracker
         if (activeAuctionsToDeactivate.Count > 0)
         {
             context.SaveChanges();
-            activeAuctionIndex.RemoveAuctions(deactivatedUids).GetAwaiter().GetResult();
+            activeAuctionSet?.RemoveActive(deactivatedUids, RemoveReason.Manual);
         }
         else
         {

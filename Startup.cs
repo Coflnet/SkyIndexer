@@ -44,8 +44,9 @@ namespace Coflnet.Sky.Indexer
             services.AddSingleton<ItemDetails>();
             services.AddSingleton<ItemPrices>();
             services.AddSingleton<NBT>();
-            services.AddSingleton<ActiveAuctionIndexService>();
-            services.AddHostedService<ActiveAuctionIndexService>(a => a.GetRequiredService<ActiveAuctionIndexService>());
+            services.AddSingleton<ActiveAuctionDbLoader>(di => new ActiveAuctionDbLoader(null, di.GetRequiredService<Microsoft.Extensions.Logging.ILogger<ActiveAuctionSetService>>()));
+            services.AddSingleton<ActiveAuctionSetService>();
+            services.AddHostedService<ActiveAuctionSetService>(a => a.GetRequiredService<ActiveAuctionSetService>());
             services.AddSingleton<IItemsApi>(di=>
             {
                 var config = di.GetRequiredService<IConfiguration>();

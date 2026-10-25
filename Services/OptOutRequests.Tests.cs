@@ -34,7 +34,7 @@ public class OptOutRequestsTests
         Assert.That(parsed.Database, Is.EqualTo("privacy_test"), "Tests refuse other databases.");
         Assert.That(parsed.Server, Is.AnyOf("127.0.0.1", "localhost"), "Tests refuse non-local databases.");
         options = new DbContextOptionsBuilder<HypixelContext>().UseMySql(connection, new MariaDbServerVersion("10.11")).Options;
-        HypixelContext.SetConfiguration(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string> { ["DBConnection"] = connection, ["DBVersion"] = "10.11", ["ActiveAuctionsDBConnection"] = "" }).Build());
+        HypixelContext.SetConfiguration(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string> { ["DBConnection"] = connection, ["DBVersion"] = "10.11" }).Build());
         using var db = Db();
         db.Database.EnsureCreated();
     }
@@ -140,7 +140,7 @@ public class OptOutRequestsTests
     {
         Seed();
         OptOut();
-        var indexer = new Indexer(null, new ConcurrentQueue<AuctionResult>(), null, null, null, new ActiveAuctionIndexService(null));
+        var indexer = new Indexer(null, new ConcurrentQueue<AuctionResult>(), null, null, null, null);
         await indexer.ToDb([new SaveAuction
         {
             Uuid = AuctionUuid, UId = 123, AuctioneerId = Uuid, SellerId = 42, ProfileId = Other,
@@ -162,7 +162,7 @@ public class OptOutRequestsTests
     {
         Seed();
         OptOut();
-        var indexer = new Indexer(null, new ConcurrentQueue<AuctionResult>(), null, null, null, new ActiveAuctionIndexService(null));
+        var indexer = new Indexer(null, new ConcurrentQueue<AuctionResult>(), null, null, null, null);
         var timestamp = new DateTime(2026, 10, 2, 10, 0, 0);
         SaveAuction Incoming(DateTime time) => new()
         {
@@ -303,7 +303,7 @@ public class OptOutRequestsTests
         // regression: including CoopMembers/ClaimedBids in the ingestion preload ran into command timeouts in production
         Seed();
         OptOut();
-        var indexer = new Indexer(null, new ConcurrentQueue<AuctionResult>(), null, null, null, new ActiveAuctionIndexService(null));
+        var indexer = new Indexer(null, new ConcurrentQueue<AuctionResult>(), null, null, null, null);
         await indexer.ToDb([new SaveAuction { Uuid = AuctionUuid, UId = 123, AuctioneerId = Other, SellerId = 43, End = DateTime.UtcNow.AddHours(1), HighestBidAmount = 100, Bids = [] }]);
         using var fresh = Db();
         Assert.That(fresh.Set<UuId>().Count(p => p.value == Uuid), Is.Not.Zero, "coop rows are not touched by ingestion");

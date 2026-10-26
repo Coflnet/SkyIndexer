@@ -35,6 +35,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private readonly IAuctionBlobStore store;
         private readonly IConfiguration config;
         private readonly ILogger<AuctionArchiveJob> logger;
+        private readonly IArchiveItemCheckpoints checkpoints;
         private readonly Dictionary<string, ushort> tagIds = new(StringComparer.Ordinal);
 
         private static readonly Prometheus.Counter monthsTotal = Prometheus.Metrics.CreateCounter("sky_indexer_archive_months_total", "Months fully archived (sentinel written)");
@@ -46,14 +47,16 @@ namespace Coflnet.Sky.Indexer.Archive
         private static readonly Prometheus.Counter bidderRowsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_archive_bidder_rows", "auction_bidders rows written");
         private static readonly Prometheus.Counter bidsWithoutBidder = Prometheus.Metrics.CreateCounter("sky_indexer_archive_bids_without_bidder", "Bids skipped for auction_bidders because BidderId is 0");
         private static readonly Prometheus.Counter itemMonthsSkipped = Prometheus.Metrics.CreateCounter("sky_indexer_archive_item_months_skipped", "ItemId-months skipped because the item's first auction ends in a later month");
+        private static readonly Prometheus.Counter itemsSkippedByCheckpoint = Prometheus.Metrics.CreateCounter("sky_indexer_archive_items_skipped_by_checkpoint", "ItemId-months skipped after a restart because a Redis checkpoint says they are done");
         private static readonly Prometheus.Counter pages = Prometheus.Metrics.CreateCounter("sky_indexer_archive_pages", "Auction pages read from MariaDB");
         private static readonly Prometheus.Counter errors = Prometheus.Metrics.CreateCounter("sky_indexer_archive_errors", "Archive errors (tag-months that failed with an exception, tag collisions)");
         private static readonly Prometheus.Gauge currentMonth = Prometheus.Metrics.CreateGauge("sky_indexer_archive_current_month", "Month (yyyyMM) being archived");
         private static readonly Prometheus.Gauge lastMonthCompleted = Prometheus.Metrics.CreateGauge("sky_indexer_archive_last_month_completed_timestamp", "Unix time the last month sentinel was written");
 
         /// <summary>DI constructor.</summary>
-        public AuctionArchiveJob(IAuctionBlobStore store, IConfiguration config, ILogger<AuctionArchiveJob> logger)
+        public AuctionArchiveJob(IAuctionBlobStore store, IConfiguration config, ILogger<AuctionArchiveJob> logger, IArchiveItemCheckpoints checkpoints = null)
         {
+            this.checkpoints = checkpoints ?? new NoArchiveItemCheckpoints();
             this.store = store;
             this.config = config;
             this.logger = logger;
@@ -164,6 +167,7 @@ namespace Coflnet.Sky.Indexer.Archive
                 if (await ArchiveMonthAsync(month, itemIds, options, cancellationToken, firstMonths).ConfigureAwait(false))
                 {
                     await WriteMonthSentinelAsync(month, cancellationToken).ConfigureAwait(false);
+                    await checkpoints.ClearAsync(month, cancellationToken).ConfigureAwait(false);
                     monthsTotal.Inc();
                     lastMonthCompleted.Set(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
                     completed++;
@@ -191,6 +195,13 @@ namespace Coflnet.Sky.Indexer.Archive
         internal async Task<bool> ArchiveMonthAsync(int month, IReadOnlyList<int> itemIds, ArchiveOptions options, CancellationToken cancellationToken, IReadOnlyDictionary<int, int> firstMonths = null)
         {
             var runs = new Dictionary<string, TagMonthRun>(StringComparer.Ordinal);
+            var done = await RestoreCheckpointsAsync(month, itemIds, runs, firstMonths, cancellationToken).ConfigureAwait(false);
+            if (done.Count > 0 && !await RestoredPartsExistAsync(month, runs, cancellationToken).ConfigureAwait(false))
+            {
+                runs.Clear();
+                done = new Dictionary<int, ItemMonthCheckpoint>();
+            }
+            var ttl = TimeSpan.FromHours(options.CheckpointTtlHours);
             foreach (var itemId in itemIds)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -199,9 +210,17 @@ namespace Coflnet.Sky.Indexer.Archive
                     itemMonthsSkipped.Inc();
                     continue;
                 }
-                var (ok, rows) = await ArchiveItemMonthAsync(itemId, month, runs, options, cancellationToken).ConfigureAwait(false);
+                if (done.ContainsKey(itemId))
+                {
+                    itemsSkippedByCheckpoint.Inc();
+                    continue;
+                }
+                var before = new Dictionary<string, RunSnapshot>(StringComparer.Ordinal); // filled lazily with the tags the item touches
+                var startedAt = DateTime.UtcNow;
+                var (ok, rows) = await ArchiveItemMonthAsync(itemId, month, runs, options, cancellationToken, before).ConfigureAwait(false);
                 if (!ok)
                     return false;
+                await checkpoints.SaveAsync(month, itemId, DiffRuns(before, runs, startedAt), ttl, cancellationToken).ConfigureAwait(false);
                 // an empty ItemId-month was one cheap index lookup; only pause after real work
                 if (rows > 0)
                     await Delay(TimeSpan.FromMilliseconds(options.TagPauseMs), cancellationToken).ConfigureAwait(false);
@@ -212,8 +231,104 @@ namespace Coflnet.Sky.Indexer.Archive
             return allFinalized;
         }
 
+        /// <summary>
+        /// The restored part hashes go into the tag index and the sentinel unchecked, so make sure the parts really are in the store.
+        /// On a missing part the checkpoints are dropped (and counted as an error) and the month is walked again.
+        /// </summary>
+        private async Task<bool> RestoredPartsExistAsync(int month, Dictionary<string, TagMonthRun> runs, CancellationToken cancellationToken)
+        {
+            foreach (var run in runs.Values.OrderBy(r => r.Tag, StringComparer.Ordinal))
+                for (var part = 0; part < run.PartHashes.Count; part++)
+                    if (!await store.BlockExistsAsync(run.Tag, month, part, cancellationToken).ConfigureAwait(false))
+                    {
+                        errors.Inc();
+                        logger.LogWarning("Checkpointed part {Part} of {Tag} {Month} is missing from the store; ignoring all checkpoints and re-walking the month", part, run.Tag, month);
+                        await checkpoints.ClearAsync(month, cancellationToken).ConfigureAwait(false);
+                        return false;
+                    }
+            return true;
+        }
+
+        internal record RunSnapshot(int Parts, int Rows, int SoldRows, int IndexRows, int IndexBidderRows, long BidsWithoutBidder);
+
+        private static RunSnapshot SnapshotRun(TagMonthRun run)
+            => run == null ? new RunSnapshot(0, 0, 0, 0, 0, 0) : new RunSnapshot(run.PartHashes.Count, run.Rows, run.SoldRows, run.IndexRows, run.IndexBidderRows, run.BidsWithoutBidder);
+
+        /// <summary>The delta an item added to <paramref name="runs"/>: new parts are the tail of <c>PartHashes</c>, counters are differences.</summary>
+        private static ItemMonthCheckpoint DiffRuns(Dictionary<string, RunSnapshot> before, Dictionary<string, TagMonthRun> runs, DateTime archivedAt)
+        {
+            var tags = new Dictionary<string, CheckpointTagDelta>(StringComparer.Ordinal);
+            foreach (var (tag, run) in runs)
+            {
+                if (!before.TryGetValue(tag, out var b))
+                    continue; // the item never touched this tag
+
+                var parts = run.PartHashes.Skip(b.Parts).Select((hash, i) => new CheckpointPart(b.Parts + i, hash)).ToList();
+                var delta = new CheckpointTagDelta(parts, run.Rows - b.Rows, run.SoldRows - b.SoldRows, run.IndexRows - b.IndexRows, run.IndexBidderRows - b.IndexBidderRows, run.BidsWithoutBidder - b.BidsWithoutBidder);
+                if (parts.Count > 0 || delta.Rows != 0 || delta.SoldRows != 0 || delta.IndexRows != 0 || delta.IndexBidderRows != 0 || delta.BidsWithoutBidder != 0)
+                    tags[tag] = delta;
+            }
+            return new ItemMonthCheckpoint(archivedAt, tags);
+        }
+
+        /// <summary>
+        /// Rebuild <paramref name="runs"/> from the month's checkpoints. Returns the finished items (empty when there are none, Redis
+        /// failed or the part numbers of a tag are not dense 0..n-1; then everything is re-walked and <paramref name="runs"/> stays empty).
+        /// </summary>
+        private async Task<IReadOnlyDictionary<int, ItemMonthCheckpoint>> RestoreCheckpointsAsync(int month, IReadOnlyList<int> itemIds, Dictionary<string, TagMonthRun> runs, IReadOnlyDictionary<int, int> firstMonths, CancellationToken cancellationToken)
+        {
+            var empty = new Dictionary<int, ItemMonthCheckpoint>();
+            var loaded = await checkpoints.LoadAsync(month, cancellationToken).ConfigureAwait(false);
+            if (loaded.Count == 0)
+                return empty;
+            var parts = new Dictionary<string, SortedDictionary<int, string>>(StringComparer.Ordinal);
+            var rebuilt = new Dictionary<string, TagMonthRun>(StringComparer.Ordinal);
+            foreach (var (itemId, checkpoint) in loaded.OrderBy(c => c.Key))
+            {
+                foreach (var (tag, delta) in checkpoint.Tags)
+                {
+                    if (!rebuilt.TryGetValue(tag, out var run))
+                    {
+                        rebuilt[tag] = run = new TagMonthRun(tag, month);
+                        parts[tag] = new SortedDictionary<int, string>();
+                    }
+                    foreach (var part in delta.Parts ?? new List<CheckpointPart>())
+                    {
+                        if (!parts[tag].TryAdd(part.Part, part.Sha256))
+                        {
+                            logger.LogWarning("Checkpoints of {Month} contain part {Part} of {Tag} twice (item {Item}); ignoring all checkpoints and re-walking the month", month, part.Part, tag, itemId);
+                            await checkpoints.ClearAsync(month, cancellationToken).ConfigureAwait(false);
+                            return empty;
+                        }
+                    }
+                    run.Rows += delta.Rows;
+                    run.SoldRows += delta.SoldRows;
+                    run.IndexRows += delta.IndexRows;
+                    run.IndexBidderRows += delta.IndexBidderRows;
+                    run.BidsWithoutBidder += delta.BidsWithoutBidder;
+                    if (run.ArchivedAt == null || checkpoint.ArchivedAt < run.ArchivedAt)
+                        run.ArchivedAt = DateTime.SpecifyKind(checkpoint.ArchivedAt, DateTimeKind.Utc);
+                }
+            }
+            foreach (var (tag, byPart) in parts)
+            {
+                if (byPart.Count > 0 && (byPart.Keys.First() != 0 || byPart.Keys.Last() != byPart.Count - 1))
+                {
+                    logger.LogWarning("Checkpoints of {Month} have a gap in the parts of {Tag} (parts {Parts}); ignoring all checkpoints and re-walking the month", month, tag, string.Join(",", byPart.Keys));
+                    await checkpoints.ClearAsync(month, cancellationToken).ConfigureAwait(false);
+                    return empty;
+                }
+                rebuilt[tag].PartHashes.AddRange(byPart.Values);
+            }
+            foreach (var (tag, run) in rebuilt)
+                runs[tag] = run;
+            var resume = itemIds.FirstOrDefault(i => !loaded.ContainsKey(i) && !(firstMonths != null && firstMonths.TryGetValue(i, out var first) && first > month), -1);
+            logger.LogInformation("Resuming {Month} from checkpoints: {Skipped} finished items skipped, walk resumes at item {Item}", month, itemIds.Count(loaded.ContainsKey), resume);
+            return loaded;
+        }
+
         /// <summary>Page one ItemId of a month into the per-tag runs; the index rows of the item are written after its parts verified.</summary>
-        internal async Task<(bool ok, int rows)> ArchiveItemMonthAsync(int itemId, int month, Dictionary<string, TagMonthRun> runs, ArchiveOptions options, CancellationToken cancellationToken)
+        internal async Task<(bool ok, int rows)> ArchiveItemMonthAsync(int itemId, int month, Dictionary<string, TagMonthRun> runs, ArchiveOptions options, CancellationToken cancellationToken, Dictionary<string, RunSnapshot> before = null)
         {
             var (monthStart, monthEnd) = ArchiveMonths.MonthRange(month);
             var buffers = new Dictionary<string, List<SaveAuction>>(StringComparer.Ordinal);
@@ -241,7 +356,10 @@ namespace Coflnet.Sky.Indexer.Archive
                         return (false, total);
                     }
                     if (!buffers.TryGetValue(row.Tag, out var buffer))
+                    {
                         buffers[row.Tag] = buffer = new List<SaveAuction>();
+                        before?.TryAdd(row.Tag, SnapshotRun(runs.GetValueOrDefault(row.Tag)));
+                    }
                     buffer.Add(row);
                     total++;
                     if (buffer.Count >= options.MaxRowsPerPart && !await FlushPartAsync(runs, indexes, row.Tag, month, buffer, cancellationToken).ConfigureAwait(false))

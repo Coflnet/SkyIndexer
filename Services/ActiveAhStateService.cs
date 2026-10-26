@@ -26,6 +26,17 @@ namespace Coflnet.Sky.Indexer
         private ActivitySource source;
         private WhipedTracker whipedTracker;
         private ActiveAuctionSetService activeAuctionSet;
+        private readonly object producerLock = new();
+        private IProducer<string, SaveAuction> checkProducer;
+
+        /// <summary>One tenth of every summary part is checked per message by default</summary>
+        internal const int DefaultReactivateSampleDenominator = 10;
+        internal Func<IProducer<string, SaveAuction>> ProducerFactory { get; set; }
+        /// <summary>Selects the sample (minute of the hour), seam for tests</summary>
+        internal Func<int> MinuteSource { get; set; } = () => Now.Minute;
+        /// <summary>Seam for the primary db query that finds auctions which were ended wrongly</summary>
+        internal Func<HypixelContext, List<long>, DateTime, Task<List<SaveAuction>>> FindActiveAgain { get; set; }
+        internal Func<long, bool> IsWhiped { get; set; }
 
         public ActiveAhStateService(IConfiguration config, Kafka.KafkaCreator kafkaCreator, ActivitySource source, WhipedTracker whipedTracker, ActiveAuctionSetService activeAuctionSet)
         {
@@ -34,6 +45,68 @@ namespace Coflnet.Sky.Indexer
             this.source = source;
             this.whipedTracker = whipedTracker;
             this.activeAuctionSet = activeAuctionSet;
+            ProducerFactory = () => this.kafkaCreator.BuildProducer<string, SaveAuction>();
+            IsWhiped = id => this.whipedTracker?.IsWhiped(id) ?? false;
+            FindActiveAgain = (context, ids, maxExpiry) => context.Auctions
+                .Where(a => ids.Contains(a.UId) && a.End < maxExpiry && (a.Bids.Count() == 0 || !a.Bin)).ToListAsync();
+        }
+
+        public override void Dispose()
+        {
+            DiscardProducer(null);
+            base.Dispose();
+        }
+
+        /// <summary>Created on first use under a lock; a failing factory or producer is retried on the next call</summary>
+        private IProducer<string, SaveAuction> GetProducer()
+        {
+            lock (producerLock)
+                return checkProducer ??= ProducerFactory();
+        }
+
+        private void DiscardProducer(IProducer<string, SaveAuction> failed)
+        {
+            lock (producerLock)
+            {
+                if (checkProducer == null || (failed != null && !ReferenceEquals(checkProducer, failed)))
+                    return;
+                var old = checkProducer;
+                checkProducer = null;
+                try { old.Dispose(); } catch { /* already broken */ }
+            }
+        }
+
+        private int ReactivateSampleDenominator()
+        {
+            var configured = config?.GetValue<int?>("ACTIVE_STATE:REACTIVATE_SAMPLE_DENOMINATOR") ?? DefaultReactivateSampleDenominator;
+            return Math.Max(1, configured);
+        }
+
+        /// <summary>
+        /// Auction ids of a summary part that are worth checking against the database: only the sampled share
+        /// (id modulo denominator equals minute modulo denominator), not almost expired and not whiped.
+        /// </summary>
+        /// <summary>Non-negative bucket, uids are signed (parsed from 16 hex chars) and C# % keeps the sign</summary>
+        internal static int Bucket(long uid, int denominator) => (int)((ulong)uid % (ulong)denominator);
+
+        internal List<long> SelectIdsToCheck(AhStateSumary sumary)
+        {
+            var denominator = ReactivateSampleDenominator();
+            var minute = MinuteSource() % denominator;
+            var minUtcTicks = (sumary.Time + TimeSpan.FromMinutes(1.5)).Ticks;
+            var toCheck = new List<long>();
+            foreach (var (uid, end) in sumary.ActiveAuctions)
+            {
+                if (end <= minUtcTicks || Bucket(uid, denominator) != minute)
+                    continue;
+                if (IsWhiped(uid))
+                {
+                    Console.WriteLine($"Whiped auction {uid} found, skipping");
+                    continue;
+                }
+                toCheck.Add(uid);
+            }
+            return toCheck;
         }
 
         private async Task LoadActiveFromDb()
@@ -222,26 +295,20 @@ namespace Coflnet.Sky.Indexer
             }
         }
 
-        private async Task ReactiveFalsyDeactivated(AhStateSumary sumary, HypixelContext context)
+        internal async Task ReactiveFalsyDeactivated(AhStateSumary sumary, HypixelContext context)
         {
             if (sumary.PartCount == LoadedFromDB)
                 return;
             var activeAuctions = sumary.ActiveAuctions;
-            var denominator = 1;
             var minUtcTicks = (sumary.Time + TimeSpan.FromMinutes(1.5)).Ticks;
-            var toCheck = activeAuctions.Where(a => a.Value > minUtcTicks && a.Key % denominator == Now.Minute % denominator).Select(a => a.Key).ToList();
+            var toCheck = SelectIdsToCheck(sumary);
             var almostEnded = activeAuctions.Where(a => a.Value < minUtcTicks);
             Console.WriteLine($"No need to reactivate almost expired {almostEnded.Count()} {almostEnded.FirstOrDefault().Key}");
+            if (toCheck.Count == 0)
+                return;
             // maximimum time considered in the past to require reactivation (sells can take up to 2 minutes to be saved)
             var maxExpiry = Now - TimeSpan.FromMinutes(1.5);
-            foreach (var item in toCheck.ToList())
-            {
-                if(!whipedTracker.IsWhiped(item))
-                    continue;
-                Console.WriteLine($"Whiped auction {item} found, skipping");
-                toCheck.Remove(item);
-            }
-            var foundActiveAgain = await context.Auctions.Where(a => toCheck.Contains(a.UId) && a.End < maxExpiry && (a.Bids.Count() == 0 || !a.Bin)).ToListAsync();
+            var foundActiveAgain = await FindActiveAgain(context, toCheck, maxExpiry);
             if(foundActiveAgain.Count > 100_000)
                 throw new Exception("impossible many auctions to reactivate, abording");
             foreach (var item in foundActiveAgain)
@@ -251,7 +318,8 @@ namespace Coflnet.Sky.Indexer
                 context.Update(item);
                 Console.WriteLine($"reactivated {item.Uuid}  {item.End}");
             }
-            await context.SaveChangesAsync();
+            if (foundActiveAgain.Count > 0)
+                await context.SaveChangesAsync();
             if (foundActiveAgain.Count > 0 && activeAuctionSet != null)
             {
                 var uids = foundActiveAgain.Select(a => a.UId).ToList();
@@ -265,15 +333,15 @@ namespace Coflnet.Sky.Indexer
         private static DateTime Now => DateTime.UtcNow;
 
 
-        private void RequestCheck(List<SaveAuction> sumarised)
+        internal void RequestCheck(List<SaveAuction> sumarised)
         {
-            using (var p = kafkaCreator.BuildProducer<string, SaveAuction>())
+            var p = GetProducer();
+            try
             {
                 foreach (var item in sumarised)
                 {
                     try
                     {
-
                         p.Produce(config["TOPICS:AUCTION_CHECK"], new Message<string, SaveAuction> { Value = item, Key = $"{item.UId.ToString()}{(item.Bids == null ? "null" : item.Bids.Count)}{item.End}" }, r =>
                         {
                             if (r.Error.IsError || r.TopicPartitionOffset.Offset % 1000 == 10)
@@ -282,14 +350,23 @@ namespace Coflnet.Sky.Indexer
                                     $"\nDelivery Error {r.Topic}: {r.Error.Reason}");
                         });
                     }
+                    catch (ProduceException<string, SaveAuction> e) when (e.Error.IsFatal)
+                    {
+                        throw;
+                    }
                     catch (Exception e)
                     {
                         dev.Logger.Instance.Error(e, "Sending auction " + JsonConvert.SerializeObject(item));
                     }
                 }
                 p.Flush(TimeSpan.FromSeconds(10));
-                Console.WriteLine("sent to check: " + sumarised.Count());
             }
+            catch
+            {
+                DiscardProducer(p); // rebuilt on the next call
+                throw;
+            }
+            Console.WriteLine("sent to check: " + sumarised.Count());
         }
     }
 }

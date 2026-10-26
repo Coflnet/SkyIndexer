@@ -28,6 +28,9 @@ public class ActiveAuctionSetService : IHostedService
     private static readonly Gauge LoadSeconds = Metrics.CreateGauge("sky_indexer_active_set_load_seconds", "Duration of the initial load");
     private static readonly Counter Upserts = Metrics.CreateCounter("sky_indexer_active_set_upserts_total", "Auctions upserted into the active set", "source");
     private static readonly Counter Removed = Metrics.CreateCounter("sky_indexer_active_set_removed_total", "Auctions removed from the active set", "reason");
+    internal static readonly Counter SnapshotRebuilds = Metrics.CreateCounter("sky_indexer_active_set_snapshot_rebuilds_total", "Snapshot rebuilds of the active set");
+    private static readonly Histogram RebuildSeconds = Metrics.CreateHistogram("sky_indexer_active_set_rebuild_seconds", "Duration of an active set snapshot rebuild",
+        new HistogramConfiguration { Buckets = Histogram.ExponentialBuckets(0.005, 2, 12) });
     private static readonly Counter ReconcileFetched = Metrics.CreateCounter("sky_indexer_active_set_reconcile_fetched_total", "Auctions fetched from the db because the summary listed them but the set did not");
 
     private readonly ActiveAuctionDbLoader loader;
@@ -40,6 +43,10 @@ public class ActiveAuctionSetService : IHostedService
 
     public ActiveAuctionSet Set { get; }
 
+    /// <summary>Number of copies made for upserts, unchanged re-sightings must not add to it</summary>
+    internal long ClonesMade => Interlocked.Read(ref clonesMade);
+    private long clonesMade;
+
     public ActiveAuctionSetService(ActiveAuctionDbLoader loader, ItemDetails itemDetails, ILogger<ActiveAuctionSetService> logger, IConfiguration config = null, ActiveAuctionSet set = null)
     {
         this.loader = loader;
@@ -48,6 +55,11 @@ public class ActiveAuctionSetService : IHostedService
         this.config = config;
         Set = set ?? new ActiveAuctionSet();
         Set.OnRemoved += (_, reason) => Removed.WithLabels(reason.ToString()).Inc();
+        Set.OnSnapshotRebuilt += duration =>
+        {
+            SnapshotRebuilds.Inc();
+            RebuildSeconds.Observe(duration.TotalSeconds);
+        };
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -126,6 +138,7 @@ public class ActiveAuctionSetService : IHostedService
 
     /// <summary>
     /// Adds or refreshes auctions. Works on copies, the passed objects stay untouched (EF still needs them).
+    /// The cheap freshness/change check runs before copying.
     /// </summary>
     public void UpsertActive(IEnumerable<SaveAuction> auctions, string source)
     {
@@ -138,6 +151,9 @@ public class ActiveAuctionSetService : IHostedService
                 continue;
             try
             {
+                if (!Set.WouldAccept(auction))
+                    continue; // unchanged re-sighting, not worth a copy
+                Interlocked.Increment(ref clonesMade);
                 var copy = CloneForActiveSet(auction);
                 EnsureItemId(copy);
                 if (Set.Upsert(copy, source))

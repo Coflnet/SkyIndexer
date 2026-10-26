@@ -94,6 +94,41 @@ public class ActiveAuctionSetServiceTests
     }
 
     [Test]
+    public void UnchangedResightingDoesNotCloneOrBump()
+    {
+        var end = DateTime.UtcNow.AddHours(1);
+        var first = Auction(7);
+        first.End = end;
+        service.UpsertActive(new[] { first }, "test");
+        Assert.That(service.ClonesMade, Is.EqualTo(1));
+        var version = service.Set.Version;
+        var again = Auction(7);
+        again.End = end;
+        service.UpsertActive(new[] { again }, "test");
+        Assert.That(service.ClonesMade, Is.EqualTo(1));
+        Assert.That(service.Set.Version, Is.EqualTo(version));
+        var withBid = Auction(7);
+        withBid.End = end;
+        withBid.HighestBidAmount = 500;
+        withBid.Bids = new() { new SaveBids { Amount = 500, Bidder = "b", Timestamp = DateTime.UtcNow } };
+        service.UpsertActive(new[] { withBid }, "test");
+        Assert.That(service.ClonesMade, Is.EqualTo(2));
+        Assert.That(service.Set.Version, Is.EqualTo(version + 1));
+    }
+
+    [Test]
+    public void RebuildMetricIncrements()
+    {
+        var before = ActiveAuctionSetService.SnapshotRebuilds.Value;
+        service.UpsertActive(new[] { Auction(8) }, "test");
+        service.Set.RebuildSnapshotIfDirty();
+        Assert.That(ActiveAuctionSetService.SnapshotRebuilds.Value, Is.EqualTo(before + 1));
+        service.UpsertActive(new[] { Auction(9) }, "test");
+        service.Set.RebuildSnapshotIfDirty(); // inside the interval
+        Assert.That(ActiveAuctionSetService.SnapshotRebuilds.Value, Is.EqualTo(before + 1));
+    }
+
+    [Test]
     public void RemoveActiveRemoves()
     {
         service.UpsertActive(new[] { Auction(1), Auction(2) }, "test");

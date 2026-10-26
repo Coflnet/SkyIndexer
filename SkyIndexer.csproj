@@ -14,11 +14,11 @@
 
   <ItemGroup>
     <PackageReference Include="AWSSDK.S3" Version="3.7.511.8" />
-    <PackageReference Include="CassandraCSharpDriver" Version="3.22.0" />
+    <PackageReference Include="CassandraCSharpDriver" Version="3.23.0" />
     <PackageReference Include="Coflnet.Sky.McConnect" Version="0.6.0" />
     <PackageReference Include="Coflnet.Sky.PlayerState.Client" Version="0.19.0" />
     <PackageReference Include="Coflnet.Sky.Settings.Client" Version="0.3.0" />
-    <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="10.0.12" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="10.0.14" />
     <PackageReference Include="RateLimiter" Version="2.2.0" />
   </ItemGroup>
 
@@ -26,7 +26,7 @@
     <Compile Remove="**\*.Tests.cs" />
   </ItemGroup>
   <ItemGroup Condition="'$(Configuration)' != 'Release'">
-    <PackageReference Include="NUnit3TestAdapter" Version="6.3.0" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageReference Include="NUnit3TestAdapter" Version="6.3.1" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
   </ItemGroup>
 </Project>

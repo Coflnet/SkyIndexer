@@ -27,6 +27,8 @@ public class AuctionArchiveJobTests
         public readonly Dictionary<(ushort tag, ushort month), ArchivedMonth> Months = new();
         public readonly Dictionary<long, (ushort tag, ushort month, byte part)> Locations = new();
         public readonly Dictionary<(uint bidder, uint end, long uid), ulong> Bidders = new();
+        public readonly HashSet<(uint seller, uint end, long uid)> Sellers = new();
+        public readonly Dictionary<string, int> Players = new();
         public readonly List<string> Events;
         public readonly List<(int item, DateTime cursor, int cursorId)> Pages = new();
         public bool SchemaEnsured;
@@ -78,13 +80,18 @@ public class AuctionArchiveJobTests
             return Task.CompletedTask;
         }
 
-        protected override Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, CancellationToken cancellationToken)
+        protected override Task<IReadOnlyDictionary<string, int>> ResolvePlayerIdsAsync(IReadOnlyList<string> uuids, CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyDictionary<string, int>>(uuids.Where(Players.ContainsKey).ToDictionary(u => u, u => Players[u]));
+
+        protected override Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers, CancellationToken cancellationToken)
         {
             Events.Add("index_rows");
             foreach (var (uid, part) in locations)
                 Locations[uid] = (tagId, month, part);
             foreach (var b in bidders)
-                Bidders.TryAdd((b.BidderId, b.End, b.Uid), b.Amount);
+                Bidders.TryAdd((b.BidderId, b.End, b.Uid), 0ul);
+            foreach (var x in sellers)
+                Sellers.Add((x.SellerId, x.End, x.Uid));
             return Task.CompletedTask;
         }
 
@@ -94,6 +101,7 @@ public class AuctionArchiveJobTests
             Months[(row.TagId, row.Month)] = row;
             return Task.CompletedTask;
         }
+
 
         protected override Task WriteMonthSentinelAsync(int month, CancellationToken cancellationToken)
         {
@@ -143,7 +151,7 @@ public class AuctionArchiveJobTests
             Tag = tag,
             End = DateTime.SpecifyKind(end, DateTimeKind.Unspecified),
             Start = DateTime.SpecifyKind(end.AddDays(-1), DateTimeKind.Unspecified),
-            AuctioneerId = "a".PadLeft(32, '0'),
+            AuctioneerId = (0xabcL).ToString("x32"),
             HighestBidAmount = bids.Length == 0 ? 0 : bids.Max(b => b.Amount),
             Bids = bids.ToList(),
             NbtData = new NbtData { data = new byte[] { 10, 0, (byte)id } },
@@ -454,7 +462,7 @@ public class AuctionArchiveJobTests
     }
 
     [Test]
-    public async Task BidderIndexKeepsMaxAmountPerBidderAndSkipsBidsWithoutId()
+    public async Task BidderIndexHasOneRowPerBidderAndSkipsBidsWithoutId()
     {
         var job = Job(("ARCHIVE:OLDEST_MONTH", "2026-09"));
         var end = new DateTime(2026, 9, 2, 3, 4, 5);
@@ -464,17 +472,103 @@ public class AuctionArchiveJobTests
         await job.Run(Now);
 
         var unix = (uint)new DateTimeOffset(DateTime.SpecifyKind(end, DateTimeKind.Utc)).ToUnixTimeSeconds();
-        Assert.That(job.Bidders, Is.EquivalentTo(new Dictionary<(uint, uint, long), ulong>
-        {
-            [(7, unix, auction.UId)] = 200,
-            [(8, unix, auction.UId)] = 150,
-        }));
+        Assert.That(job.Bidders.Keys, Is.EquivalentTo(new[] { (7u, unix, auction.UId), (8u, unix, auction.UId) }), "one row per bidder and auction, no amount column");
         var row = job.Months[(job.Tags["HYPERION"], ArchiveMonths.ToIndex(Sep))];
         Assert.That(row.IndexBidderRows, Is.EqualTo(2));
         Assert.That(row.SoldRows, Is.EqualTo(1));
         Assert.That(row.Note, Does.Contain("1 bids without bidder id"));
         var block = await store.ReadBlockAsync("HYPERION", Sep, 0);
         Assert.That(block.ToAuctions().Single().Bids, Has.Count.EqualTo(4), "the blob keeps every bid");
+    }
+
+    [Test]
+    public async Task SellerIndexHasOneRowPerAuctionAndSkipsUnknownSellers()
+    {
+        var job = Job(("ARCHIVE:OLDEST_MONTH", "2026-09"));
+        var end = new DateTime(2026, 9, 2, 3, 4, 5);
+        var sold = Auction(1, "HYPERION", end, Bid(7, 100));
+        sold.SellerId = 55;
+        var unsold = Auction(1, "HYPERION", end.AddHours(1));
+        unsold.SellerId = 55;
+        var unknown = Auction(1, "HYPERION", end.AddHours(2), Bid(8, 100));
+        unknown.SellerId = 0; // auctioneer "...abc" has no Players row: skipped
+        job.Auctions.AddRange(new[] { sold, unsold, unknown });
+
+        await job.Run(Now);
+
+        uint Unix(DateTime d) => (uint)new DateTimeOffset(DateTime.SpecifyKind(d, DateTimeKind.Utc)).ToUnixTimeSeconds();
+        Assert.That(job.Sellers, Is.EquivalentTo(new[] { (55u, Unix(end), sold.UId), (55u, Unix(end.AddHours(1)), unsold.UId) }),
+            "sold and unsold auctions are indexed, an unresolvable auctioneer is skipped");
+    }
+
+    /// <summary>Opted-out or anonymised auctioneers get no seller row even when SellerId is set.</summary>
+    [Test]
+    public async Task OptedOutOrAnonymisedAuctioneerGetsNoSellerRowEvenWithASellerId()
+    {
+        var job = Job(("ARCHIVE:OLDEST_MONTH", "2026-09"));
+        var end = new DateTime(2026, 9, 2, 3, 4, 5);
+        var optedOut = Auction(1, "HYPERION", end);
+        optedOut.AuctioneerId = PlayerOptOut.LegacyPlayerUuids[0];
+        optedOut.SellerId = 55;
+        var anonymised = Auction(1, "HYPERION", end.AddHours(1));
+        anonymised.AuctioneerId = PlayerOptOut.AnonymousUuidPrefix + "7f";
+        anonymised.SellerId = 56;
+        var normal = Auction(1, "HYPERION", end.AddHours(2));
+        normal.SellerId = 57;
+        job.Auctions.AddRange(new[] { optedOut, anonymised, normal });
+
+        await job.Run(Now);
+
+        Assert.That(job.Sellers.Select(s => s.seller), Is.EqualTo(new[] { 57u }));
+    }
+
+    /// <summary>SellerId 0 is not always anonymous (Numberer: duplicate players, old unnumbered rows): the auctioneer uuid is resolved.</summary>
+    [Test]
+    public async Task SellerIdZeroFallsBackToTheAuctioneerUuid_AnonymisedIsSkipped()
+    {
+        var job = Job(("ARCHIVE:OLDEST_MONTH", "2026-09"));
+        var end = new DateTime(2026, 9, 2, 3, 4, 5);
+        var real = Auction(1, "HYPERION", end);
+        real.AuctioneerId = (1234L).ToString("x32");
+        real.SellerId = 0;
+        var anonymised = Auction(1, "HYPERION", end.AddHours(1));
+        anonymised.AuctioneerId = PlayerOptOut.AnonymousUuidPrefix + "7f";
+        anonymised.SellerId = 0;
+        job.Players[real.AuctioneerId] = 66;
+        job.Players[anonymised.AuctioneerId] = 99;
+        job.Auctions.AddRange(new[] { real, anonymised });
+
+        await job.Run(Now);
+
+        Assert.That(job.Sellers.Select(s => (s.seller, s.uid)), Is.EqualTo(new[] { (66u, real.UId) }));
+    }
+
+    [Test]
+    public async Task OptedOutBidderIsNotIndexed()
+    {
+        var job = Job(("ARCHIVE:OLDEST_MONTH", "2026-09"));
+        var auction = Auction(1, "HYPERION", new DateTime(2026, 9, 2, 3, 4, 5), Bid(7, 100), Bid(8, 150));
+        auction.Bids[1].Bidder = PlayerOptOut.LegacyPlayerUuids[0];
+        job.Auctions.Add(auction);
+
+        await job.Run(Now);
+
+        Assert.That(job.Bidders.Keys.Select(k => k.bidder), Is.EqualTo(new[] { 7u }));
+    }
+
+    /// <summary>Key shared with the retention, import and backfill tests: seller 123, auction 77, end 2020-09-02 12:00 UTC.</summary>
+    [Test]
+    public async Task SellerKeyIsIdenticalAcrossWriters()
+    {
+        var job = Job(("ARCHIVE:OLDEST_MONTH", "2020-09"));
+        var a = Auction(1, "HYPERION", new DateTime(2020, 9, 2, 12, 0, 0));
+        a.UId = 77;
+        a.SellerId = 123;
+        job.Auctions.Add(a);
+
+        await job.Run(new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        Assert.That(job.Sellers.Single(), Is.EqualTo((123u, 1599048000u, 77L)));
     }
 
     [Test]
@@ -485,8 +579,8 @@ public class AuctionArchiveJobTests
         Assert.That(sql, Has.Count.EqualTo(2));
         Assert.That(sql[0], Does.StartWith("INSERT INTO auction_locations (uid, tag_id, month, part) VALUES (-5,7,93,1),(-4,7,93,1)"));
         Assert.That(sql[0], Does.EndWith("ON DUPLICATE KEY UPDATE tag_id = VALUES(tag_id), month = VALUES(month), part = VALUES(part)"));
-        var bidders = AuctionArchiveJob.BuildBidderInserts(new[] { new AuctionBidder { BidderId = 3, End = 1700000000, Uid = -9, Amount = 12 } }).Single();
-        Assert.That(bidders, Is.EqualTo("INSERT IGNORE INTO auction_bidders (bidder_id, `end`, uid, amount) VALUES (3,1700000000,-9,12)"));
+        var bidders = AuctionArchiveJob.BuildBidderInserts(new[] { new AuctionBidder { BidderId = 3, End = 1700000000, Uid = -9 } }).Single();
+        Assert.That(bidders, Is.EqualTo("INSERT IGNORE INTO auction_bidders (bidder_id, `end`, uid) VALUES (3,1700000000,-9)"));
     }
 
     [Test]

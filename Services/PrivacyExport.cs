@@ -12,7 +12,10 @@ using System.Text.Json.Serialization;
 using Coflnet.Security.OpenBao;
 using Coflnet.Sky.Core;
 using Microsoft.EntityFrameworkCore;
+using Coflnet.Sky.Core.Archive;
+using Coflnet.Sky.Indexer.Archive;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 
 namespace Coflnet.Sky.Indexer;
 
@@ -264,10 +267,27 @@ internal sealed class PrivacyExport
         transaction.Commit();
         return users.Count;
     }
-    private static void ConfigureDatabase()
+    private static IConfiguration ConfigureDatabase()
     {
         var config = new ConfigurationBuilder().AddJsonFile("appsettings.json", true).AddEnvironmentVariables().AddOpenBaoFromEnvironment().Build();
         HypixelContext.SetConfiguration(config);
+        return config;
+    }
+
+    /// <summary>
+    /// Erases the player from the auction archive (R2 parts and index tables, see <see cref="ArchivePlayerErasure"/>) when
+    /// <c>ARCHIVE:ENABLED</c> and <c>S3:ENABLED</c> are set; null otherwise. Runs before the SQL erasure, which deletes the Players row
+    /// (the id is needed to find the index rows) and is repeatable, so a failed SQL step is simply re-run.
+    /// </summary>
+    internal static ArchiveErasureResult EraseFromArchive(IConfiguration config, string uuid, int playerId)
+    {
+        if (!(bool.TryParse(config["ARCHIVE:ENABLED"], out var archive) && archive) || !(bool.TryParse(config["S3:ENABLED"], out var s3) && s3))
+            return null;
+        ArchiveContext.SetConfiguration(config);
+        using var loggers = LoggerFactory.Create(b => b.AddConsole());
+        var store = new S3AuctionBlobStore(config, loggers.CreateLogger<S3AuctionBlobStore>());
+        var erasure = new ArchivePlayerErasure(store, store, new EfArchiveLocationLookup(() => new ArchiveContext()), loggers.CreateLogger<ArchivePlayerErasure>());
+        return erasure.EraseAsync((uint)playerId, uuid, System.Threading.CancellationToken.None).GetAwaiter().GetResult();
     }
     internal static int Run(string[] args)
     {
@@ -277,13 +297,19 @@ internal sealed class PrivacyExport
             var apply = args[1] == "erase";
             var plan = Read(args[2]);
             var unlinked = 0;
+            ArchiveErasureResult archive = null;
             if (args[1] != "preview")
             {
-                ConfigureDatabase();
+                var config = ConfigureDatabase();
                 using var db = new HypixelContext();
-                unlinked = plan.Execute(db, apply);
+                unlinked = plan.Execute(db, false);   // the complete check (also requires the opt-out) runs before anything is written
+                if (apply)
+                {
+                    archive = EraseFromArchive(config, plan.Uuid, plan.Player.Id);
+                    unlinked = plan.Execute(db, true);
+                }
             }
-            Console.WriteLine($"SQL-only {args[1]}: {plan.Auctions.Count(a => a.SellerId == plan.Player.Id)} owned auctions, {plan.Bids.Count} target bids, {plan.Relations.Count} target relations; archive SHA-256 {plan.Sha256}. {(apply ? $"Players row deleted, {unlinked} user account(s) unlinked (account row and agreement acceptances kept)." : "No changes written.")} Scope: numbered sellers/bidders and relations on known auction IDs only; unnumbered identities and cross-service erasure are outside this command.");
+            Console.WriteLine($"SQL-only {args[1]}: {plan.Auctions.Count(a => a.SellerId == plan.Player.Id)} owned auctions, {plan.Bids.Count} target bids, {plan.Relations.Count} target relations; archive SHA-256 {plan.Sha256}. {(apply ? $"Players row deleted, {unlinked} user account(s) unlinked (account row and agreement acceptances kept)." : "No changes written.")} {(!apply ? "" : archive == null ? "Auction archive not enabled here, untouched. " : $"Auction archive: {archive.PartsRewritten} of {archive.Parts} parts rewritten ({archive.RowsChanged} auctions anonymised), {archive.IndexRowsDeleted} index rows deleted. ")}Scope: numbered sellers/bidders and relations on known auction IDs only; unnumbered identities and cross-service erasure are outside this command.");
             return 0;
         }
         catch (Exception error)

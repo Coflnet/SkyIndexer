@@ -24,6 +24,7 @@ public class ScyllaArchiveImportWorkerTests
         public readonly Dictionary<(ushort tag, ushort month), ArchivedMonth> Months = new();
         public readonly Dictionary<long, (ushort tag, ushort month, byte part)> Locations = new();
         public readonly Dictionary<(uint bidder, uint end, long uid), ulong> Bidders = new();
+        public readonly HashSet<(uint seller, uint end, long uid)> Sellers = new();
         public readonly Dictionary<string, int> Players = new();
         public readonly List<int> BidderChunks = new();
         public readonly List<string> Events;
@@ -55,7 +56,7 @@ public class ScyllaArchiveImportWorkerTests
             return Task.FromResult(found);
         }
 
-        protected override Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, CancellationToken cancellationToken)
+        protected override Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers, CancellationToken cancellationToken)
         {
             Events.Add($"index_rows:{tagId}");
             WriteCalls.Add((locations.ToList(), bidders.Count));
@@ -63,7 +64,9 @@ public class ScyllaArchiveImportWorkerTests
                 if (!Locations.TryGetValue(uid, out var existing) || existing.tag == tagId && existing.month == month)
                     Locations[uid] = (tagId, month, part); // keepOtherTagMonths semantics, see BuildIndexSql test
             foreach (var b in bidders)
-                Bidders.TryAdd((b.BidderId, b.End, b.Uid), b.Amount);
+                Bidders.TryAdd((b.BidderId, b.End, b.Uid), 0ul);
+            foreach (var x in sellers)
+                Sellers.Add((x.SellerId, x.End, x.Uid));
             return Task.CompletedTask;
         }
 
@@ -82,6 +85,10 @@ public class ScyllaArchiveImportWorkerTests
         }
 
         public ArchivedMonth Row(string tag, int month) => Tags.TryGetValue(tag, out var id) && Months.TryGetValue((id, ArchiveMonths.ToIndex(month)), out var r) ? r : null;
+        public bool SchemaReady = true;
+        public int SchemaChecks;
+        protected override Task<bool> SchemaReadyAsync(CancellationToken cancellationToken) { SchemaChecks++; return Task.FromResult(SchemaReady); }
+
         public Task<int> Run() => RunOnceAsync(CancellationToken.None);
     }
 
@@ -180,8 +187,84 @@ public class ScyllaArchiveImportWorkerTests
         Assert.That(worker.Locations[2], Is.EqualTo(((ushort)1, SepIndex, (byte)1)));
         Assert.That(worker.Locations[4], Is.EqualTo((worker.Tags[Terminator], SepIndex, (byte)0)));
         var end2 = (uint)new DateTimeOffset(new DateTime(2020, 9, 2, 12, 0, 0, DateTimeKind.Utc)).ToUnixTimeSeconds();
-        Assert.That(worker.Bidders[(50u, end2, 2)], Is.EqualTo(90ul), "highest amount per bidder and auction");
+        Assert.That(worker.Bidders.ContainsKey((50u, end2, 2)), Is.True, "one row per bidder and auction");
         Assert.That(worker.Months[(0, SepIndex)].ScyllaAt, Is.Not.Null);
+    }
+
+    [Test]
+    public async Task SellerRowsAreWrittenForResolvedAuctioneersOnly()
+    {
+        Scenario();
+        worker.Players[Hex(1002)] = 72; // auctioneer of uid 2
+        worker.Players[Hex(1004)] = 74; // auctioneer of uid 4; uid 3's auctioneer is unknown, uid 1 is a MariaDB part (not imported)
+
+        await worker.Run();
+
+        uint End(int day) => (uint)new DateTimeOffset(new DateTime(2020, 9, day, 12, 0, 0, DateTimeKind.Utc)).ToUnixTimeSeconds();
+        Assert.That(worker.Sellers, Is.EquivalentTo(new[] { (72u, End(2), 2L), (74u, End(4), 4L) }));
+    }
+
+    /// <summary>Key shared with the archive job, retention and backfill tests: seller 123, auction 77, end 2020-09-02 12:00 UTC.</summary>
+    [Test]
+    public async Task SellerKeyIsIdenticalAcrossWriters()
+    {
+        var sha = WriteBlock(Terminator, 0, ArchivedAuctionBlock.SourceScylla, Auction(77, 2, Terminator));
+        await store.WriteIndexAsync(new ArchivedTagIndex { Tag = Terminator }.Upsert(new ArchivedMonthEntry { Month = Sep, Parts = 1, Rows = 1, PartSha256 = new() { sha }, Source = ArchivedAuctionBlock.SourceScylla }));
+        await store.WriteMetaAsync(AuctionBlobKeys.ScyllaManifest(Sep), new ScyllaMonthManifest { Month = Sep, CompletedAt = Now }
+            .Upsert(new ScyllaTagImport { Tag = Terminator, FirstNewPart = 0, NewParts = 1, NewRows = 1, NewPartSha256 = new() { sha } }));
+        worker.Months[(0, SepIndex)] = new ArchivedMonth { TagId = 0, Month = SepIndex, Source = "mariadb", Sha256 = new string('0', 64) };
+        worker.Players[Hex(1077)] = 123;
+
+        await worker.Run();
+
+        Assert.That(worker.Sellers.Single(), Is.EqualTo((123u, 1599048000u, 77L)));
+    }
+
+    [Test]
+    public async Task OptedOutAndAnonymisedBiddersAreNotIndexed_ParityWithSellers()
+    {
+        var a = Auction(100, 1, Terminator, (700, 5), (701, 6), (702, 7));
+        a.Bids[1].Bidder = PlayerOptOut.LegacyPlayerUuids[0];
+        a.Bids[2].Bidder = PlayerOptOut.AnonymousUuidPrefix + "7f";
+        var sha = WriteBlock(Terminator, 0, ArchivedAuctionBlock.SourceScylla, a);
+        await store.WriteIndexAsync(new ArchivedTagIndex { Tag = Terminator }.Upsert(new ArchivedMonthEntry { Month = Sep, Parts = 1, Rows = 1, PartSha256 = new() { sha }, Source = ArchivedAuctionBlock.SourceScylla }));
+        await store.WriteMetaAsync(AuctionBlobKeys.ScyllaManifest(Sep), new ScyllaMonthManifest { Month = Sep, CompletedAt = Now }
+            .Upsert(new ScyllaTagImport { Tag = Terminator, FirstNewPart = 0, NewParts = 1, NewRows = 1, NewPartSha256 = new() { sha } }));
+        worker.Months[(0, SepIndex)] = new ArchivedMonth { TagId = 0, Month = SepIndex, Source = "mariadb", Sha256 = new string('0', 64) };
+        worker.Players[Hex(700)] = 70;
+        worker.Players[PlayerOptOut.LegacyPlayerUuids[0]] = 71;
+        worker.Players[PlayerOptOut.AnonymousUuidPrefix + "7f"] = 72;
+
+        await worker.Run();
+
+        Assert.That(worker.Bidders.Keys.Select(k => k.bidder), Is.EqualTo(new[] { 70u }));
+    }
+
+    [Test]
+    public async Task AnonymisedAndOptedOutAuctioneersAreNotIndexed()
+    {
+        var anonymous = Auction(100, 1, Terminator);
+        anonymous.AuctioneerId = Hex(0);
+        var prefixed = Auction(102, 3, Terminator);
+        prefixed.AuctioneerId = PlayerOptOut.AnonymousUuidPrefix + "7f";
+        var optedOut = Auction(103, 4, Terminator);
+        optedOut.AuctioneerId = PlayerOptOut.LegacyPlayerUuids[0];
+        var named = Auction(101, 2, Terminator);
+        var sha = WriteBlock(Terminator, 0, ArchivedAuctionBlock.SourceScylla, anonymous, named, prefixed, optedOut);
+        await store.WriteIndexAsync(new ArchivedTagIndex { Tag = Terminator }.Upsert(new ArchivedMonthEntry { Month = Sep, Parts = 1, Rows = 4, PartSha256 = new() { sha }, Source = ArchivedAuctionBlock.SourceScylla }));
+        await store.WriteMetaAsync(AuctionBlobKeys.ScyllaManifest(Sep), new ScyllaMonthManifest { Month = Sep, CompletedAt = Now }
+            .Upsert(new ScyllaTagImport { Tag = Terminator, FirstNewPart = 0, NewParts = 1, NewRows = 4, NewPartSha256 = new() { sha } }));
+        worker.Months[(0, SepIndex)] = new ArchivedMonth { TagId = 0, Month = SepIndex, Source = "mariadb", Sha256 = new string('0', 64) };
+        // even if Players rows existed for the identities that must never be indexed
+        worker.Players[Hex(0)] = 99;
+        worker.Players[prefixed.AuctioneerId] = 98;
+        worker.Players[optedOut.AuctioneerId] = 97;
+        worker.Players[Hex(1101)] = 81;
+
+        await worker.Run();
+
+        Assert.That(worker.Sellers.Select(x => x.seller), Is.EqualTo(new[] { 81u }));
+        Assert.That(worker.Sellers.Single().uid, Is.EqualTo(101));
     }
 
     [Test]
@@ -199,6 +282,26 @@ public class ScyllaArchiveImportWorkerTests
         Assert.That(worker.Locations.ContainsKey(2), Is.False);
         Assert.That(worker.Months[(0, SepIndex)].ScyllaAt, Is.Null);
         Assert.That(log.Entries.Any(e => e.level == Microsoft.Extensions.Logging.LogLevel.Error && e.message.Contains("tag index entry does not end with the manifest's part hashes")), Is.True);
+    }
+
+    [Test]
+    public async Task PendingSchemaMigrations_SkipThePollWithoutWritesOrErrors_ThenProceedAndCacheReadiness()
+    {
+        Scenario();
+        events.Clear();
+        worker.SchemaReady = false;
+
+        Assert.That(await worker.Run(), Is.Zero);
+        Assert.That(events, Is.Empty, "no manifest import, index write or archived_months write while a migration is pending");
+        Assert.That(worker.WriteCalls, Is.Empty);
+        Assert.That(worker.Months[(0, SepIndex)].ScyllaAt, Is.Null);
+
+        worker.SchemaReady = true;
+        Assert.That(await worker.Run(), Is.EqualTo(1));
+        Assert.That(worker.WriteCalls, Is.Not.Empty);
+        var checks = worker.SchemaChecks;
+        await worker.Run();
+        Assert.That(worker.SchemaChecks, Is.EqualTo(checks), "a positive result is cached");
     }
 
     [Test]
@@ -287,7 +390,7 @@ public class ScyllaArchiveImportWorkerTests
         await worker.Run();
 
         Assert.That(worker.BidderChunks, Has.All.LessThanOrEqualTo(100));
-        Assert.That(worker.BidderChunks.Sum(), Is.EqualTo(250));
+        Assert.That(worker.BidderChunks.Sum(), Is.EqualTo(500), "250 bidders and 250 auctioneers share one lookup per part");
         Assert.That(worker.Bidders, Has.Count.EqualTo(200));
         Assert.That(worker.Row(Terminator, Sep).Note, Does.Contain("50 bids without bidder"));
     }
@@ -375,9 +478,10 @@ public class ScyllaArchiveImportWorkerTests
     [Test]
     public void IndexSqlNeverMovesALocationOfAnotherTagMonth()
     {
-        var sql = ScyllaArchiveImportWorker.BuildIndexSql(3, SepIndex, new[] { (7L, (byte)1) }, new[] { new AuctionBidder { BidderId = 1, End = 2, Uid = 7, Amount = 9 } }).ToList();
+        var sql = ScyllaArchiveImportWorker.BuildIndexSql(3, SepIndex, new[] { (7L, (byte)1) }, new[] { new AuctionBidder { BidderId = 1, End = 2, Uid = 7 } }, new[] { new AuctionSeller { SellerId = 4, End = 2, Uid = 7 } }).ToList();
         Assert.That(sql[0], Does.EndWith("ON DUPLICATE KEY UPDATE part = IF(tag_id = VALUES(tag_id) AND month = VALUES(month), VALUES(part), part)"));
         Assert.That(sql[1], Does.StartWith("INSERT IGNORE INTO auction_bidders"));
+        Assert.That(sql[2], Is.EqualTo("INSERT IGNORE INTO auction_sellers (seller_id, `end`, uid) VALUES (4,2,7)"));
     }
 
     [Test]

@@ -1,7 +1,7 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /build
 RUN echo "new revision "
-ARG CACHEBUST=20261027
+ARG CACHEBUST=2026102702
 RUN git clone --depth=1 https://github.com/Coflnet/HypixelSkyblock.git dev
 WORKDIR /build/sky
 COPY SkyIndexer.csproj SkyIndexer.csproj

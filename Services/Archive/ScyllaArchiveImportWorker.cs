@@ -21,7 +21,7 @@ namespace Coflnet.Sky.Indexer.Archive
     /// month sentinel exists without <c>scylla_at</c>, and each tag entry whose <c>archived_months</c> row has no <c>scylla_at</c>:
     /// the new parts are read uncached, one at a time, in two passes. Pass 1 verifies that every SHA-256 equals the manifest's
     /// (and the tag index ends with them) and that the row count matches, writing nothing. Pass 2 re-reads and re-verifies each part
-    /// and writes its <c>auction_locations</c> (never moving another tag-month's location) and <c>auction_bidders</c>, so memory is
+    /// and writes its <c>auction_locations</c> (never moving another tag-month's location), <c>auction_bidders</c> and <c>auction_sellers</c>, so memory is
     /// bounded by one part; then the <c>archived_months</c> row is upserted with the merged totals and <c>scylla_at</c> (written last). When the manifest is
     /// completed and every entry is imported, the sentinel gets <c>scylla_at</c>, which lets the sweep start the next month.
     /// Idempotent: a re-run skips imported tags; an interrupted tag is imported again (upserted locations, INSERT IGNORE bidders).
@@ -29,7 +29,7 @@ namespace Coflnet.Sky.Indexer.Archive
     public class ScyllaArchiveImportWorker : BackgroundService
     {
         /// <summary>Uuids per <c>Players</c> lookup; MariaDB stops index dives at 200 IN values (phase 1 outage), stay well below.</summary>
-        internal const int BidderLookupChunkSize = 100;
+        internal const int BidderLookupChunkSize = PlayerIdLookup.ChunkSize;
         /// <summary>Note column width of <c>archived_months</c>.</summary>
         internal const int NoteMaxLength = 255;
         /// <summary>Start of the import part of a note.</summary>
@@ -46,6 +46,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private static readonly Prometheus.Counter hashMismatches = Prometheus.Metrics.CreateCounter("sky_indexer_scylla_import_hash_mismatches", "Scylla parts or tag index entries that did not match the manifest (tag skipped, nothing written)");
         private static readonly Prometheus.Counter indexRowsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_scylla_import_index_rows", "auction_locations rows written for Scylla parts");
         private static readonly Prometheus.Counter bidderRowsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_scylla_import_bidder_rows", "auction_bidders rows written for Scylla parts");
+        private static readonly Prometheus.Counter sellerRowsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_scylla_import_seller_rows", "auction_sellers rows written for Scylla parts");
         private static readonly Prometheus.Counter bidsWithoutBidder = Prometheus.Metrics.CreateCounter("sky_indexer_scylla_import_bids_without_bidder", "Bids of Scylla parts not indexed (empty/anonymous bidder or no Players row)");
         private static readonly Prometheus.Counter monthsCompleted = Prometheus.Metrics.CreateCounter("sky_indexer_scylla_import_months_completed", "Month sentinels that got scylla_at");
         private static readonly Prometheus.Counter errors = Prometheus.Metrics.CreateCounter("sky_indexer_scylla_import_errors", "Scylla import errors (failed tags, failed passes)");
@@ -107,10 +108,39 @@ namespace Coflnet.Sky.Indexer.Archive
             }
         }
 
+        private bool schemaReady;
+        private bool loggedSchemaWait;
+
+        /// <summary>True when the archive database has no pending EF migrations. Logs once per wait. A positive result is cached by the caller.</summary>
+        protected virtual async Task<bool> SchemaReadyAsync(CancellationToken cancellationToken)
+        {
+            using var db = new ArchiveContext();
+            var pending = (await db.Database.GetPendingMigrationsAsync(cancellationToken).ConfigureAwait(false)).ToList();
+            if (pending.Count == 0)
+            {
+                loggedSchemaWait = false;
+                return true;
+            }
+            if (!loggedSchemaWait)
+            {
+                loggedSchemaWait = true;
+                logger.LogInformation("Scylla import waits for archive schema migrations: {Pending}", string.Join(", ", pending));
+            }
+            return false;
+        }
+
         /// <summary>One pass over every manifest; returns the number of month sentinels that got <c>scylla_at</c>.</summary>
         internal async Task<int> RunOnceAsync(CancellationToken cancellationToken)
         {
             var completed = 0;
+            if (!schemaReady)
+            {
+                // The archive migrations (index table rebuilds) are applied by AuctionArchiveJob after its start delay; writing the
+                // new index rows against the old schema would fail. Not an error: skip the poll.
+                if (!await SchemaReadyAsync(cancellationToken).ConfigureAwait(false))
+                    return 0;
+                schemaReady = true;
+            }
             var keys = await meta.ListMetaKeysAsync(AuctionBlobKeys.ScyllaManifestPrefix, cancellationToken).ConfigureAwait(false);
             foreach (var key in keys)
             {
@@ -233,14 +263,17 @@ namespace Coflnet.Sky.Indexer.Archive
                     return Reject($"part {part} hashes to {sha}, the manifest says {newHashes[i]}", hashMismatch: true);
                 var locations = new List<(long uid, byte part)>();
                 var bids = new Dictionary<(string bidder, long uid), (uint end, ulong amount)>();
+                var sells = new Dictionary<(string seller, long uid), uint>();
                 long partWithoutBidder = 0;
                 foreach (var auction in block.ToAuctions())
                 {
                     locations.Add((auction.UId, (byte)part));
                     var end = (uint)new DateTimeOffset(DateTime.SpecifyKind(auction.End, DateTimeKind.Utc)).ToUnixTimeSeconds();
+                    if (IsIndexableSeller(auction.AuctioneerId))
+                        sells[(auction.AuctioneerId, auction.UId)] = end;
                     foreach (var bid in auction.Bids)
                     {
-                        if (bid.Amount < 0 || !IsPlayerUuid(bid.Bidder))
+                        if (bid.Amount < 0 || !IsIndexablePlayer(bid.Bidder))
                         {
                             partWithoutBidder++;
                             continue;
@@ -250,11 +283,14 @@ namespace Coflnet.Sky.Indexer.Archive
                             bids[key] = (end, (ulong)bid.Amount);
                     }
                 }
-                var bidders = await ResolveBiddersAsync(bids, cancellationToken).ConfigureAwait(false);
+                var ids = await PlayerIdLookup.ResolveAsync(bids.Keys.Select(k => k.bidder).Concat(sells.Keys.Select(k => k.seller)), ResolveBidderIdsAsync, cancellationToken).ConfigureAwait(false);
+                var bidders = ResolveBidders(bids, ids);
+                var sellers = ResolveSellers(sells, ids);
                 partWithoutBidder += bids.Count - bidders.Count;
-                await WriteIndexRowsAsync(tagId, monthIndex, locations, bidders, cancellationToken).ConfigureAwait(false);
+                await WriteIndexRowsAsync(tagId, monthIndex, locations, bidders, sellers, cancellationToken).ConfigureAwait(false);
                 indexRowsWritten.Inc(locations.Count);
                 bidderRowsWritten.Inc(bidders.Count);
+                sellerRowsWritten.Inc(sellers.Count);
                 locationCount += locations.Count;
                 bidderCount += bidders.Count;
                 withoutBidder += partWithoutBidder;
@@ -288,6 +324,17 @@ namespace Coflnet.Sky.Indexer.Archive
             return true;
         }
 
+        /// <summary>
+        /// A seller worth an index row: a player uuid (<see cref="IsPlayerUuid"/>) that is neither an anonymised identity (the
+        /// <see cref="PlayerOptOut.AnonymousUuidPrefix"/> scheme) nor an opted-out player. Opted-out sellers are normally already masked in the
+        /// stored auctions; this is the second line of defence.
+        /// </summary>
+        internal static bool IsIndexableSeller(string uuid) => IsIndexablePlayer(uuid);
+
+        /// <summary>Same rule for bidders and sellers: a real player uuid, not anonymised (<see cref="PlayerOptOut.AnonymousUuidPrefix"/>), not opted out.</summary>
+        internal static bool IsIndexablePlayer(string uuid)
+            => IsPlayerUuid(uuid) && !PlayerOptOut.IsAnonymousUuid(uuid) && !PlayerOptOut.IsOptedOut(uuid);
+
         /// <summary>32-char lowercase hex, not all zeros (anonymised bids carry the empty uuid).</summary>
         internal static bool IsPlayerUuid(string uuid)
         {
@@ -303,21 +350,23 @@ namespace Coflnet.Sky.Indexer.Archive
             return nonZero;
         }
 
-        /// <summary><c>auction_bidders</c> rows: bidder uuids resolved to <c>Players.Id</c> in chunks of at most <see cref="BidderLookupChunkSize"/>; unknown players are left out.</summary>
-        private async Task<List<AuctionBidder>> ResolveBiddersAsync(Dictionary<(string bidder, long uid), (uint end, ulong amount)> bids, CancellationToken cancellationToken)
+        /// <summary><c>auction_bidders</c> rows of the resolved bids; unknown players are left out.</summary>
+        internal static List<AuctionBidder> ResolveBidders(Dictionary<(string bidder, long uid), (uint end, ulong amount)> bids, IReadOnlyDictionary<string, int> ids)
         {
-            var uuids = bids.Keys.Select(k => k.bidder).Distinct(StringComparer.Ordinal).OrderBy(u => u, StringComparer.Ordinal).ToList();
-            var ids = new Dictionary<string, int>(StringComparer.Ordinal);
-            for (var offset = 0; offset < uuids.Count; offset += BidderLookupChunkSize)
-            {
-                var chunk = uuids.GetRange(offset, Math.Min(BidderLookupChunkSize, uuids.Count - offset));
-                foreach (var (uuid, id) in await ResolveBidderIdsAsync(chunk, cancellationToken).ConfigureAwait(false))
-                    ids[uuid] = id;
-            }
             var result = new List<AuctionBidder>(bids.Count);
-            foreach (var ((bidder, uid), (end, amount)) in bids)
+            foreach (var ((bidder, uid), (end, _)) in bids)
                 if (ids.TryGetValue(bidder, out var id) && id > 0)
-                    result.Add(new AuctionBidder { BidderId = (uint)id, Uid = uid, End = end, Amount = amount });
+                    result.Add(new AuctionBidder { BidderId = (uint)id, Uid = uid, End = end });
+            return result;
+        }
+
+        /// <summary><c>auction_sellers</c> rows of the resolved auctioneers (same rules as the bidders: unknown or anonymous players are left out).</summary>
+        internal static List<AuctionSeller> ResolveSellers(Dictionary<(string seller, long uid), uint> sells, IReadOnlyDictionary<string, int> ids)
+        {
+            var result = new List<AuctionSeller>(sells.Count);
+            foreach (var ((seller, uid), end) in sells)
+                if (ids.TryGetValue(seller, out var id) && id > 0)
+                    result.Add(new AuctionSeller { SellerId = (uint)id, Uid = uid, End = end });
             return result;
         }
 
@@ -345,9 +394,10 @@ namespace Coflnet.Sky.Indexer.Archive
             return (kept.Length > room ? kept[..room] : kept) + separator + note;
         }
 
-        /// <summary>The SQL of the index rows: locations never move an auction archived in another tag-month, bidders are INSERT IGNORE.</summary>
-        internal static IEnumerable<string> BuildIndexSql(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders)
-            => ArchiveIndexSql.BuildLocationInserts(tagId, month, locations, keepOtherTagMonths: true).Concat(ArchiveIndexSql.BuildBidderInserts(bidders));
+        /// <summary>The SQL of the index rows: locations never move an auction archived in another tag-month, bidders and sellers are INSERT IGNORE.</summary>
+        internal static IEnumerable<string> BuildIndexSql(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers = null)
+            => ArchiveIndexSql.BuildLocationInserts(tagId, month, locations, keepOtherTagMonths: true).Concat(ArchiveIndexSql.BuildBidderInserts(bidders))
+                .Concat(ArchiveIndexSql.BuildSellerInserts(sellers ?? Array.Empty<AuctionSeller>()));
 
         // ---------------------------------------------------------------- data access seams
 
@@ -399,22 +449,14 @@ namespace Coflnet.Sky.Indexer.Archive
         }
 
         /// <summary><c>Players.Id</c> of up to <see cref="BidderLookupChunkSize"/> uuids (32-char hex, primary key lookups); unknown uuids are absent.</summary>
-        protected virtual async Task<IReadOnlyDictionary<string, int>> ResolveBidderIdsAsync(IReadOnlyList<string> uuids, CancellationToken cancellationToken)
-        {
-            using var db = new HypixelContext();
-            var list = uuids.ToList();
-            var rows = await db.Players.AsNoTracking().Where(p => list.Contains(p.UuId)).Select(p => new { p.UuId, p.Id }).ToListAsync(cancellationToken).ConfigureAwait(false);
-            var result = new Dictionary<string, int>(StringComparer.Ordinal);
-            foreach (var r in rows)
-                result[r.UuId] = r.Id;
-            return result;
-        }
+        protected virtual Task<IReadOnlyDictionary<string, int>> ResolveBidderIdsAsync(IReadOnlyList<string> uuids, CancellationToken cancellationToken)
+            => PlayerIdLookup.QueryPlayersAsync(uuids, cancellationToken);
 
         /// <summary>Write the index rows (<see cref="BuildIndexSql"/>, idempotent).</summary>
-        protected virtual async Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, CancellationToken cancellationToken)
+        protected virtual async Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers, CancellationToken cancellationToken)
         {
             using var db = new ArchiveContext();
-            foreach (var sql in BuildIndexSql(tagId, month, locations, bidders))
+            foreach (var sql in BuildIndexSql(tagId, month, locations, bidders, sellers))
                 await db.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
         }
 

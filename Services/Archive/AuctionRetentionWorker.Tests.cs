@@ -33,8 +33,27 @@ public class AuctionRetentionWorkerTests
         public readonly List<List<DeleteStatement>> Executed = new();
         public readonly List<(int month, long total, bool completed)> Recorded = new();
         public int DeletedToday;
+        /// <summary>Seller rows committed so far and the order of seller inserts versus deletes.</summary>
+        public readonly HashSet<(uint seller, uint end, long uid)> Sellers = new();
+        public readonly List<string> Order = new();
+        public Exception SellerFailure;
+        public readonly Dictionary<string, int> Players = new();
 
-        public TestableRetentionWorker(IConfiguration config) : base(config, NullLogger<AuctionRetentionWorker>.Instance) { }
+        public readonly InMemoryAuctionBlobStore Store;
+        public readonly Dictionary<int, List<RetentionTagParts>> MonthParts = new();
+        public readonly HashSet<int> SellerPassDone = new();
+
+        public TestableRetentionWorker(InMemoryAuctionBlobStore store, IConfiguration config) : base(store, config, NullLogger<AuctionRetentionWorker>.Instance) => Store = store;
+
+        protected override Task<IReadOnlyList<RetentionTagParts>> GetMonthPartsAsync(int month, CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<RetentionTagParts>>(MonthParts.GetValueOrDefault(month) ?? new List<RetentionTagParts>());
+        protected override Task<bool> IsSellerPassDoneAsync(int month, CancellationToken cancellationToken) => Task.FromResult(SellerPassDone.Contains(month));
+        protected override Task MarkSellerBackfillDoneAsync(int month, CancellationToken cancellationToken)
+        {
+            Order.Add("marker:" + month);
+            SellerPassDone.Add(month);
+            return Task.CompletedTask;
+        }
 
         protected override Task<int> CountMonthsDeletedSinceAsync(DateTime sinceUtc, CancellationToken cancellationToken) => Task.FromResult(DeletedToday);
 
@@ -50,8 +69,22 @@ public class AuctionRetentionWorkerTests
         protected override Task<int> CountLocatedUidsAsync(ushort monthIndex, IReadOnlyList<long> uids, CancellationToken cancellationToken)
             => Task.FromResult(uids.Count(u => Locations.Contains((monthIndex, u))));
 
+        protected override Task<IReadOnlyDictionary<string, int>> ResolvePlayerIdsAsync(IReadOnlyList<string> uuids, CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyDictionary<string, int>>(uuids.Where(Players.ContainsKey).ToDictionary(u => u, u => Players[u]));
+
+        protected override Task WriteSellerRowsAsync(IReadOnlyList<AuctionSeller> sellers, CancellationToken cancellationToken)
+        {
+            Order.Add("sellers:" + sellers.Count);
+            if (SellerFailure != null)
+                throw SellerFailure;
+            foreach (var x in sellers)
+                Sellers.Add((x.SellerId, x.End, x.Uid));
+            return Task.CompletedTask;
+        }
+
         protected override Task<Dictionary<string, long>> ExecuteDeleteAsync(IReadOnlyList<DeleteStatement> statements, CancellationToken cancellationToken)
         {
+            Order.Add("delete");
             Executed.Add(statements.ToList());
             var counts = new Dictionary<string, long>();
             foreach (var s in statements)
@@ -99,7 +132,7 @@ public class AuctionRetentionWorkerTests
     {
         var all = new List<(string, string)> { ("ARCHIVE:DELETE_MARIADB", "true"), ("ARCHIVE:OLDEST_MONTH", "2023-01") };
         all.AddRange(config);
-        return new TestableRetentionWorker(ArchiveTestConfig.Build(all.ToArray()));
+        return new TestableRetentionWorker(new InMemoryAuctionBlobStore(), ArchiveTestConfig.Build(all.ToArray()));
     }
 
     /// <summary>Adds an archived (sentinel + verified tag row), fully indexed month with <paramref name="rows"/> auctions and their children.</summary>
@@ -112,7 +145,7 @@ public class AuctionRetentionWorkerTests
         {
             var id = nextId++;
             var nbt = sharedNbt ?? 10_000 + id;
-            var row = new DeleteCandidate(id, 500_000 + id, ItemTag, start.AddHours(i), nbt);
+            var row = new DeleteCandidate(id, 500_000 + id, ItemTag, start.AddHours(i), nbt, i % 3 == 2 ? 0 : 7_000 + i % 2, (2_000 + id).ToString("x32"));
             added.Add(row);
             w.Auctions.Add(row);
             w.NbtData.Add(nbt);
@@ -131,6 +164,226 @@ public class AuctionRetentionWorkerTests
         };
         w.VerifiedTags[month] = new Dictionary<string, ushort> { [ItemTag] = Tag };
         return added;
+    }
+
+    [Test]
+    public async Task InsertsTheSellerRowsOfEveryBatchBeforeDeletingIt()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "3"));
+        var rows = AddArchivedMonth(w, OldMonth, 7);
+        var expected = rows.Where(r => r.SellerId > 0)
+            .Select(r => ((uint)r.SellerId, (uint)new DateTimeOffset(DateTime.SpecifyKind(r.End, DateTimeKind.Utc)).ToUnixTimeSeconds(), r.UId)).ToList();
+
+        Assert.That(await w.Run(), Is.EqualTo(1));
+
+        Assert.That(w.Auctions, Is.Empty);
+        Assert.That(w.Order.Where(o => !o.StartsWith("marker")), Is.EqualTo(new[] { "sellers:2", "delete", "sellers:2", "delete", "sellers:1", "delete" }), "7 rows in batches of 3; auctions without a seller id have no row");
+        Assert.That(w.Sellers, Is.EquivalentTo(expected));
+        Assert.That(expected, Has.Count.EqualTo(5));
+    }
+
+    [Test]
+    public async Task DoesNotDeleteABatchWhoseSellerInsertFailed()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "3"));
+        AddArchivedMonth(w, OldMonth, 7);
+        w.SellerFailure = new InvalidOperationException("table auction_sellers does not exist");
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty, "nothing deleted");
+        Assert.That(w.Auctions, Has.Count.EqualTo(7));
+        Assert.That(w.Recorded.Single().completed, Is.False);
+        Assert.That(w.MonthRows[OldMonth].All(r => r.DeletedAt == null), Is.True, "the month stays open");
+    }
+
+    [Test]
+    public void SellerRowsSkipUnknownOptedOutAndAnonymisedSellersAndUseUnixEnd()
+    {
+        var end = new DateTime(2020, 9, 2, 12, 0, 0, DateTimeKind.Unspecified);
+        var rows = AuctionRetentionWorker.BuildSellerRows(new[]
+        {
+            new DeleteCandidate(1, 77, ItemTag, end, null, 123, (3000L).ToString("x32")),
+            new DeleteCandidate(2, 12, ItemTag, end, null, 0),
+            new DeleteCandidate(3, 13, ItemTag, end, null, 124, PlayerOptOut.LegacyPlayerUuids[0]),
+            new DeleteCandidate(4, 14, ItemTag, end, null, 125, PlayerOptOut.AnonymousUuidPrefix + "7f"),
+        });
+        var row = rows.Single();
+        Assert.That((row.SellerId, row.End, row.Uid), Is.EqualTo((123u, 1599048000u, 77L)), "same key as the archive job, import and backfill tests");
+    }
+
+    /// <summary>SellerId 0 is not always anonymous: resolved auctioneers get a row before the delete; anonymised and unresolved uuids none (documented: unresolved means no Players row, like bidders).</summary>
+    [Test]
+    public async Task SellerIdZeroFallsBackToTheAuctioneerUuidBeforeTheDelete()
+    {
+        var w = Worker();
+        var rows = AddArchivedMonth(w, OldMonth, 3);
+        string Uuid(int n) => n == 0 ? PlayerOptOut.AnonymousUuidPrefix + "7f" : (n + 1000).ToString("x32");
+        w.Auctions[0] = rows[0] with { SellerId = 0, AuctioneerId = Uuid(11) };   // resolvable
+        w.Auctions[1] = rows[1] with { SellerId = 0, AuctioneerId = Uuid(0) };    // anonymised
+        w.Auctions[2] = rows[2] with { SellerId = 0, AuctioneerId = Uuid(13) };   // no Players row
+        w.Players[Uuid(11)] = 4711;
+        w.Players[Uuid(0)] = 99;
+
+        await w.Run();
+
+        Assert.That(w.Sellers.Select(s => (s.seller, s.uid)), Is.EqualTo(new[] { (4711u, rows[0].UId) }));
+        Assert.That(w.Order.Where(o => !o.StartsWith("marker")), Is.EqualTo(new[] { "sellers:1", "delete" }));
+        Assert.That(w.Auctions, Is.Empty);
+    }
+
+    // ------------------------------------------------------------ seller pass over the archived parts (one decode: verification + seller rows)
+
+    private static string PassUuid(int n) => (n + 5000).ToString("x32");
+
+    private static SaveAuction PassAuction(long uid, int day, int seller) => new()
+    {
+        Uuid = uid.ToString("x32"),
+        UId = uid,
+        Tag = ItemTag,
+        End = new DateTime(2023, 1, day, 12, 0, 0, DateTimeKind.Utc),
+        Start = new DateTime(2023, 1, day, 0, 0, 0, DateTimeKind.Utc),
+        AuctioneerId = PassUuid(seller),
+        NbtData = new NbtData { data = new byte[] { 10, 0, (byte)uid } },
+        Bids = new List<SaveBids>(),
+        Enchantments = new List<Enchantment>(),
+        NBTLookup = new List<NBTLookup>(),
+    };
+
+    /// <summary>Writes the parts (part 0 phase 1, further parts Scylla) to the store and tag index, registers them as the month's parts; returns the part hashes.</summary>
+    private static List<string> ArchiveParts(TestableRetentionWorker w, int month, params SaveAuction[][] parts)
+    {
+        var hashes = new List<string>();
+        for (var i = 0; i < parts.Length; i++)
+        {
+            var block = ArchivedAuctionBlock.FromAuctions(ItemTag, month, i, i == 0 ? ArchivedAuctionBlock.SourceMariaDb : ArchivedAuctionBlock.SourceScylla, parts[i]);
+            w.Store.WriteBlockAsync(block).Wait();
+            hashes.Add(block.Sha256());
+        }
+        w.Store.WriteIndexAsync(new ArchivedTagIndex { Tag = ItemTag }.Upsert(new ArchivedMonthEntry
+        {
+            Month = month, Parts = parts.Length, Rows = parts.Sum(p => p.Length), PartSha256 = hashes, Source = ArchivedAuctionBlock.SourceMerged,
+        })).Wait();
+        w.MonthParts[month] = new List<RetentionTagParts> { new(ItemTag, parts.Length, ArchivedAuctionBlock.CombinedSha256(hashes)) };
+        w.Store.Events.Clear();
+        return hashes;
+    }
+
+    [Test]
+    public async Task ReadsEveryPartOnceAndWritesSellerRowsOfAllPartsBeforeTheFirstDelete()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 2);
+        // part 0 = the MariaDB auctions, part 1 = Scylla-only auctions that have no MariaDB row
+        ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1), PassAuction(2, 2, 2) }, new[] { PassAuction(3, 3, 3), PassAuction(4, 4, 99) });
+        foreach (var n in new[] { 1, 2, 3 })
+            w.Players[PassUuid(n)] = 100 + n;   // 99 has no Players row
+
+        await w.Run();
+
+        Assert.That(w.Store.Events.Where(e => e.StartsWith("read:")), Is.EqualTo(new[] { $"read:{ItemTag}:{OldMonth}:0:uncached", $"read:{ItemTag}:{OldMonth}:1:uncached" }),
+            "each part is decoded exactly once, for the verification and the seller rows");
+        Assert.That(w.Sellers.Select(x => x.uid), Is.SupersetOf(new[] { 1L, 2L, 3L }).And.No.Member(4L), "includes the Scylla-only part (uid 3); the unresolved seller 99 (uid 4) is skipped");
+        Assert.That(w.Sellers.Select(x => x.seller), Does.Contain(103u));
+        var firstDelete = w.Order.IndexOf("delete");
+        Assert.That(w.Order.Take(firstDelete).Count(o => o == "sellers:2" || o == "sellers:1"), Is.GreaterThanOrEqualTo(2), "both parts' seller rows are written first");
+        Assert.That(w.Order.IndexOf("marker:" + OldMonth), Is.LessThan(firstDelete).And.GreaterThan(-1), "marker after the pass, before any delete");
+        Assert.That(w.SellerPassDone, Does.Contain(OldMonth));
+    }
+
+    [Test]
+    public async Task ScyllaOnlyMonthWithoutMariaDbRowsIsStillPassedOnce()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 0);
+        ArchiveParts(w, OldMonth, new[] { PassAuction(7, 5, 7) });
+        w.Players[PassUuid(7)] = 107;
+
+        await w.Run();
+
+        Assert.That(w.Sellers.Select(x => (x.seller, x.uid)), Is.EqualTo(new[] { (107u, 7L) }));
+        Assert.That(w.SellerPassDone, Does.Contain(OldMonth));
+        Assert.That(w.Recorded.Single(), Is.EqualTo((OldMonth, 0L, true)), "the month is completed although it had no MariaDB rows");
+        w.Store.Events.Clear();
+        await w.Run();
+        Assert.That(w.Store.Events.Any(e => e.StartsWith("read:")), Is.False, "a finished month is not read again");
+    }
+
+    /// <summary>Key shared with the archive job, import and retention batch tests: seller 123, auction 77, end 2020-09-02 12:00 UTC.</summary>
+    [Test]
+    public async Task SellerKeyOfTheDecodedPartIsIdenticalToTheOtherWriters()
+    {
+        var w = Worker();
+        var auction = PassAuction(77, 2, 1);
+        auction.End = new DateTime(2020, 9, 2, 12, 0, 0, DateTimeKind.Utc);
+        auction.Start = new DateTime(2020, 9, 2, 0, 0, 0, DateTimeKind.Utc);
+        w.Players[auction.AuctioneerId] = 123;
+        var block = ArchivedAuctionBlock.FromAuctions(ItemTag, 202009, 0, ArchivedAuctionBlock.SourceScylla, new[] { auction });
+
+        var row = (await w.BuildSellerRowsOfBlockAsync(block, CancellationToken.None)).Single();
+
+        Assert.That((row.SellerId, row.End, row.Uid), Is.EqualTo((123u, 1599048000u, 77L)));
+    }
+
+    [Test]
+    public async Task MonthWithMarkerIsNotReadAgain_ButStillDeleted()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 2);
+        ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) });
+        w.SellerPassDone.Add(OldMonth);   // the pass already ran for this month
+
+        Assert.That(await w.Run(), Is.EqualTo(1));
+
+        Assert.That(w.Store.Events.Any(e => e.StartsWith("read:")), Is.False);
+        Assert.That(w.Auctions, Is.Empty);
+    }
+
+    [TestCase("hash")]
+    [TestCase("missing part")]
+    [TestCase("combined")]
+    public async Task AbortsWithoutDeletingWhenAPartDoesNotVerify(string defect)
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 2);
+        var hashes = ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) }, new[] { PassAuction(3, 3, 3) });
+        w.Players[PassUuid(1)] = 101;
+        switch (defect)
+        {
+            case "hash":
+                var index = await w.Store.ReadIndexAsync(ItemTag);
+                index.Find(OldMonth).PartSha256[1] = new string('a', 64);
+                await w.Store.WriteIndexAsync(index);
+                break;
+            case "missing part":
+                w.Store.Objects.Remove(AuctionBlobKeys.Block(ItemTag, OldMonth, 1));
+                break;
+            case "combined":
+                w.MonthParts[OldMonth] = new List<RetentionTagParts> { new(ItemTag, 2, new string('b', 64)) };
+                break;
+        }
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty, "nothing deleted");
+        Assert.That(w.Auctions, Has.Count.EqualTo(2));
+        Assert.That(w.SellerPassDone, Is.Empty, "no marker");
+        Assert.That(w.MonthRows[OldMonth].All(r => r.DeletedAt == null), Is.True);
+    }
+
+    [Test]
+    public async Task SellerWriteFailureInThePassBlocksTheMonth()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 2);
+        ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) });
+        w.Players[PassUuid(1)] = 101;
+        w.SellerFailure = new InvalidOperationException("insert failed");
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(w.SellerPassDone, Is.Empty);
     }
 
     [Test]
@@ -345,5 +598,28 @@ public class AuctionRetentionWorkerTests
             Assert.That(Fk(nameof(SaveAuction.NBTLookup)), Is.EqualTo("AuctionId"));
             Assert.That(model.FindEntityType(typeof(SaveAuction)).FindNavigation(nameof(SaveAuction.NbtData)).ForeignKey.Properties.Single().GetColumnName(), Is.EqualTo("NbtDataId"));
         });
+    }
+
+    [Test]
+    public void HistoryLengthSqlUsesShowGlobalStatusWithoutInnodbMetrics()
+    {
+        var sql = AuctionRetentionWorker.HistoryLengthSql;
+        Assert.That(sql, Does.Contain("SHOW GLOBAL STATUS"));
+        Assert.That(sql, Does.Contain("Innodb_history_list_length"));
+        Assert.That(sql, Does.Not.Contain("INNODB_METRICS"));
+        Assert.That(sql, Does.Not.Contain("`STATUS`"));
+        Assert.That(sql, Does.Not.Contain("SELECT"));
+    }
+
+    [TestCase("1234", 1234L)]
+    [TestCase("0", 0L)]
+    public void ParseHistoryLengthReadsNumericValue(string value, long expected)
+        => Assert.That(AuctionRetentionWorker.ParseHistoryLength(value), Is.EqualTo(expected));
+
+    [Test]
+    public void ParseHistoryLengthIgnoresNonNumeric()
+    {
+        Assert.That(AuctionRetentionWorker.ParseHistoryLength(null), Is.Null);
+        Assert.That(AuctionRetentionWorker.ParseHistoryLength("n/a"), Is.Null);
     }
 }

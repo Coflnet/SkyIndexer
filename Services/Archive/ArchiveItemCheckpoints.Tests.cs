@@ -114,7 +114,8 @@ public class ArchiveItemCheckpointsTests
             return Task.FromResult(Auctions.Where(filter).OrderBy(a => a.End).ThenBy(a => a.Id).Take(pageSize).ToList());
         }
         protected override Task LoadChildrenAsync(List<SaveAuction> page, CancellationToken ct) => Task.CompletedTask;
-        protected override Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, CancellationToken ct) => Task.CompletedTask;
+        protected override Task<IReadOnlyDictionary<string, int>> ResolvePlayerIdsAsync(IReadOnlyList<string> uuids, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyDictionary<string, int>>(new Dictionary<string, int>());
+        protected override Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers, CancellationToken ct) => Task.CompletedTask;
         protected override Task UpsertArchivedMonthAsync(ArchivedMonth row, CancellationToken ct)
         {
             Months[(row.TagId, row.Month)] = row;
@@ -141,7 +142,7 @@ public class ArchiveItemCheckpointsTests
         return new SaveAuction
         {
             Id = id, UId = 5_000_000 + id, Uuid = (5_000_000L + id).ToString("x32"), ItemId = itemId, Tag = tag,
-            End = end, Start = end.AddDays(-1), AuctioneerId = "a".PadLeft(32, '0'),
+            End = end, Start = end.AddDays(-1), AuctioneerId = (0xabcL).ToString("x32"),
             Bids = new List<SaveBids>(), NbtData = new NbtData { data = new byte[] { 10, 0, (byte)id } },
             Enchantments = new List<Enchantment>(), NBTLookup = new List<NBTLookup>(),
         };

@@ -45,6 +45,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private static readonly Prometheus.Counter rowsArchived = Prometheus.Metrics.CreateCounter("sky_indexer_archive_rows_archived", "Auction rows in verified parts");
         private static readonly Prometheus.Counter indexRowsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_archive_index_rows", "auction_locations rows written");
         private static readonly Prometheus.Counter bidderRowsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_archive_bidder_rows", "auction_bidders rows written");
+        private static readonly Prometheus.Counter sellerRowsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_archive_seller_rows", "auction_sellers rows written");
         private static readonly Prometheus.Counter bidsWithoutBidder = Prometheus.Metrics.CreateCounter("sky_indexer_archive_bids_without_bidder", "Bids skipped for auction_bidders because BidderId is 0");
         private static readonly Prometheus.Counter itemMonthsSkipped = Prometheus.Metrics.CreateCounter("sky_indexer_archive_item_months_skipped", "ItemId-months skipped because the item's first auction ends in a later month");
         private static readonly Prometheus.Counter itemsSkippedByCheckpoint = Prometheus.Metrics.CreateCounter("sky_indexer_archive_items_skipped_by_checkpoint", "ItemId-months skipped after a restart because a Redis checkpoint says they are done");
@@ -377,10 +378,17 @@ namespace Coflnet.Sky.Indexer.Archive
             foreach (var (tag, index) in indexes.OrderBy(i => i.Key, StringComparer.Ordinal))
             {
                 var tagId = await GetOrCreateTagIdAsync(tag, cancellationToken).ConfigureAwait(false);
-                var bidders = index.Bidders.Select(kv => new AuctionBidder { BidderId = kv.Key.bidder, Uid = kv.Key.uid, End = kv.Value.end, Amount = kv.Value.amount }).ToList();
-                await WriteIndexRowsAsync(tagId, monthIndex, index.Locations, bidders, cancellationToken).ConfigureAwait(false);
+                var bidders = index.Bidders.Select(kv => new AuctionBidder { BidderId = kv.Key.bidder, Uid = kv.Key.uid, End = kv.Value.end }).ToList();
+                var sellers = index.Sellers.Select(kv => new AuctionSeller { SellerId = kv.Key.seller, Uid = kv.Key.uid, End = kv.Value }).ToList();
+                if (index.UnnumberedSellers.Count > 0)
+                {
+                    var ids = await PlayerIdLookup.ResolveAsync(index.UnnumberedSellers.Keys.Select(k => k.uuid), ResolvePlayerIdsAsync, cancellationToken).ConfigureAwait(false);
+                    sellers.AddRange(ScyllaArchiveImportWorker.ResolveSellers(index.UnnumberedSellers, ids));
+                }
+                await WriteIndexRowsAsync(tagId, monthIndex, index.Locations, bidders, sellers, cancellationToken).ConfigureAwait(false);
                 indexRowsWritten.Inc(index.Locations.Count);
                 bidderRowsWritten.Inc(bidders.Count);
+                sellerRowsWritten.Inc(sellers.Count);
                 runs[tag].IndexRows += index.Locations.Count;
                 runs[tag].IndexBidderRows += bidders.Count;
             }
@@ -475,12 +483,20 @@ namespace Coflnet.Sky.Indexer.Archive
             foreach (var row in rows)
             {
                 index.Locations.Add((row.UId, (byte)part));
+                var end = (uint)new DateTimeOffset(DateTime.SpecifyKind(row.End, DateTimeKind.Utc)).ToUnixTimeSeconds();
+                if (!ScyllaArchiveImportWorker.IsIndexableSeller(row.AuctioneerId))
+                {
+                    // anonymised or opted-out auctioneer (whatever SellerId says), or no auctioneer uuid: no seller row
+                }
+                else if (row.SellerId > 0)
+                    index.Sellers[((uint)row.SellerId, row.UId)] = end;
+                else
+                    index.UnnumberedSellers[(row.AuctioneerId, row.UId)] = end; // SellerId 0 is not always anonymous (Numberer: duplicate players, old rows)
                 if (row.Bids == null)
                     continue;
-                var end = (uint)new DateTimeOffset(DateTime.SpecifyKind(row.End, DateTimeKind.Utc)).ToUnixTimeSeconds();
                 foreach (var bid in row.Bids)
                 {
-                    if (bid.BidderId <= 0 || bid.Amount < 0)
+                    if (bid.BidderId <= 0 || bid.Amount < 0 || PlayerOptOut.IsOptedOut(bid.Bidder))
                     {
                         run.BidsWithoutBidder++;
                         bidsWithoutBidder.Inc();
@@ -519,15 +535,29 @@ namespace Coflnet.Sky.Indexer.Archive
         {
             public List<(long uid, byte part)> Locations { get; } = new();
             public Dictionary<(uint bidder, long uid), (uint end, ulong amount)> Bidders { get; } = new();
+            /// <summary>Seller (<c>Players.Id</c>) and uid to the auction end; SellerId 0 (unknown) is left out like bids without a bidder.</summary>
+            public Dictionary<(uint seller, long uid), uint> Sellers { get; } = new();
+            /// <summary>Rows with SellerId 0 but a real auctioneer uuid, resolved to <c>Players.Id</c> when the index rows are written.</summary>
+            public Dictionary<(string uuid, long uid), uint> UnnumberedSellers { get; } = new();
         }
 
         // ---------------------------------------------------------------- data access seams
 
-        /// <summary>Create the archive tables (own migrations history table); only called when the job is enabled.</summary>
+        /// <summary>Command timeout for the schema migrations: index-table rebuilds (e.g. PAGE_COMPRESSED) take many minutes.</summary>
+        internal static readonly TimeSpan MigrationCommandTimeout = TimeSpan.FromHours(4);
+
+        /// <summary>Create the archive tables (own migrations history table); only called when the job is enabled.
+        /// Runs with a <see cref="MigrationCommandTimeout"/> (4 h) command timeout and logs start and elapsed time, because
+        /// migrations such as the index compression rebuild tables of ~50-80 M rows. Not unit-tested (needs a database).</summary>
         protected virtual async Task EnsureSchemaAsync(CancellationToken cancellationToken)
         {
             using var db = new ArchiveContext();
+            // Migrations can ALTER the permanent index tables (tens of millions of rows, rebuilt on the primary): no short command timeout.
+            db.Database.SetCommandTimeout(MigrationCommandTimeout);
+            logger.LogInformation("Applying archive schema migrations (may take long on large index tables)");
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             await db.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
+            logger.LogInformation("Archive schema migrations applied in {Elapsed}", sw.Elapsed);
         }
 
         /// <summary>Distinct <c>ItemId</c>s of <c>Auctions</c> with the <c>End</c> of their first auction (loose index scan on
@@ -681,17 +711,23 @@ namespace Coflnet.Sky.Indexer.Archive
 
         /// <summary>
         /// Insert the index rows of a verified tag-month in batches of <see cref="IndexBatchSize"/>. Idempotent:
-        /// locations are upserted (a re-run points them at the latest verified part), bidders use INSERT IGNORE.
+        /// locations are upserted (a re-run points them at the latest verified part), bidders and sellers use INSERT IGNORE.
         /// All values are integers formatted invariantly, so the statements can not carry injected SQL.
         /// </summary>
-        protected virtual async Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, CancellationToken cancellationToken)
+        protected virtual async Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers, CancellationToken cancellationToken)
         {
             using var db = new ArchiveContext();
             foreach (var sql in BuildLocationInserts(tagId, month, locations))
                 await db.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
             foreach (var sql in BuildBidderInserts(bidders))
                 await db.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
+            foreach (var sql in ArchiveIndexSql.BuildSellerInserts(sellers))
+                await db.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
         }
+
+        /// <summary><c>Players.Id</c> of up to 100 uuids (sellers whose <c>SellerId</c> is 0); unknown uuids are absent.</summary>
+        protected virtual Task<IReadOnlyDictionary<string, int>> ResolvePlayerIdsAsync(IReadOnlyList<string> uuids, CancellationToken cancellationToken)
+            => PlayerIdLookup.QueryPlayersAsync(uuids, cancellationToken);
 
         /// <summary>Insert or replace the <c>archived_months</c> row of a tag-month.</summary>
         protected virtual async Task UpsertArchivedMonthAsync(ArchivedMonth row, CancellationToken cancellationToken)

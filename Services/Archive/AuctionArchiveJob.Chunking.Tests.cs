@@ -17,7 +17,7 @@ public class AuctionArchiveJobChunkingTests
     public void Chunk_UsesTheConfiguredBatchSize()
     {
         var ids = Enumerable.Range(1, 2000).ToList();
-        Assert.That(AuctionArchiveJob.Chunk(ids, Configured("250")).Count(), Is.EqualTo(8));
+        Assert.That(AuctionArchiveJob.Chunk(ids, Configured("150")).Count(), Is.EqualTo(14));
         Assert.That(AuctionArchiveJob.Chunk(ids, Configured("0")).Count(), Is.EqualTo(2000));
     }
 
@@ -36,13 +36,13 @@ public class AuctionArchiveJobChunkingTests
         var ids = Enumerable.Range(1, 2000).ToList();
         var chunks = AuctionArchiveJob.Chunk(ids, Configured()).ToList();
 
-        Assert.That(chunks, Has.Count.EqualTo(20));
+        Assert.That(chunks, Has.Count.EqualTo(12));
         Assert.That(chunks.All(c => c.Count <= Configured()));
         Assert.That(chunks.SelectMany(c => c), Is.EqualTo(ids));
 
         Assert.That(AuctionArchiveJob.Chunk(new List<int>(), Configured()), Is.Empty);
 
         var odd = AuctionArchiveJob.Chunk(Enumerable.Range(1, 101).ToList(), Configured()).ToList();
-        Assert.That(odd.Select(c => c.Count), Is.EqualTo(new[] { 100, 1 }));
+        Assert.That(odd.Select(c => c.Count), Is.EqualTo(new[] { 101 }));
     }
 }

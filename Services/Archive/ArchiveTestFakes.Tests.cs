@@ -25,28 +25,40 @@ internal class InMemoryAuctionBlobStore : IAuctionBlobStore, IArchiveMetaStore
     public Func<ArchivedTagIndex, Task> BeforeIndexWrite;
     public int IndexConflicts;
 
+    /// <summary>Guards block reads and writes, which run concurrently when items are archived in parallel.</summary>
+    private readonly object gate = new();
+
     public InMemoryAuctionBlobStore(List<string> events = null) => Events = events ?? new List<string>();
 
     public bool IsEnabled => true;
 
     public Task<ArchivedAuctionBlock> ReadBlockAsync(string tag, int month, int part, bool uncached = false, CancellationToken cancellationToken = default)
     {
-        Events.Add($"read:{tag}:{month}:{part}:{(uncached ? "uncached" : "cached")}");
-        var block = Get<ArchivedAuctionBlock>(AuctionBlobKeys.Block(tag, month, part));
-        if (block != null && CorruptReadBack && block.ItemBytes.Length > 0 && block.ItemBytes[0]?.Length > 0)
-            block.ItemBytes[0][0] ^= 0xFF;
-        return Task.FromResult(block);
+        lock (gate)
+        {
+            Events.Add($"read:{tag}:{month}:{part}:{(uncached ? "uncached" : "cached")}");
+            var block = Get<ArchivedAuctionBlock>(AuctionBlobKeys.Block(tag, month, part));
+            if (block != null && CorruptReadBack && block.ItemBytes.Length > 0 && block.ItemBytes[0]?.Length > 0)
+                block.ItemBytes[0][0] ^= 0xFF;
+            return Task.FromResult(block);
+        }
     }
 
     public Task WriteBlockAsync(ArchivedAuctionBlock block, CancellationToken cancellationToken = default)
     {
-        Events.Add($"write:{block.Tag}:{block.Month}:{block.Part}");
-        Put(AuctionBlobKeys.Block(block.Tag, block.Month, block.Part), block);
+        lock (gate)
+        {
+            Events.Add($"write:{block.Tag}:{block.Month}:{block.Part}");
+            Put(AuctionBlobKeys.Block(block.Tag, block.Month, block.Part), block);
+        }
         return Task.CompletedTask;
     }
 
     public Task<bool> BlockExistsAsync(string tag, int month, int part, CancellationToken cancellationToken = default)
-        => Task.FromResult(Objects.ContainsKey(AuctionBlobKeys.Block(tag, month, part)));
+    {
+        lock (gate)
+            return Task.FromResult(Objects.ContainsKey(AuctionBlobKeys.Block(tag, month, part)));
+    }
 
     public Task<ArchivedTagIndex> ReadIndexAsync(string tag, CancellationToken cancellationToken = default)
     {
@@ -149,6 +161,7 @@ internal static class ArchiveTestConfig
             ["ARCHIVE:ENABLED"] = "true",
             ["ARCHIVE:OLDEST_MONTH"] = "2026-08",
             ["ARCHIVE:PAGE_PAUSE_MS"] = "0",
+            ["ARCHIVE:ITEM_PARALLELISM"] = "1", // deterministic part numbers; concurrency has its own tests
         };
         foreach (var (key, value) in values)
             dict[key] = value;

@@ -14,11 +14,21 @@ namespace Coflnet.Sky.Indexer.Archive
         public int ClosedMarginDays { get; init; } = 14;
         public int MaxRowsPerPart { get; init; } = 50000;
         public int PageSize { get; init; } = 2000;
-        /// <summary>Auction ids per child-table IN list (6 statements per chunk). Raise above 100 only after <c>ANALYZE TABLE UuId</c> on the primary.</summary>
-        public int ChildQueryBatchSize { get; init; } = 100;
-        public int PagePauseMs { get; init; } = 200;
+        /// <summary>Hard upper bound of <see cref="ChildQueryBatchSize"/>: MariaDB's <c>eq_range_index_dive_limit</c> is 200 and an IN list of that many values
+        /// made the optimizer scan the all-NULL <c>UuId.SaveAuctionId</c> index (583M rows).</summary>
+        public const int MaxChildQueryBatchSize = 199;
+        /// <summary>Auction ids per child-table IN list (5 statements per chunk), clamped to 1..<see cref="MaxChildQueryBatchSize"/>.</summary>
+        public int ChildQueryBatchSize { get; init; } = 180;
+        /// <summary>The unclamped <c>CHILD_QUERY_BATCH_SIZE</c> as configured (the job warns when it differs from <see cref="ChildQueryBatchSize"/>).</summary>
+        public int RequestedChildQueryBatchSize { get; init; } = 180;
+        /// <summary>Child-table queries of one page that run at the same time (each on its own connection to the read replica).</summary>
+        public int ChildQueryParallelism { get; init; } = 6;
+        /// <summary>ItemIds of a month archived at the same time. Replica connections used are about <c>ItemParallelism * (ChildQueryParallelism + 1)</c>
+        /// (MySqlConnector's default MaxPoolSize is 100).</summary>
+        public int ItemParallelism { get; init; } = 4;
+        public int PagePauseMs { get; init; } = 0;
         /// <summary>Pause after an ItemId-month that had rows; each visit is one keyset page query on (ItemId, End).</summary>
-        public int TagPauseMs { get; init; } = 100;
+        public int TagPauseMs { get; init; } = 0;
         public int MonthPauseMs { get; init; } = 60000;
         public int IdlePauseMinutes { get; init; } = 60;
         /// <summary>Minutes between scans of the Scylla month manifests SkyAuctions hands over (<see cref="ScyllaArchiveImportWorker"/>).</summary>
@@ -52,7 +62,10 @@ namespace Coflnet.Sky.Indexer.Archive
                 ClosedMarginDays = Int(s["CLOSED_MARGIN_DAYS"], d.ClosedMarginDays),
                 MaxRowsPerPart = System.Math.Max(1, Int(s["MAX_ROWS_PER_PART"], d.MaxRowsPerPart)),
                 PageSize = System.Math.Max(1, Int(s["PAGE_SIZE"], d.PageSize)),
-                ChildQueryBatchSize = System.Math.Max(1, Int(s["CHILD_QUERY_BATCH_SIZE"], d.ChildQueryBatchSize)),
+                ChildQueryBatchSize = System.Math.Clamp(Int(s["CHILD_QUERY_BATCH_SIZE"], d.ChildQueryBatchSize), 1, MaxChildQueryBatchSize),
+                RequestedChildQueryBatchSize = Int(s["CHILD_QUERY_BATCH_SIZE"], d.ChildQueryBatchSize),
+                ChildQueryParallelism = System.Math.Max(1, Int(s["CHILD_QUERY_PARALLELISM"], d.ChildQueryParallelism)),
+                ItemParallelism = System.Math.Max(1, Int(s["ITEM_PARALLELISM"], d.ItemParallelism)),
                 PagePauseMs = Int(s["PAGE_PAUSE_MS"], d.PagePauseMs),
                 TagPauseMs = Int(s["TAG_PAUSE_MS"], d.TagPauseMs),
                 MonthPauseMs = Int(s["MONTH_PAUSE_MS"], d.MonthPauseMs),

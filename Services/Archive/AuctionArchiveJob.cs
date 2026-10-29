@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
@@ -36,7 +37,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private readonly IConfiguration config;
         private readonly ILogger<AuctionArchiveJob> logger;
         private readonly IArchiveItemCheckpoints checkpoints;
-        private readonly Dictionary<string, ushort> tagIds = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, ushort> tagIds = new(StringComparer.Ordinal);
 
         private static readonly Prometheus.Counter monthsTotal = Prometheus.Metrics.CreateCounter("sky_indexer_archive_months_total", "Months fully archived (sentinel written)");
         private static readonly Prometheus.Counter partsWritten = Prometheus.Metrics.CreateCounter("sky_indexer_archive_parts_written", "Archive parts written");
@@ -51,6 +52,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private static readonly Prometheus.Counter itemsSkippedByCheckpoint = Prometheus.Metrics.CreateCounter("sky_indexer_archive_items_skipped_by_checkpoint", "ItemId-months skipped after a restart because a Redis checkpoint says they are done");
         private static readonly Prometheus.Counter pages = Prometheus.Metrics.CreateCounter("sky_indexer_archive_pages", "Auction pages read from MariaDB");
         private static readonly Prometheus.Counter errors = Prometheus.Metrics.CreateCounter("sky_indexer_archive_errors", "Archive errors (tag-months that failed with an exception, tag collisions)");
+        private static readonly Prometheus.Counter childQueryRetries = Prometheus.Metrics.CreateCounter("sky_indexer_archive_child_query_retries_total", "Child or page queries re-run in smaller pieces after a statement timeout", new Prometheus.CounterConfiguration { LabelNames = new[] { "table" } });
         private static readonly Prometheus.Gauge currentMonth = Prometheus.Metrics.CreateGauge("sky_indexer_archive_current_month", "Month (yyyyMM) being archived");
         private static readonly Prometheus.Gauge lastMonthCompleted = Prometheus.Metrics.CreateGauge("sky_indexer_archive_last_month_completed_timestamp", "Unix time the last month sentinel was written");
 
@@ -129,6 +131,8 @@ namespace Coflnet.Sky.Indexer.Archive
         internal async Task<int> RunOnceAsync(DateTime nowUtc, CancellationToken cancellationToken)
         {
             var options = ArchiveOptions.From(config);
+            if (options.RequestedChildQueryBatchSize != options.ChildQueryBatchSize)
+                logger.LogWarning("ARCHIVE:CHILD_QUERY_BATCH_SIZE={Requested} is outside 1..{Max} (MariaDB eq_range_index_dive_limit is 200); using {Used}", options.RequestedChildQueryBatchSize, ArchiveOptions.MaxChildQueryBatchSize, options.ChildQueryBatchSize);
             var newest = ArchiveMonths.NewestClosed(nowUtc, options.ClosedMarginDays);
             var completed = 0;
             IReadOnlyList<int> itemIds = null;
@@ -195,14 +199,15 @@ namespace Coflnet.Sky.Indexer.Archive
         /// are skipped without a query. Null skips nothing.</param>
         internal async Task<bool> ArchiveMonthAsync(int month, IReadOnlyList<int> itemIds, ArchiveOptions options, CancellationToken cancellationToken, IReadOnlyDictionary<int, int> firstMonths = null)
         {
-            var runs = new Dictionary<string, TagMonthRun>(StringComparer.Ordinal);
-            var done = await RestoreCheckpointsAsync(month, itemIds, runs, firstMonths, cancellationToken).ConfigureAwait(false);
-            if (done.Count > 0 && !await RestoredPartsExistAsync(month, runs, cancellationToken).ConfigureAwait(false))
+            var ttl = TimeSpan.FromHours(options.CheckpointTtlHours);
+            var state = new MonthRuns();
+            var done = await RestoreCheckpointsAsync(month, itemIds, state, firstMonths, ttl, cancellationToken).ConfigureAwait(false);
+            if (done.Count > 0 && !await RestoredPartsExistAsync(month, state.Runs, cancellationToken).ConfigureAwait(false))
             {
-                runs.Clear();
+                state = new MonthRuns();
                 done = new Dictionary<int, ItemMonthCheckpoint>();
             }
-            var ttl = TimeSpan.FromHours(options.CheckpointTtlHours);
+            var work = new List<int>();
             foreach (var itemId in itemIds)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -216,18 +221,38 @@ namespace Coflnet.Sky.Indexer.Archive
                     itemsSkippedByCheckpoint.Inc();
                     continue;
                 }
-                var before = new Dictionary<string, RunSnapshot>(StringComparer.Ordinal); // filled lazily with the tags the item touches
-                var startedAt = DateTime.UtcNow;
-                var (ok, rows) = await ArchiveItemMonthAsync(itemId, month, runs, options, cancellationToken, before).ConfigureAwait(false);
-                if (!ok)
-                    return false;
-                await checkpoints.SaveAsync(month, itemId, DiffRuns(before, runs, startedAt), ttl, cancellationToken).ConfigureAwait(false);
-                // an empty ItemId-month was one cheap index lookup; only pause after real work
-                if (rows > 0)
-                    await Delay(TimeSpan.FromMilliseconds(options.TagPauseMs), cancellationToken).ConfigureAwait(false);
+                work.Add(itemId);
             }
+            // Items run concurrently, each with its own private runs; a finished item merges them into the shared month state
+            // (part numbers of a tag are reserved atomically) and then saves its own checkpoint. The first failing item cancels the others.
+            using var failure = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var failed = 0;
+            try
+            {
+                await Parallel.ForEachAsync(work, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, options.ItemParallelism), CancellationToken = failure.Token }, async (itemId, token) =>
+                {
+                    var startedAt = DateTime.UtcNow;
+                    var (ok, rows, checkpoint) = await ArchiveItemMonthAsync(itemId, month, state, options, token, startedAt).ConfigureAwait(false);
+                    if (!ok)
+                    {
+                        Interlocked.Exchange(ref failed, 1);
+                        failure.Cancel();
+                        return;
+                    }
+                    await checkpoints.SaveAsync(month, itemId, checkpoint, ttl, token).ConfigureAwait(false);
+                    // an empty ItemId-month was one cheap index lookup; only pause after real work
+                    if (rows > 0)
+                        await Delay(TimeSpan.FromMilliseconds(options.TagPauseMs), token).ConfigureAwait(false);
+                }).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (Volatile.Read(ref failed) != 0 && !cancellationToken.IsCancellationRequested)
+            {
+                // another item failed and cancelled this one
+            }
+            if (Volatile.Read(ref failed) != 0)
+                return false;
             var allFinalized = true;
-            foreach (var run in runs.Values.OrderBy(r => r.Tag, StringComparer.Ordinal))
+            foreach (var run in state.Runs.Values.OrderBy(r => r.Tag, StringComparer.Ordinal))
                 allFinalized &= await FinalizeTagMonthAsync(run, cancellationToken).ConfigureAwait(false);
             return allFinalized;
         }
@@ -239,7 +264,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private async Task<bool> RestoredPartsExistAsync(int month, Dictionary<string, TagMonthRun> runs, CancellationToken cancellationToken)
         {
             foreach (var run in runs.Values.OrderBy(r => r.Tag, StringComparer.Ordinal))
-                for (var part = 0; part < run.PartHashes.Count; part++)
+                for (var part = 0; part < run.Parts.Count; part++)
                     if (!await store.BlockExistsAsync(run.Tag, month, part, cancellationToken).ConfigureAwait(false))
                     {
                         errors.Inc();
@@ -250,22 +275,14 @@ namespace Coflnet.Sky.Indexer.Archive
             return true;
         }
 
-        internal record RunSnapshot(int Parts, int Rows, int SoldRows, int IndexRows, int IndexBidderRows, long BidsWithoutBidder);
-
-        private static RunSnapshot SnapshotRun(TagMonthRun run)
-            => run == null ? new RunSnapshot(0, 0, 0, 0, 0, 0) : new RunSnapshot(run.PartHashes.Count, run.Rows, run.SoldRows, run.IndexRows, run.IndexBidderRows, run.BidsWithoutBidder);
-
-        /// <summary>The delta an item added to <paramref name="runs"/>: new parts are the tail of <c>PartHashes</c>, counters are differences.</summary>
-        private static ItemMonthCheckpoint DiffRuns(Dictionary<string, RunSnapshot> before, Dictionary<string, TagMonthRun> runs, DateTime archivedAt)
+        /// <summary>The checkpoint of a finished item: per touched tag the parts it wrote (with their month-wide numbers) and its counters.</summary>
+        private static ItemMonthCheckpoint BuildCheckpoint(Dictionary<string, TagMonthRun> local, DateTime archivedAt)
         {
             var tags = new Dictionary<string, CheckpointTagDelta>(StringComparer.Ordinal);
-            foreach (var (tag, run) in runs)
+            foreach (var (tag, run) in local)
             {
-                if (!before.TryGetValue(tag, out var b))
-                    continue; // the item never touched this tag
-
-                var parts = run.PartHashes.Skip(b.Parts).Select((hash, i) => new CheckpointPart(b.Parts + i, hash)).ToList();
-                var delta = new CheckpointTagDelta(parts, run.Rows - b.Rows, run.SoldRows - b.SoldRows, run.IndexRows - b.IndexRows, run.IndexBidderRows - b.IndexBidderRows, run.BidsWithoutBidder - b.BidsWithoutBidder);
+                var parts = run.Parts.Select(kv => new CheckpointPart(kv.Key, kv.Value)).ToList();
+                var delta = new CheckpointTagDelta(parts, run.Rows, run.SoldRows, run.IndexRows, run.IndexBidderRows, run.BidsWithoutBidder);
                 if (parts.Count > 0 || delta.Rows != 0 || delta.SoldRows != 0 || delta.IndexRows != 0 || delta.IndexBidderRows != 0 || delta.BidsWithoutBidder != 0)
                     tags[tag] = delta;
             }
@@ -273,35 +290,69 @@ namespace Coflnet.Sky.Indexer.Archive
         }
 
         /// <summary>
-        /// Rebuild <paramref name="runs"/> from the month's checkpoints. Returns the finished items (empty when there are none, Redis
-        /// failed or the part numbers of a tag are not dense 0..n-1; then everything is re-walked and <paramref name="runs"/> stays empty).
+        /// Rebuild the month state from the month's checkpoints. Returns the finished items (empty when there are none, Redis
+        /// failed or a part number occurs twice; then everything is re-walked and <paramref name="state"/> stays empty).
+        /// Items run concurrently, so a crash can leave a finished item whose part numbers lie behind the number of an unfinished
+        /// item (a gap in the part numbers of a tag). Those items are dropped and redone, the others stay; the Redis hash is rewritten
+        /// without the dropped items so no stale part numbers survive.
         /// </summary>
-        private async Task<IReadOnlyDictionary<int, ItemMonthCheckpoint>> RestoreCheckpointsAsync(int month, IReadOnlyList<int> itemIds, Dictionary<string, TagMonthRun> runs, IReadOnlyDictionary<int, int> firstMonths, CancellationToken cancellationToken)
+        private async Task<IReadOnlyDictionary<int, ItemMonthCheckpoint>> RestoreCheckpointsAsync(int month, IReadOnlyList<int> itemIds, MonthRuns state, IReadOnlyDictionary<int, int> firstMonths, TimeSpan ttl, CancellationToken cancellationToken)
         {
             var empty = new Dictionary<int, ItemMonthCheckpoint>();
             var loaded = await checkpoints.LoadAsync(month, cancellationToken).ConfigureAwait(false);
             if (loaded.Count == 0)
                 return empty;
-            var parts = new Dictionary<string, SortedDictionary<int, string>>(StringComparer.Ordinal);
-            var rebuilt = new Dictionary<string, TagMonthRun>(StringComparer.Ordinal);
+            var seen = new HashSet<(string tag, int part)>();
             foreach (var (itemId, checkpoint) in loaded.OrderBy(c => c.Key))
-            {
                 foreach (var (tag, delta) in checkpoint.Tags)
-                {
-                    if (!rebuilt.TryGetValue(tag, out var run))
-                    {
-                        rebuilt[tag] = run = new TagMonthRun(tag, month);
-                        parts[tag] = new SortedDictionary<int, string>();
-                    }
                     foreach (var part in delta.Parts ?? new List<CheckpointPart>())
-                    {
-                        if (!parts[tag].TryAdd(part.Part, part.Sha256))
+                        if (!seen.Add((tag, part.Part)))
                         {
                             logger.LogWarning("Checkpoints of {Month} contain part {Part} of {Tag} twice (item {Item}); ignoring all checkpoints and re-walking the month", month, part.Part, tag, itemId);
                             await checkpoints.ClearAsync(month, cancellationToken).ConfigureAwait(false);
                             return empty;
                         }
+            var kept = new Dictionary<int, ItemMonthCheckpoint>(loaded);
+            var dropped = new List<int>();
+            while (true)
+            {
+                var present = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
+                foreach (var checkpoint in kept.Values)
+                    foreach (var (tag, delta) in checkpoint.Tags)
+                    {
+                        if (!present.TryGetValue(tag, out var set))
+                            present[tag] = set = new HashSet<int>();
+                        foreach (var part in delta.Parts ?? new List<CheckpointPart>())
+                            set.Add(part.Part);
                     }
+                var dense = present.ToDictionary(kv => kv.Key, kv => { var n = 0; while (kv.Value.Contains(n)) n++; return n; }, StringComparer.Ordinal);
+                var bad = kept.Where(kv => kv.Value.Tags.Any(t => (t.Value.Parts ?? new List<CheckpointPart>()).Any(p => p.Part < 0 || p.Part >= dense[t.Key]))).Select(kv => kv.Key).ToList();
+                if (bad.Count == 0)
+                    break;
+                foreach (var itemId in bad)
+                {
+                    kept.Remove(itemId);
+                    dropped.Add(itemId);
+                }
+            }
+            if (dropped.Count > 0)
+            {
+                logger.LogWarning("Checkpoints of {Month} have gaps in the part numbers (items {Items} were in flight when the last run ended); redoing those items and keeping {Kept} others", month, string.Join(",", dropped.OrderBy(i => i)), kept.Count);
+                await checkpoints.ClearAsync(month, cancellationToken).ConfigureAwait(false);
+                foreach (var (itemId, checkpoint) in kept.OrderBy(k => k.Key))
+                    await checkpoints.SaveAsync(month, itemId, checkpoint, ttl, cancellationToken).ConfigureAwait(false);
+                if (kept.Count == 0)
+                    return empty;
+            }
+            var rebuilt = new Dictionary<string, TagMonthRun>(StringComparer.Ordinal);
+            foreach (var (itemId, checkpoint) in kept.OrderBy(c => c.Key))
+            {
+                foreach (var (tag, delta) in checkpoint.Tags)
+                {
+                    if (!rebuilt.TryGetValue(tag, out var run))
+                        rebuilt[tag] = run = new TagMonthRun(tag, month);
+                    foreach (var part in delta.Parts ?? new List<CheckpointPart>())
+                        run.Parts.Add(part.Part, part.Sha256);
                     run.Rows += delta.Rows;
                     run.SoldRows += delta.SoldRows;
                     run.IndexRows += delta.IndexRows;
@@ -311,35 +362,32 @@ namespace Coflnet.Sky.Indexer.Archive
                         run.ArchivedAt = DateTime.SpecifyKind(checkpoint.ArchivedAt, DateTimeKind.Utc);
                 }
             }
-            foreach (var (tag, byPart) in parts)
-            {
-                if (byPart.Count > 0 && (byPart.Keys.First() != 0 || byPart.Keys.Last() != byPart.Count - 1))
-                {
-                    logger.LogWarning("Checkpoints of {Month} have a gap in the parts of {Tag} (parts {Parts}); ignoring all checkpoints and re-walking the month", month, tag, string.Join(",", byPart.Keys));
-                    await checkpoints.ClearAsync(month, cancellationToken).ConfigureAwait(false);
-                    return empty;
-                }
-                rebuilt[tag].PartHashes.AddRange(byPart.Values);
-            }
-            foreach (var (tag, run) in rebuilt)
-                runs[tag] = run;
-            var resume = itemIds.FirstOrDefault(i => !loaded.ContainsKey(i) && !(firstMonths != null && firstMonths.TryGetValue(i, out var first) && first > month), -1);
-            logger.LogInformation("Resuming {Month} from checkpoints: {Skipped} finished items skipped, walk resumes at item {Item}", month, itemIds.Count(loaded.ContainsKey), resume);
-            return loaded;
+            state.Restore(rebuilt);
+            var resume = itemIds.FirstOrDefault(i => !kept.ContainsKey(i) && !(firstMonths != null && firstMonths.TryGetValue(i, out var first) && first > month), -1);
+            logger.LogInformation("Resuming {Month} from checkpoints: {Skipped} finished items skipped, walk resumes at item {Item}", month, itemIds.Count(kept.ContainsKey), resume);
+            return kept;
         }
 
-        /// <summary>Page one ItemId of a month into the per-tag runs; the index rows of the item are written after its parts verified.</summary>
-        internal async Task<(bool ok, int rows)> ArchiveItemMonthAsync(int itemId, int month, Dictionary<string, TagMonthRun> runs, ArchiveOptions options, CancellationToken cancellationToken, Dictionary<string, RunSnapshot> before = null)
+        /// <summary>
+        /// Page one ItemId of a month; the item collects its parts and counters in private runs, the index rows are written after its parts
+        /// verified, and only then are the runs merged into <paramref name="state"/> (so a failing item leaves the shared state untouched).
+        /// Part numbers are reserved from <paramref name="state"/>, which keeps them unique per tag-month while items run concurrently.
+        /// </summary>
+        internal async Task<(bool ok, int rows, ItemMonthCheckpoint checkpoint)> ArchiveItemMonthAsync(int itemId, int month, MonthRuns state, ArchiveOptions options, CancellationToken cancellationToken, DateTime? startedAt = null)
         {
+            var archivedAt = startedAt ?? DateTime.UtcNow;
+            var local = new Dictionary<string, TagMonthRun>(StringComparer.Ordinal);
             var (monthStart, monthEnd) = ArchiveMonths.MonthRange(month);
             var buffers = new Dictionary<string, List<SaveAuction>>(StringComparer.Ordinal);
             var indexes = new Dictionary<string, ItemRunIndex>(StringComparer.Ordinal);
             var cursorEnd = monthStart;
             var cursorId = 0;
             var total = 0;
+            var take = options.PageSize;
             while (true)
             {
-                var page = await LoadPageAsync(itemId, cursorEnd, cursorId, monthEnd, options.PageSize, cancellationToken).ConfigureAwait(false);
+                List<SaveAuction> page;
+                (page, take) = await LoadPageResilientAsync(itemId, cursorEnd, cursorId, monthEnd, take, cancellationToken).ConfigureAwait(false);
                 pages.Inc();
                 if (page.Count == 0)
                     break;
@@ -354,25 +402,22 @@ namespace Coflnet.Sky.Indexer.Archive
                     {
                         errors.Inc();
                         logger.LogError("Auction {Id} (uid {UId}, item {Item}) ended in {Month} has no tag; the month can not be archived and gets no sentinel", row.Id, row.UId, itemId, month);
-                        return (false, total);
+                        return (false, total, null);
                     }
                     if (!buffers.TryGetValue(row.Tag, out var buffer))
-                    {
                         buffers[row.Tag] = buffer = new List<SaveAuction>();
-                        before?.TryAdd(row.Tag, SnapshotRun(runs.GetValueOrDefault(row.Tag)));
-                    }
                     buffer.Add(row);
                     total++;
-                    if (buffer.Count >= options.MaxRowsPerPart && !await FlushPartAsync(runs, indexes, row.Tag, month, buffer, cancellationToken).ConfigureAwait(false))
-                        return (false, total);
+                    if (buffer.Count >= options.MaxRowsPerPart && !await FlushPartAsync(state, local, indexes, row.Tag, month, buffer, cancellationToken).ConfigureAwait(false))
+                        return (false, total, null);
                 }
-                if (page.Count < options.PageSize)
+                if (page.Count < take)
                     break;
                 await Delay(TimeSpan.FromMilliseconds(options.PagePauseMs), cancellationToken).ConfigureAwait(false);
             }
             foreach (var (tag, buffer) in buffers.OrderBy(b => b.Key, StringComparer.Ordinal))
-                if (buffer.Count > 0 && !await FlushPartAsync(runs, indexes, tag, month, buffer, cancellationToken).ConfigureAwait(false))
-                    return (false, total);
+                if (buffer.Count > 0 && !await FlushPartAsync(state, local, indexes, tag, month, buffer, cancellationToken).ConfigureAwait(false))
+                    return (false, total, null);
 
             var monthIndex = ArchiveMonths.ToIndex(month);
             foreach (var (tag, index) in indexes.OrderBy(i => i.Key, StringComparer.Ordinal))
@@ -389,11 +434,80 @@ namespace Coflnet.Sky.Indexer.Archive
                 indexRowsWritten.Inc(index.Locations.Count);
                 bidderRowsWritten.Inc(bidders.Count);
                 sellerRowsWritten.Inc(sellers.Count);
-                runs[tag].IndexRows += index.Locations.Count;
-                runs[tag].IndexBidderRows += bidders.Count;
+                local[tag].IndexRows += index.Locations.Count;
+                local[tag].IndexBidderRows += bidders.Count;
             }
-            return (true, total);
+            var checkpoint = BuildCheckpoint(local, archivedAt);
+            state.Merge(local);
+            return (true, total, checkpoint);
         }
+
+        private const int MinPageSize = 100;
+        private const int MinChildChunk = 10;
+        private const int MaxChildSplitDepth = 3;
+
+        /// <summary>
+        /// MariaDB <c>max_statement_time</c> (error 1969, "Query execution was interrupted (max_statement_time exceeded)"), MySQL's
+        /// <c>max_execution_time</c> (3024) or MySqlConnector's client side command timeout, looking through inner and aggregate exceptions.
+        /// </summary>
+        internal static bool IsStatementTimeout(Exception ex)
+        {
+            for (var e = ex; e != null; e = e.InnerException)
+            {
+                if (e is MySqlConnector.MySqlException my && (my.Number == 1969 || my.Number == 3024 || my.ErrorCode == MySqlConnector.MySqlErrorCode.CommandTimeoutExpired))
+                    return true;
+                if (e is AggregateException agg && agg.InnerExceptions.Any(IsStatementTimeout))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// <see cref="LoadPageAsync"/>, halving the page size (down to <see cref="MinPageSize"/>) when the page query hits the statement timeout.
+        /// Returns the page size that worked; it stays reduced for the rest of the item (a short page only ends the item when it is below that size).
+        /// </summary>
+        private async Task<(List<SaveAuction> page, int take)> LoadPageResilientAsync(int itemId, DateTime cursorEnd, int cursorId, DateTime monthEnd, int take, CancellationToken cancellationToken)
+        {
+            while (true)
+            {
+                try
+                {
+                    return (await LoadPageAsync(itemId, cursorEnd, cursorId, monthEnd, take, cancellationToken).ConfigureAwait(false), take);
+                }
+                catch (Exception ex) when (IsStatementTimeout(ex) && !cancellationToken.IsCancellationRequested && take / 2 >= MinPageSize)
+                {
+                    childQueryRetries.WithLabels("Auctions").Inc();
+                    logger.LogWarning("Page query of item {Item} timed out with {Take} rows; retrying with {Half}", itemId, take, take / 2);
+                    take /= 2;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Run a child-table query for <paramref name="ids"/>; on a statement timeout the ids are split in half and each half is retried
+        /// (recursively, at most <see cref="MaxChildSplitDepth"/> times and never below <see cref="MinChildChunk"/> ids). The results of the halves
+        /// are concatenated in id order, so they equal the unsplit result. A timeout that can not be split further is rethrown.
+        /// </summary>
+        internal static async Task<List<T>> QueryWithSplitAsync<T>(string table, IReadOnlyList<int> ids, Func<IReadOnlyList<int>, CancellationToken, Task<List<T>>> query, ILogger logger, CancellationToken cancellationToken, int depth = 0)
+        {
+            try
+            {
+                return await query(ids, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsStatementTimeout(ex) && !cancellationToken.IsCancellationRequested && depth < MaxChildSplitDepth && ids.Count / 2 >= MinChildChunk)
+            {
+                logger?.LogWarning("Child query on {Table} with {Count} ids timed out; retrying as two halves (split depth {Depth})", table, ids.Count, depth + 1);
+                childQueryRetries.WithLabels(table).Inc(2);
+                var half = ids.Count / 2;
+                var left = await QueryWithSplitAsync(table, ids.Take(half).ToList(), query, logger, cancellationToken, depth + 1).ConfigureAwait(false);
+                var right = await QueryWithSplitAsync(table, ids.Skip(half).ToList(), query, logger, cancellationToken, depth + 1).ConfigureAwait(false);
+                left.AddRange(right);
+                return left;
+            }
+        }
+
+        /// <summary>Current value of <c>sky_indexer_archive_child_query_retries_total</c> for a table (tests).</summary>
+        internal static double ChildQueryRetries(string table) => childQueryRetries.WithLabels(table).Value;
 
         /// <summary>
         /// The R2 tag index and the verified <c>archived_months</c> marker of a tag-month (written last). The index write is
@@ -402,15 +516,22 @@ namespace Coflnet.Sky.Indexer.Archive
         /// </summary>
         private async Task<bool> FinalizeTagMonthAsync(TagMonthRun run, CancellationToken cancellationToken)
         {
+            if (!run.IsDense)
+            {
+                errors.Inc();
+                logger.LogError("Parts of {Tag} {Month} are not numbered 0..n-1 ({Parts}); not marked, retried next pass", run.Tag, run.Month, string.Join(",", run.Parts.Keys));
+                return false;
+            }
             var tagId = await GetOrCreateTagIdAsync(run.Tag, cancellationToken).ConfigureAwait(false);
             var now = DateTime.UtcNow;
+            var partHashes = run.PartHashes;
             var entry = new ArchivedMonthEntry
             {
                 Month = run.Month,
-                Parts = run.PartHashes.Count,
+                Parts = partHashes.Count,
                 Rows = run.Rows,
                 SoldRows = run.SoldRows,
-                PartSha256 = run.PartHashes.ToList(),
+                PartSha256 = partHashes.ToList(),
                 Source = ArchivedAuctionBlock.SourceMariaDb,
                 VerifiedAt = now,
             };
@@ -438,29 +559,29 @@ namespace Coflnet.Sky.Indexer.Archive
             {
                 TagId = tagId,
                 Month = ArchiveMonths.ToIndex(run.Month),
-                Parts = checked((byte)run.PartHashes.Count),
+                Parts = checked((byte)partHashes.Count),
                 Rows = (uint)run.Rows,
                 SoldRows = (uint)run.SoldRows,
                 Source = ArchivedAuctionBlock.SourceMariaDb,
-                Sha256 = ArchivedAuctionBlock.CombinedSha256(run.PartHashes),
+                Sha256 = ArchivedAuctionBlock.CombinedSha256(partHashes),
                 ArchivedAt = run.ArchivedAt ?? now,
                 VerifiedAt = now,
                 IndexRows = (uint)run.IndexRows,
                 IndexBidderRows = (uint)run.IndexBidderRows,
                 Note = run.BidsWithoutBidder > 0 ? $"{run.BidsWithoutBidder} bids without bidder id not indexed" : null,
             }, cancellationToken).ConfigureAwait(false);
-            logger.LogInformation("Archived {Rows} auctions of {Tag} {Month} in {Parts} parts", run.Rows, run.Tag, run.Month, run.PartHashes.Count);
+            logger.LogInformation("Archived {Rows} auctions of {Tag} {Month} in {Parts} parts", run.Rows, run.Tag, run.Month, partHashes.Count);
             return true;
         }
 
         /// <summary>Write the buffered rows of a tag as that tag-month's next part, verify by uncached read-back and collect the index rows. Clears <paramref name="rows"/>.</summary>
-        private async Task<bool> FlushPartAsync(Dictionary<string, TagMonthRun> runs, Dictionary<string, ItemRunIndex> indexes, string tag, int month, List<SaveAuction> rows, CancellationToken cancellationToken)
+        private async Task<bool> FlushPartAsync(MonthRuns state, Dictionary<string, TagMonthRun> runs, Dictionary<string, ItemRunIndex> indexes, string tag, int month, List<SaveAuction> rows, CancellationToken cancellationToken)
         {
             if (!runs.TryGetValue(tag, out var run))
                 runs[tag] = run = new TagMonthRun(tag, month);
             if (!indexes.TryGetValue(tag, out var index))
                 indexes[tag] = index = new ItemRunIndex();
-            var part = run.PartHashes.Count;
+            var part = state.ReservePart(tag);
             if (part > byte.MaxValue)
                 throw new InvalidOperationException($"{run.Tag} {run.Month} needs more than {byte.MaxValue + 1} parts; raise MAX_ROWS_PER_PART");
             var block = ArchivedAuctionBlock.FromAuctions(run.Tag, run.Month, part, ArchivedAuctionBlock.SourceMariaDb, rows);
@@ -477,7 +598,7 @@ namespace Coflnet.Sky.Indexer.Archive
             }
             partsVerified.Inc();
             rowsArchived.Inc(block.RowCount);
-            run.PartHashes.Add(block.Sha256());
+            run.Parts[part] = block.Sha256();
             run.Rows += block.RowCount;
             run.SoldRows += block.IsSold.Count(s => s);
             foreach (var row in rows)
@@ -521,13 +642,73 @@ namespace Coflnet.Sky.Indexer.Archive
             }
             public string Tag { get; }
             public int Month { get; }
-            public List<string> PartHashes { get; } = new();
+            /// <summary>Verified part hashes by part number inside the tag-month.</summary>
+            public SortedDictionary<int, string> Parts { get; } = new();
+            /// <summary>The hashes in part order.</summary>
+            public IReadOnlyList<string> PartHashes => Parts.Values.ToList();
+            /// <summary>True when the part numbers are exactly 0..n-1.</summary>
+            public bool IsDense => Parts.Count == 0 || Parts.Keys.First() == 0 && Parts.Keys.Last() == Parts.Count - 1;
             public int Rows { get; set; }
             public int SoldRows { get; set; }
             public int IndexRows { get; set; }
             public int IndexBidderRows { get; set; }
             public long BidsWithoutBidder { get; set; }
             public DateTime? ArchivedAt { get; set; }
+        }
+
+        /// <summary>
+        /// Shared state of one month while its items run concurrently: the merged per-tag runs and the next part number of each tag.
+        /// Everything is guarded by one lock; items only touch it to reserve a part number and, once finished, to merge their private runs.
+        /// </summary>
+        internal sealed class MonthRuns
+        {
+            private readonly object gate = new();
+            private readonly Dictionary<string, int> nextPart = new(StringComparer.Ordinal);
+
+            /// <summary>Merged runs of the restored and the finished items. Read it only when no item is running.</summary>
+            public Dictionary<string, TagMonthRun> Runs { get; } = new(StringComparer.Ordinal);
+
+            /// <summary>The next unused part number of a tag-month; every call returns a new one.</summary>
+            public int ReservePart(string tag)
+            {
+                lock (gate)
+                {
+                    var part = nextPart.GetValueOrDefault(tag);
+                    nextPart[tag] = part + 1;
+                    return part;
+                }
+            }
+
+            /// <summary>Take over runs rebuilt from checkpoints (dense part numbers), new parts continue behind them.</summary>
+            public void Restore(Dictionary<string, TagMonthRun> restored)
+            {
+                lock (gate)
+                    foreach (var (tag, run) in restored)
+                    {
+                        Runs[tag] = run;
+                        nextPart[tag] = Math.Max(nextPart.GetValueOrDefault(tag), run.Parts.Count);
+                    }
+            }
+
+            /// <summary>Add the runs of a finished item (its parts keep the numbers they reserved).</summary>
+            public void Merge(Dictionary<string, TagMonthRun> item)
+            {
+                lock (gate)
+                    foreach (var (tag, local) in item)
+                    {
+                        if (!Runs.TryGetValue(tag, out var run))
+                            Runs[tag] = run = new TagMonthRun(tag, local.Month);
+                        foreach (var (part, hash) in local.Parts)
+                            run.Parts.Add(part, hash);
+                        run.Rows += local.Rows;
+                        run.SoldRows += local.SoldRows;
+                        run.IndexRows += local.IndexRows;
+                        run.IndexBidderRows += local.IndexBidderRows;
+                        run.BidsWithoutBidder += local.BidsWithoutBidder;
+                        if (local.ArchivedAt != null && (run.ArchivedAt == null || local.ArchivedAt < run.ArchivedAt))
+                            run.ArchivedAt = local.ArchivedAt;
+                    }
+            }
         }
 
         /// <summary>Index tuples of one tag collected while one ItemId is paged.</summary>
@@ -642,62 +823,52 @@ namespace Coflnet.Sky.Indexer.Archive
             }
         }
 
-        /// <summary>Load bids, item bytes, nbt lookups, enchantments, coop members and claimed bidders of a page with one query per table and <see cref="ArchiveOptions.ChildQueryBatchSize"/> ids.</summary>
+        /// <summary>
+        /// Load bids, item bytes, nbt lookups, enchantments, coop members and claimed bidders of a page with one query per table and
+        /// <see cref="ArchiveOptions.ChildQueryBatchSize"/> ids. The queries of all chunks run concurrently (at most
+        /// <see cref="ArchiveOptions.ChildQueryParallelism"/>, each on its own connection); every result lands in the slot of its chunk, so the
+        /// assembled children equal those of a sequential load. A query that hits the statement timeout is split, see <see cref="QueryWithSplitAsync{T}"/>.
+        /// </summary>
         protected virtual async Task LoadChildrenAsync(List<SaveAuction> page, CancellationToken cancellationToken)
         {
             var ids = page.Select(a => a.Id).ToList();
             var nbtIds = page.Where(a => a.NbtDataId != null).Select(a => a.NbtDataId.Value).Distinct().ToList();
-            using var db = ArchiveReadContext.Open(config);
-            var batchSize = ArchiveOptions.From(config).ChildQueryBatchSize;
-            var bids = new List<(int? AuctionId, SaveBids Bid)>();
-            var nbt = new Dictionary<int, NbtData>();
-            var lookups = new List<NBTLookup>();
-            var enchantments = new List<Enchantment>();
-            var coop = new List<(int? AuctionId, string value)>();
-            var claimed = new List<(int? AuctionId, string value)>();
-            foreach (var chunk in Chunk(ids, batchSize))
-            {
-                var nullableIds = chunk.Select(i => (int?)i).ToList();
-                var chunkBids = await db.Bids.AsNoTracking()
-                    .Where(b => nullableIds.Contains(EF.Property<int?>(b, "Uuid")))
-                    .OrderBy(b => b.Id)
-                    .Select(b => new { AuctionId = EF.Property<int?>(b, "Uuid"), Bid = b })
-                    .ToListAsync(cancellationToken).ConfigureAwait(false);
-                bids.AddRange(chunkBids.Select(b => (b.AuctionId, b.Bid)));
-                lookups.AddRange(await db.NBTLookups.AsNoTracking()
-                    .Where(l => chunk.Contains(l.AuctionId))
-                    .ToListAsync(cancellationToken).ConfigureAwait(false));
-                enchantments.AddRange(await db.Enchantment.AsNoTracking()
-                    .Where(e => chunk.Contains(e.SaveAuctionId))
-                    .OrderBy(e => e.Id)
-                    .ToListAsync(cancellationToken).ConfigureAwait(false));
-                var chunkCoop = await db.Set<UuId>().AsNoTracking()
-                    .Where(u => nullableIds.Contains(EF.Property<int?>(u, "SaveAuctionId1")))
-                    .OrderBy(u => u.Id)
-                    .Select(u => new { AuctionId = EF.Property<int?>(u, "SaveAuctionId1"), u.value })
-                    .ToListAsync(cancellationToken).ConfigureAwait(false);
-                coop.AddRange(chunkCoop.Select(c => (c.AuctionId, c.value)));
-                var chunkClaimed = await db.Set<UuId>().AsNoTracking()
-                    .Where(u => nullableIds.Contains(EF.Property<int?>(u, "SaveAuctionId")))
-                    .OrderBy(u => u.Id)
-                    .Select(u => new { AuctionId = EF.Property<int?>(u, "SaveAuctionId"), u.value })
-                    .ToListAsync(cancellationToken).ConfigureAwait(false);
-                claimed.AddRange(chunkClaimed.Select(c => (c.AuctionId, c.value)));
-            }
-            foreach (var chunk in Chunk(nbtIds, batchSize))
-            {
-                var rows = await db.Set<NbtData>().AsNoTracking()
-                    .Where(n => chunk.Contains(n.Id))
-                    .ToListAsync(cancellationToken).ConfigureAwait(false);
-                foreach (var n in rows)
-                    nbt[n.Id] = n;
-            }
+            var options = ArchiveOptions.From(config);
+            var chunks = Chunk(ids, options.ChildQueryBatchSize).ToList();
+            var nbtChunks = Chunk(nbtIds, options.ChildQueryBatchSize).ToList();
+            var bids = new List<(int? AuctionId, SaveBids Bid)>[chunks.Count];
+            var lookups = new List<NBTLookup>[chunks.Count];
+            var enchantments = new List<Enchantment>[chunks.Count];
+            var coop = new List<(int? AuctionId, string value)>[chunks.Count];
+            var claimed = new List<(int? AuctionId, string value)>[chunks.Count];
+            var nbtRows = new List<NbtData>[nbtChunks.Count];
 
-            var bidsBy = bids.ToLookup(b => b.AuctionId, b => b.Bid);
-            var lookupsBy = lookups.ToLookup(l => l.AuctionId);
-            var enchantmentsBy = enchantments.ToLookup(e => e.SaveAuctionId);
-            var coopBy = coop.ToLookup(c => c.AuctionId, c => new UuId(c.value));
-            var claimedBy = claimed.ToLookup(c => c.AuctionId, c => new UuId(c.value));
+            var work = new List<Func<CancellationToken, Task>>();
+            for (var i = 0; i < chunks.Count; i++)
+            {
+                var (index, chunk) = (i, chunks[i]);
+                work.Add(async ct => bids[index] = await QueryWithSplitAsync("Bids", chunk, QueryBidsAsync, logger, ct).ConfigureAwait(false));
+                work.Add(async ct => lookups[index] = await QueryWithSplitAsync("NBTLookups", chunk, QueryNbtLookupsAsync, logger, ct).ConfigureAwait(false));
+                work.Add(async ct => enchantments[index] = await QueryWithSplitAsync("Enchantment", chunk, QueryEnchantmentsAsync, logger, ct).ConfigureAwait(false));
+                work.Add(async ct => coop[index] = await QueryWithSplitAsync("UuId_coop", chunk, QueryCoopAsync, logger, ct).ConfigureAwait(false));
+                work.Add(async ct => claimed[index] = await QueryWithSplitAsync("UuId_claimed", chunk, QueryClaimedAsync, logger, ct).ConfigureAwait(false));
+            }
+            for (var i = 0; i < nbtChunks.Count; i++)
+            {
+                var (index, chunk) = (i, nbtChunks[i]);
+                work.Add(async ct => nbtRows[index] = await QueryWithSplitAsync("NbtData", chunk, QueryNbtDataAsync, logger, ct).ConfigureAwait(false));
+            }
+            await Parallel.ForEachAsync(work, new ParallelOptions { MaxDegreeOfParallelism = options.ChildQueryParallelism, CancellationToken = cancellationToken },
+                async (query, ct) => await query(ct).ConfigureAwait(false)).ConfigureAwait(false);
+
+            var nbt = new Dictionary<int, NbtData>();
+            foreach (var n in nbtRows.SelectMany(r => r))
+                nbt[n.Id] = n;
+            var bidsBy = bids.SelectMany(r => r).ToLookup(b => b.AuctionId, b => b.Bid);
+            var lookupsBy = lookups.SelectMany(r => r).ToLookup(l => l.AuctionId);
+            var enchantmentsBy = enchantments.SelectMany(r => r).ToLookup(e => e.SaveAuctionId);
+            var coopBy = coop.SelectMany(r => r).ToLookup(c => c.AuctionId, c => new UuId(c.value));
+            var claimedBy = claimed.SelectMany(r => r).ToLookup(c => c.AuctionId, c => new UuId(c.value));
             foreach (var a in page)
             {
                 a.Bids = bidsBy[a.Id].ToList();
@@ -707,6 +878,78 @@ namespace Coflnet.Sky.Indexer.Archive
                 a.CoopMembers = coopBy[a.Id].ToList();
                 a.ClaimedBids = claimedBy[a.Id].ToList();
             }
+        }
+
+        // One method per child table, each opens its own read context (a DbContext is not thread-safe) and returns its rows ordered by Id.
+
+        /// <summary>Bids of the auctions (by <c>Uuid</c> foreign key), ordered by bid id.</summary>
+        protected virtual async Task<List<(int? AuctionId, SaveBids Bid)>> QueryBidsAsync(IReadOnlyList<int> chunk, CancellationToken cancellationToken)
+        {
+            using var db = ArchiveReadContext.Open(config);
+            var nullableIds = chunk.Select(i => (int?)i).ToList();
+            var rows = await db.Bids.AsNoTracking()
+                .Where(b => nullableIds.Contains(EF.Property<int?>(b, "Uuid")))
+                .OrderBy(b => b.Id)
+                .Select(b => new { AuctionId = EF.Property<int?>(b, "Uuid"), Bid = b })
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            return rows.Select(b => (b.AuctionId, b.Bid)).ToList();
+        }
+
+        /// <summary>NBT lookups of the auctions.</summary>
+        protected virtual async Task<List<NBTLookup>> QueryNbtLookupsAsync(IReadOnlyList<int> chunk, CancellationToken cancellationToken)
+        {
+            using var db = ArchiveReadContext.Open(config);
+            var ids = chunk.ToList();
+            return await db.NBTLookups.AsNoTracking()
+                .Where(l => ids.Contains(l.AuctionId))
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>Enchantments of the auctions, ordered by id.</summary>
+        protected virtual async Task<List<Enchantment>> QueryEnchantmentsAsync(IReadOnlyList<int> chunk, CancellationToken cancellationToken)
+        {
+            using var db = ArchiveReadContext.Open(config);
+            var ids = chunk.ToList();
+            return await db.Enchantment.AsNoTracking()
+                .Where(e => ids.Contains(e.SaveAuctionId))
+                .OrderBy(e => e.Id)
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>Coop members (<c>UuId.SaveAuctionId1</c>), ordered by id.</summary>
+        protected virtual async Task<List<(int? AuctionId, string value)>> QueryCoopAsync(IReadOnlyList<int> chunk, CancellationToken cancellationToken)
+        {
+            using var db = ArchiveReadContext.Open(config);
+            var nullableIds = chunk.Select(i => (int?)i).ToList();
+            var rows = await db.Set<UuId>().AsNoTracking()
+                .Where(u => nullableIds.Contains(EF.Property<int?>(u, "SaveAuctionId1")))
+                .OrderBy(u => u.Id)
+                .Select(u => new { AuctionId = EF.Property<int?>(u, "SaveAuctionId1"), u.value })
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            return rows.Select(c => (c.AuctionId, c.value)).ToList();
+        }
+
+        /// <summary>Claimed bidders (<c>UuId.SaveAuctionId</c>), ordered by id.</summary>
+        protected virtual async Task<List<(int? AuctionId, string value)>> QueryClaimedAsync(IReadOnlyList<int> chunk, CancellationToken cancellationToken)
+        {
+            using var db = ArchiveReadContext.Open(config);
+            var nullableIds = chunk.Select(i => (int?)i).ToList();
+            var rows = await db.Set<UuId>().AsNoTracking()
+                .Where(u => nullableIds.Contains(EF.Property<int?>(u, "SaveAuctionId")))
+                .OrderBy(u => u.Id)
+                .Select(u => new { AuctionId = EF.Property<int?>(u, "SaveAuctionId"), u.value })
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            return rows.Select(c => (c.AuctionId, c.value)).ToList();
+        }
+
+        /// <summary>Item bytes (<c>NbtData</c>) by their own ids.</summary>
+        protected virtual async Task<List<NbtData>> QueryNbtDataAsync(IReadOnlyList<int> chunk, CancellationToken cancellationToken)
+        {
+            using var db = ArchiveReadContext.Open(config);
+            var ids = chunk.ToList();
+            return await db.Set<NbtData>().AsNoTracking()
+                .Where(n => ids.Contains(n.Id))
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary>

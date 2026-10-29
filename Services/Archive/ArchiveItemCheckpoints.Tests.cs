@@ -91,7 +91,7 @@ public class ArchiveItemCheckpointsTests
         private static IConfiguration Config() => new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string>
         {
             ["ARCHIVE:ENABLED"] = "true", ["ARCHIVE:OLDEST_MONTH"] = "2026-09", ["ARCHIVE:MAX_ROWS_PER_PART"] = "2",
-            ["ARCHIVE:PAGE_PAUSE_MS"] = "0", ["ARCHIVE:TAG_PAUSE_MS"] = "0", ["ARCHIVE:MONTH_PAUSE_MS"] = "0",
+            ["ARCHIVE:PAGE_PAUSE_MS"] = "0", ["ARCHIVE:TAG_PAUSE_MS"] = "0", ["ARCHIVE:MONTH_PAUSE_MS"] = "0", ["ARCHIVE:ITEM_PARALLELISM"] = "1",
         }).Build();
 
         protected override Task<IReadOnlyDictionary<int, DateTime>> GetAuctionItemFirstEndsAsync(CancellationToken ct)

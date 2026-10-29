@@ -27,8 +27,8 @@ public class ArchiveOptionsTests
     {
         // 1,000 ms per ItemId-month with rows made a full backfill take days in pauses alone.
         var o = ArchiveOptions.From(Config());
-        Assert.That(o.TagPauseMs, Is.EqualTo(100));
-        Assert.That(o.PagePauseMs, Is.EqualTo(200));
+        Assert.That(o.TagPauseMs, Is.EqualTo(0));
+        Assert.That(o.PagePauseMs, Is.EqualTo(0));
     }
 
     [Test]
@@ -68,14 +68,44 @@ public class ArchiveOptionsTests
     {
         var o = ArchiveOptions.From(Config(("TAG_PAUSE_MS", "250"), ("PAGE_PAUSE_MS", "not-a-number")));
         Assert.That(o.TagPauseMs, Is.EqualTo(250));
-        Assert.That(o.PagePauseMs, Is.EqualTo(200));
+        Assert.That(o.PagePauseMs, Is.EqualTo(0));
     }
 
     [Test]
     public void From_ChildQueryBatchSize_DefaultOverrideAndMinimum()
     {
-        Assert.That(ArchiveOptions.From(Config()).ChildQueryBatchSize, Is.EqualTo(100));
+        Assert.That(ArchiveOptions.From(Config()).ChildQueryBatchSize, Is.EqualTo(180));
         Assert.That(ArchiveOptions.From(Config(("CHILD_QUERY_BATCH_SIZE", "150"))).ChildQueryBatchSize, Is.EqualTo(150));
         Assert.That(ArchiveOptions.From(Config(("CHILD_QUERY_BATCH_SIZE", "0"))).ChildQueryBatchSize, Is.EqualTo(1));
+    }
+
+    [TestCase("199", 199)]
+    [TestCase("200", 199)]
+    [TestCase("5000", 199)]
+    public void From_ChildQueryBatchSize_IsClampedBelowTheMariaDbIndexDiveLimit(string configured, int expected)
+    {
+        // an IN list of 200 ids made the optimizer scan the all-NULL UuId.SaveAuctionId index (583M rows)
+        var o = ArchiveOptions.From(Config(("CHILD_QUERY_BATCH_SIZE", configured)));
+        Assert.That(o.ChildQueryBatchSize, Is.EqualTo(expected));
+        Assert.That(o.ChildQueryBatchSize, Is.LessThan(200));
+        Assert.That(o.RequestedChildQueryBatchSize, Is.EqualTo(int.Parse(configured)));
+    }
+
+    [Test]
+    public void Defaults_Parallelism_AndShippedAppsettingsAgree()
+    {
+        var o = ArchiveOptions.From(Config());
+        Assert.That((o.ItemParallelism, o.ChildQueryParallelism), Is.EqualTo((4, 6)));
+        Assert.That(ArchiveOptions.From(Config(("ITEM_PARALLELISM", "0"), ("CHILD_QUERY_PARALLELISM", "-3"))).ItemParallelism, Is.EqualTo(1));
+        var shipped = ArchiveOptions.From(new ConfigurationBuilder().AddJsonFile(System.IO.Path.Combine(ProjectDir(), "appsettings.json")).Build());
+        Assert.That((shipped.ItemParallelism, shipped.ChildQueryParallelism, shipped.ChildQueryBatchSize), Is.EqualTo((4, 6, 180)));
+    }
+
+    private static string ProjectDir()
+    {
+        for (var dir = new System.IO.DirectoryInfo(System.AppContext.BaseDirectory); dir != null; dir = dir.Parent)
+            if (System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "SkyIndexer.csproj")))
+                return dir.FullName;
+        throw new System.IO.FileNotFoundException("SkyIndexer.csproj");
     }
 }

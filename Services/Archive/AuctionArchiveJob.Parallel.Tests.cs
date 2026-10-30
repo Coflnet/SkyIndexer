@@ -128,12 +128,35 @@ public class AuctionArchiveJobParallelTests
 
         protected override Task<IReadOnlyDictionary<string, int>> ResolvePlayerIdsAsync(IReadOnlyList<string> uuids, CancellationToken ct)
             => Task.FromResult<IReadOnlyDictionary<string, int>>(new Dictionary<string, int>());
-        protected override Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers, CancellationToken ct)
+        /// <summary>Runs the real statement loop (with its retries) on top of <see cref="OnIndexSql"/> instead of the in-memory index.</summary>
+        public bool RealIndexWrites;
+        /// <summary>Stands in for one index INSERT on the primary when <see cref="RealIndexWrites"/> is set.</summary>
+        public Func<string, CancellationToken, Task> OnIndexSql = (sql, ct) => Task.CompletedTask;
+        /// <summary>Runs inside every index write (fake or real) while it counts as in flight.</summary>
+        public Func<CancellationToken, Task> OnIndexWrite = ct => Task.CompletedTask;
+        public int IndexWritesInFlight, MaxIndexWritesInFlight;
+        protected override async Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers, CancellationToken ct)
         {
-            foreach (var (uid, part) in locations)
-                Locations[uid] = (tagId, part);
-            return Task.CompletedTask;
+            var running = Interlocked.Increment(ref IndexWritesInFlight);
+            int max;
+            while ((max = MaxIndexWritesInFlight) < running && Interlocked.CompareExchange(ref MaxIndexWritesInFlight, running, max) != max) { }
+            try
+            {
+                await OnIndexWrite(ct);
+                if (RealIndexWrites)
+                {
+                    await base.WriteIndexRowsAsync(tagId, month, locations, bidders, sellers, ct);
+                    return;
+                }
+                foreach (var (uid, part) in locations)
+                    Locations[uid] = (tagId, part);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref IndexWritesInFlight);
+            }
         }
+        protected override Task ExecuteIndexSqlAsync(string sql, CancellationToken ct) => OnIndexSql(sql, ct);
         public readonly ConcurrentDictionary<long, (ushort tag, byte part)> Locations = new();
         protected override Task UpsertArchivedMonthAsync(ArchivedMonth row, CancellationToken ct)
         {
@@ -421,6 +444,95 @@ public class AuctionArchiveJobParallelTests
         Assert.That(await store.ReadIndexAsync("SHARED"), Is.Null, "no tag-month is finalized");
         Assert.That(job.Months, Is.Empty);
         Assert.That(cp.Log.Where(l => l.StartsWith("finalized")), Is.Empty);
+    }
+
+    // ---------------------------------------------------------------- primary index writes
+
+    [Test]
+    public async Task IndexWrite_TimeoutOnAStatement_IsRetriedOnItsOwn_AndTheItemSucceeds()
+    {
+        var job = new Job(store, cp, ("ARCHIVE:ITEM_PARALLELISM", "1")) { RealIndexWrites = true };
+        Seed(job, 1, 4);
+        var attempts = new ConcurrentDictionary<string, int>();
+        var calls = 0;
+        job.OnIndexSql = (sql, ct) =>
+        {
+            Interlocked.Increment(ref calls);
+            // every statement times out on its first run and on its second one it deadlocks, the third run works
+            var n = attempts.AddOrUpdate(sql, 1, (_, c) => c + 1);
+            return n == 1 ? throw Timeout() : n == 2 ? throw ServerError(1213, "Deadlock found when trying to get lock") : Task.CompletedTask;
+        };
+        var before = AuctionArchiveJob.IndexWriteRetries("index_sql");
+
+        Assert.That(await job.Month(new[] { 1 }), Is.True);
+
+        Assert.That(attempts.Count, Is.GreaterThanOrEqualTo(2), "location and seller/bidder statements");
+        Assert.That(attempts.Values, Is.All.EqualTo(3), "each statement is retried on its own, not the whole write");
+        Assert.That(AuctionArchiveJob.IndexWriteRetries("index_sql") - before, Is.EqualTo(attempts.Count * 2));
+        Assert.That(cp.Data.Keys, Is.EquivalentTo(new[] { 1 }));
+    }
+
+    [Test]
+    public void IndexWrite_TimeoutsBeyondTheRetryLimit_FailThePass()
+    {
+        var job = new Job(store, cp, ("ARCHIVE:ITEM_PARALLELISM", "1")) { RealIndexWrites = true };
+        Seed(job, 1, 4);
+        var calls = 0;
+        job.OnIndexSql = (sql, ct) => { Interlocked.Increment(ref calls); throw Timeout(); };
+
+        var ex = Assert.ThrowsAsync<MySqlConnector.MySqlException>(() => job.Month(new[] { 1 }));
+
+        Assert.That(ex.Number, Is.EqualTo(1969));
+        Assert.That(calls, Is.EqualTo(1 + AuctionArchiveJob.PrimaryWriteRetryDelays.Length), "first run plus three re-runs of the failing statement");
+        Assert.That(cp.Data, Is.Empty);
+        Assert.That(job.Months, Is.Empty, "nothing is finalized");
+    }
+
+    [TestCase(1062)]
+    [TestCase(1146)]
+    public void IndexWrite_OtherServerErrors_AreNotRetried(int number)
+    {
+        var job = new Job(store, cp, ("ARCHIVE:ITEM_PARALLELISM", "1")) { RealIndexWrites = true };
+        Seed(job, 1, 4);
+        var calls = 0;
+        job.OnIndexSql = (sql, ct) => { Interlocked.Increment(ref calls); throw ServerError(number, "nope"); };
+        var before = AuctionArchiveJob.IndexWriteRetries("index_sql");
+
+        var ex = Assert.ThrowsAsync<MySqlConnector.MySqlException>(() => job.Month(new[] { 1 }));
+
+        Assert.That(ex.Number, Is.EqualTo(number));
+        Assert.That(calls, Is.EqualTo(1));
+        Assert.That(AuctionArchiveJob.IndexWriteRetries("index_sql"), Is.EqualTo(before));
+    }
+
+    [Test]
+    public void IndexWrite_NonMySqlError_IsNotRetried()
+    {
+        var job = new Job(store, cp, ("ARCHIVE:ITEM_PARALLELISM", "1")) { RealIndexWrites = true };
+        Seed(job, 1, 4);
+        var calls = 0;
+        job.OnIndexSql = (sql, ct) => { Interlocked.Increment(ref calls); throw new InvalidOperationException("boom"); };
+
+        Assert.ThrowsAsync<InvalidOperationException>(() => job.Month(new[] { 1 }));
+
+        Assert.That(calls, Is.EqualTo(1));
+    }
+
+    [TestCase(1, 1)]
+    [TestCase(2, 2)]
+    public async Task IndexWrite_ParallelItems_NeverExceedIndexWriteParallelism(int configured, int expectedMax)
+    {
+        var job = new Job(store, cp, ("ARCHIVE:ITEM_PARALLELISM", "6"), ("ARCHIVE:INDEX_WRITE_PARALLELISM", configured.ToString()));
+        Seed(job, 12, 3);
+        job.OnIndexWrite = ct => Task.Delay(25, ct); // long enough for the other items to queue up
+        var pages = 0;
+        job.OnPage = (item, take, ct) => { Interlocked.Increment(ref pages); return Task.CompletedTask; };
+
+        Assert.That(await job.Month(Enumerable.Range(1, 12).ToList()), Is.True);
+
+        Assert.That(job.MaxIndexWritesInFlight, Is.EqualTo(expectedMax), "bounded by the semaphore, and the items did overlap");
+        Assert.That(cp.Data.Count, Is.EqualTo(12));
+        Assert.That(job.Locations.Count, Is.EqualTo(job.Auctions.Count));
     }
 
     private const int Timeout_Infinite = System.Threading.Timeout.Infinite;

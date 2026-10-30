@@ -26,6 +26,10 @@ namespace Coflnet.Sky.Indexer.Archive
         /// <summary>ItemIds of a month archived at the same time. Replica connections used are about <c>ItemParallelism * (ChildQueryParallelism + 1)</c>
         /// (MySqlConnector's default MaxPoolSize is 100).</summary>
         public int ItemParallelism { get; init; } = 4;
+        /// <summary>Index bulk inserts (locations, bidders, sellers) running on the primary at the same time, across all parallel items.</summary>
+        public int IndexWriteParallelism { get; init; } = 1;
+        /// <summary>Command timeout in seconds of the primary writes (the default of 30 s is too short for a busy disk).</summary>
+        public int IndexWriteTimeoutSeconds { get; init; } = 300;
         public int PagePauseMs { get; init; } = 0;
         /// <summary>Pause after an ItemId-month that had rows; each visit is one keyset page query on (ItemId, End).</summary>
         public int TagPauseMs { get; init; } = 0;
@@ -66,6 +70,8 @@ namespace Coflnet.Sky.Indexer.Archive
                 RequestedChildQueryBatchSize = Int(s["CHILD_QUERY_BATCH_SIZE"], d.ChildQueryBatchSize),
                 ChildQueryParallelism = System.Math.Max(1, Int(s["CHILD_QUERY_PARALLELISM"], d.ChildQueryParallelism)),
                 ItemParallelism = System.Math.Max(1, Int(s["ITEM_PARALLELISM"], d.ItemParallelism)),
+                IndexWriteParallelism = System.Math.Max(1, Int(s["INDEX_WRITE_PARALLELISM"], d.IndexWriteParallelism)),
+                IndexWriteTimeoutSeconds = System.Math.Max(1, Int(s["INDEX_WRITE_TIMEOUT_SECONDS"], d.IndexWriteTimeoutSeconds)),
                 PagePauseMs = Int(s["PAGE_PAUSE_MS"], d.PagePauseMs),
                 TagPauseMs = Int(s["TAG_PAUSE_MS"], d.TagPauseMs),
                 MonthPauseMs = Int(s["MONTH_PAUSE_MS"], d.MonthPauseMs),

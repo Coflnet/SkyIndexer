@@ -101,6 +101,17 @@ public class ArchiveOptionsTests
         Assert.That((shipped.ItemParallelism, shipped.ChildQueryParallelism, shipped.ChildQueryBatchSize), Is.EqualTo((4, 6, 180)));
     }
 
+    [Test]
+    public void IndexWriteOptions_DefaultsClampAndShippedAppsettingsAgree()
+    {
+        var o = ArchiveOptions.From(Config());
+        Assert.That((o.IndexWriteParallelism, o.IndexWriteTimeoutSeconds), Is.EqualTo((1, 300)));
+        var odd = ArchiveOptions.From(Config(("INDEX_WRITE_PARALLELISM", "0"), ("INDEX_WRITE_TIMEOUT_SECONDS", "-5")));
+        Assert.That((odd.IndexWriteParallelism, odd.IndexWriteTimeoutSeconds), Is.EqualTo((1, 1)));
+        var shipped = ArchiveOptions.From(new ConfigurationBuilder().AddJsonFile(System.IO.Path.Combine(ProjectDir(), "appsettings.json")).Build());
+        Assert.That((shipped.IndexWriteParallelism, shipped.IndexWriteTimeoutSeconds), Is.EqualTo((1, 300)));
+    }
+
     private static string ProjectDir()
     {
         for (var dir = new System.IO.DirectoryInfo(System.AppContext.BaseDirectory); dir != null; dir = dir.Parent)

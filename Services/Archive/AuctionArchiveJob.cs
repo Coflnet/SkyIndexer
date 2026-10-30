@@ -53,6 +53,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private static readonly Prometheus.Counter pages = Prometheus.Metrics.CreateCounter("sky_indexer_archive_pages", "Auction pages read from MariaDB");
         private static readonly Prometheus.Counter errors = Prometheus.Metrics.CreateCounter("sky_indexer_archive_errors", "Archive errors (tag-months that failed with an exception, tag collisions)");
         private static readonly Prometheus.Counter childQueryRetries = Prometheus.Metrics.CreateCounter("sky_indexer_archive_child_query_retries_total", "Child or page queries re-run in smaller pieces after a statement timeout", new Prometheus.CounterConfiguration { LabelNames = new[] { "table" } });
+        private static readonly Prometheus.Counter indexWriteRetries = Prometheus.Metrics.CreateCounter("sky_indexer_archive_index_write_retries_total", "Primary writes re-run after a timeout, deadlock or lock wait timeout", new Prometheus.CounterConfiguration { LabelNames = new[] { "operation" } });
         private static readonly Prometheus.Gauge currentMonth = Prometheus.Metrics.CreateGauge("sky_indexer_archive_current_month", "Month (yyyyMM) being archived");
         private static readonly Prometheus.Gauge lastMonthCompleted = Prometheus.Metrics.CreateGauge("sky_indexer_archive_last_month_completed_timestamp", "Unix time the last month sentinel was written");
 
@@ -422,7 +423,7 @@ namespace Coflnet.Sky.Indexer.Archive
             var monthIndex = ArchiveMonths.ToIndex(month);
             foreach (var (tag, index) in indexes.OrderBy(i => i.Key, StringComparer.Ordinal))
             {
-                var tagId = await GetOrCreateTagIdAsync(tag, cancellationToken).ConfigureAwait(false);
+                var tagId = await RetryPrimaryWriteAsync("tag_id", () => GetOrCreateTagIdAsync(tag, cancellationToken), cancellationToken).ConfigureAwait(false);
                 var bidders = index.Bidders.Select(kv => new AuctionBidder { BidderId = kv.Key.bidder, Uid = kv.Key.uid, End = kv.Value.end }).ToList();
                 var sellers = index.Sellers.Select(kv => new AuctionSeller { SellerId = kv.Key.seller, Uid = kv.Key.uid, End = kv.Value }).ToList();
                 if (index.UnnumberedSellers.Count > 0)
@@ -430,7 +431,17 @@ namespace Coflnet.Sky.Indexer.Archive
                     var ids = await PlayerIdLookup.ResolveAsync(index.UnnumberedSellers.Keys.Select(k => k.uuid), ResolvePlayerIdsAsync, cancellationToken).ConfigureAwait(false);
                     sellers.AddRange(ScyllaArchiveImportWorker.ResolveSellers(index.UnnumberedSellers, ids));
                 }
-                await WriteIndexRowsAsync(tagId, monthIndex, index.Locations, bidders, sellers, cancellationToken).ConfigureAwait(false);
+                // bulk inserts on the primary: serialized (default one at a time) so parallel items do not pile up on its disk
+                var gate = IndexWriteGate(options);
+                await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await WriteIndexRowsAsync(tagId, monthIndex, index.Locations, bidders, sellers, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    gate.Release();
+                }
                 indexRowsWritten.Inc(index.Locations.Count);
                 bidderRowsWritten.Inc(bidders.Count);
                 sellerRowsWritten.Inc(sellers.Count);
@@ -445,6 +456,64 @@ namespace Coflnet.Sky.Indexer.Archive
         private const int MinPageSize = 100;
         private const int MinChildChunk = 10;
         private const int MaxChildSplitDepth = 3;
+
+        /// <summary>Waits before the 1st, 2nd and 3rd re-run of a failed primary write (so up to 4 attempts).</summary>
+        internal static readonly TimeSpan[] PrimaryWriteRetryDelays = { TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15) };
+
+        private SemaphoreSlim indexWriteGate;
+        private readonly object indexWriteGateLock = new();
+
+        /// <summary>Limits concurrent index bulk inserts on the primary, sized by <c>INDEX_WRITE_PARALLELISM</c> on first use.</summary>
+        private SemaphoreSlim IndexWriteGate(ArchiveOptions options)
+        {
+            lock (indexWriteGateLock)
+                return indexWriteGate ??= new SemaphoreSlim(Math.Max(1, options.IndexWriteParallelism));
+        }
+
+        /// <summary>Statement timeout (see <see cref="IsStatementTimeout"/>), deadlock (1213) or lock wait timeout (1205): worth re-running an idempotent write.</summary>
+        internal static bool IsRetryableWriteError(Exception ex)
+        {
+            if (IsStatementTimeout(ex))
+                return true;
+            for (var e = ex; e != null; e = e.InnerException)
+            {
+                if (e is MySqlConnector.MySqlException my && (my.Number == 1213 || my.Number == 1205))
+                    return true;
+                if (e is AggregateException agg && agg.InnerExceptions.Any(IsRetryableWriteError))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>Runs an idempotent primary write, re-running it after <see cref="PrimaryWriteRetryDelays"/> when it hits
+        /// <see cref="IsRetryableWriteError"/>. Other errors, and the failure after the last re-run, propagate.</summary>
+        private async Task<T> RetryPrimaryWriteAsync<T>(string operation, Func<Task<T>> write, CancellationToken cancellationToken)
+        {
+            for (var attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    return await write().ConfigureAwait(false);
+                }
+                catch (Exception ex) when (IsRetryableWriteError(ex) && !cancellationToken.IsCancellationRequested && attempt < PrimaryWriteRetryDelays.Length)
+                {
+                    indexWriteRetries.WithLabels(operation).Inc();
+                    logger.LogWarning(ex, "Primary write {Operation} failed (attempt {Attempt}); retrying in {Delay}", operation, attempt + 1, PrimaryWriteRetryDelays[attempt]);
+                    await Delay(PrimaryWriteRetryDelays[attempt], cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private Task RetryPrimaryWriteAsync(string operation, Func<Task> write, CancellationToken cancellationToken)
+            => RetryPrimaryWriteAsync<bool>(operation, async () => { await write().ConfigureAwait(false); return true; }, cancellationToken);
+
+        /// <summary>A context on the primary with the (longer) <c>INDEX_WRITE_TIMEOUT_SECONDS</c> command timeout.</summary>
+        private ArchiveContext OpenPrimaryWriteContext()
+        {
+            var db = new ArchiveContext();
+            db.Database.SetCommandTimeout(TimeSpan.FromSeconds(ArchiveOptions.From(config).IndexWriteTimeoutSeconds));
+            return db;
+        }
 
         /// <summary>
         /// MariaDB <c>max_statement_time</c> (error 1969, "Query execution was interrupted (max_statement_time exceeded)"), MySQL's
@@ -509,6 +578,9 @@ namespace Coflnet.Sky.Indexer.Archive
         /// <summary>Current value of <c>sky_indexer_archive_child_query_retries_total</c> for a table (tests).</summary>
         internal static double ChildQueryRetries(string table) => childQueryRetries.WithLabels(table).Value;
 
+        /// <summary>Current value of <c>sky_indexer_archive_index_write_retries_total</c> for an operation (tests).</summary>
+        internal static double IndexWriteRetries(string operation) => indexWriteRetries.WithLabels(operation).Value;
+
         /// <summary>
         /// The R2 tag index and the verified <c>archived_months</c> marker of a tag-month (written last). The index write is
         /// conditional (the SkyAuctions Scylla sweep writes the same per-tag object); on a conflict the index is re-read and the
@@ -555,7 +627,7 @@ namespace Coflnet.Sky.Indexer.Archive
                     return false;
                 }
             }
-            await UpsertArchivedMonthAsync(new ArchivedMonth
+            var monthRow = new ArchivedMonth
             {
                 TagId = tagId,
                 Month = ArchiveMonths.ToIndex(run.Month),
@@ -569,7 +641,8 @@ namespace Coflnet.Sky.Indexer.Archive
                 IndexRows = (uint)run.IndexRows,
                 IndexBidderRows = (uint)run.IndexBidderRows,
                 Note = run.BidsWithoutBidder > 0 ? $"{run.BidsWithoutBidder} bids without bidder id not indexed" : null,
-            }, cancellationToken).ConfigureAwait(false);
+            };
+            await RetryPrimaryWriteAsync("archived_month", () => UpsertArchivedMonthAsync(monthRow, cancellationToken), cancellationToken).ConfigureAwait(false);
             logger.LogInformation("Archived {Rows} auctions of {Tag} {Month} in {Parts} parts", run.Rows, run.Tag, run.Month, partHashes.Count);
             return true;
         }
@@ -770,7 +843,7 @@ namespace Coflnet.Sky.Indexer.Archive
         {
             if (tagIds.TryGetValue(tag, out var cached))
                 return cached;
-            using var db = new ArchiveContext();
+            using var db = OpenPrimaryWriteContext();
             var existing = await db.AuctionTags.AsNoTracking().Where(t => t.Tag == tag).Select(t => (ushort?)t.Id).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
             if (existing == null)
             {
@@ -781,9 +854,9 @@ namespace Coflnet.Sky.Indexer.Archive
                     await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
                     existing = entity.Id;
                 }
-                catch (DbUpdateException)
+                catch (DbUpdateException ex) when (!IsRetryableWriteError(ex)) // a duplicate key from a concurrent insert, not a timeout
                 {
-                    using var retry = new ArchiveContext();
+                    using var retry = OpenPrimaryWriteContext();
                     existing = await retry.AuctionTags.AsNoTracking().Where(t => t.Tag == tag).Select(t => (ushort?)t.Id).FirstAsync(cancellationToken).ConfigureAwait(false);
                 }
             }
@@ -959,13 +1032,20 @@ namespace Coflnet.Sky.Indexer.Archive
         /// </summary>
         protected virtual async Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers, CancellationToken cancellationToken)
         {
-            using var db = new ArchiveContext();
+            // every statement is idempotent, so each is re-run on its own after a timeout or deadlock (see RetryPrimaryWriteAsync)
             foreach (var sql in BuildLocationInserts(tagId, month, locations))
-                await db.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
+                await RetryPrimaryWriteAsync("index_sql", () => ExecuteIndexSqlAsync(sql, cancellationToken), cancellationToken).ConfigureAwait(false);
             foreach (var sql in BuildBidderInserts(bidders))
-                await db.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
+                await RetryPrimaryWriteAsync("index_sql", () => ExecuteIndexSqlAsync(sql, cancellationToken), cancellationToken).ConfigureAwait(false);
             foreach (var sql in ArchiveIndexSql.BuildSellerInserts(sellers))
-                await db.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
+                await RetryPrimaryWriteAsync("index_sql", () => ExecuteIndexSqlAsync(sql, cancellationToken), cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>Executes one index INSERT on the primary with a fresh context (the connection of a timed out statement may be broken).</summary>
+        protected virtual async Task ExecuteIndexSqlAsync(string sql, CancellationToken cancellationToken)
+        {
+            using var db = OpenPrimaryWriteContext();
+            await db.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary><c>Players.Id</c> of up to 100 uuids (sellers whose <c>SellerId</c> is 0); unknown uuids are absent.</summary>
@@ -975,7 +1055,7 @@ namespace Coflnet.Sky.Indexer.Archive
         /// <summary>Insert or replace the <c>archived_months</c> row of a tag-month.</summary>
         protected virtual async Task UpsertArchivedMonthAsync(ArchivedMonth row, CancellationToken cancellationToken)
         {
-            using var db = new ArchiveContext();
+            using var db = OpenPrimaryWriteContext();
             var existing = await db.ArchivedMonths.FindAsync(new object[] { row.TagId, row.Month }, cancellationToken).ConfigureAwait(false);
             if (existing == null)
                 db.ArchivedMonths.Add(row);

@@ -49,4 +49,13 @@ public class ArchiveReadContextTests
         Assert.That(text, Does.Not.Contain("password"));
         Assert.That(text, Does.Not.Contain("skyblock"));
     }
+
+    [Test]
+    public void DescriptionCannotMistakeQuotedPasswordPartsForEndpoints()
+    {
+        var text = ArchiveReadContext.ReadConnectionDescription(Config(("DBReadOnlyConnection",
+            "Password=\";server=synthetic-secret;port=9999\";Server=replica.example;Port=3307")));
+        Assert.That(text, Does.Contain("server=replica.example").And.Contain("port=3307"));
+        Assert.That(text, Does.Not.Contain("synthetic-secret").And.Not.Contain("9999"));
+    }
 }

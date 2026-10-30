@@ -1,12 +1,15 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /build
 RUN echo "new revision "
-ARG CACHEBUST=2026102702
-RUN git clone --depth=1 https://github.com/Coflnet/HypixelSkyblock.git dev
+ARG HYPIXEL_CORE_REVISION=18ea1aaf3c3298d7eff54cd4e342243318141d10
+RUN git clone --depth=1 https://github.com/Coflnet/HypixelSkyblock.git dev \
+    && git -C dev fetch --depth=1 origin "$HYPIXEL_CORE_REVISION" \
+    && git -C dev checkout --detach FETCH_HEAD
 WORKDIR /build/sky
 COPY SkyIndexer.csproj SkyIndexer.csproj
 RUN dotnet restore
 COPY . .
+RUN dotnet test --no-restore --nologo
 RUN dotnet publish -c release -o /artifact
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0

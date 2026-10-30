@@ -13,6 +13,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Coflnet.Core" Version="0.7.5" />
     <PackageReference Include="AWSSDK.S3" Version="3.7.511.8" />
     <PackageReference Include="CassandraCSharpDriver" Version="3.23.0" />
     <PackageReference Include="Coflnet.Sky.McConnect" Version="0.6.0" />

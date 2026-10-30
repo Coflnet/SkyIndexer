@@ -1,7 +1,7 @@
-using System.Text.RegularExpressions;
 using Coflnet.Sky.Core;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using MySqlConnector;
 
 namespace Coflnet.Sky.Indexer.Archive
 {
@@ -36,14 +36,8 @@ namespace Coflnet.Sky.Indexer.Archive
         {
             if (!UsesReadReplica(config))
                 return "DBConnection (no DBReadOnlyConnection configured)";
-            var conn = config["DBReadOnlyConnection"];
-            return $"DBReadOnlyConnection (server={Part(conn, "server|host|data source")}, port={Part(conn, "port")})";
-        }
-
-        private static string Part(string conn, string keys)
-        {
-            var m = Regex.Match(conn, $@"(?:^|;)\s*(?:{keys})\s*=\s*([^;]*)", RegexOptions.IgnoreCase);
-            return m.Success ? m.Groups[1].Value.Trim() : "default";
+            var connection = new MySqlConnectionStringBuilder(config["DBReadOnlyConnection"]);
+            return $"DBReadOnlyConnection (server={connection.Server}, port={connection.Port})";
         }
     }
 }

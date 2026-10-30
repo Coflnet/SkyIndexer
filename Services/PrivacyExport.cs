@@ -271,6 +271,7 @@ internal sealed class PrivacyExport
     {
         var config = new ConfigurationBuilder().AddJsonFile("appsettings.json", true).AddEnvironmentVariables().AddOpenBaoFromEnvironment().Build();
         HypixelContext.SetConfiguration(config);
+        new Infrastructure.DatabaseTls(config).Install();
         return config;
     }
 

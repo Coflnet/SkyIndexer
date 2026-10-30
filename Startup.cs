@@ -4,6 +4,7 @@ using Coflnet.Sky.Core;
 using Coflnet.Sky.Core.Archive;
 using Coflnet.Sky.Indexer.Archive;
 using Coflnet.Sky.Indexer.Controllers;
+using Coflnet.Sky.Indexer.Infrastructure;
 using Coflnet.Sky.Items.Client.Api;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -108,6 +109,18 @@ namespace Coflnet.Sky.Indexer
             {
                 endpoints.MapMetrics();
                 endpoints.MapControllers();
+                endpoints.MapGet("/health/ready", async context =>
+                {
+                    try
+                    {
+                        await DatabaseReadiness.CheckAsync(context.RequestServices.GetRequiredService<HypixelContext>(), context.RequestAborted);
+                        context.Response.StatusCode = 200;
+                    }
+                    catch (System.InvalidOperationException)
+                    {
+                        context.Response.StatusCode = 503;
+                    }
+                });
             });
         }
     }

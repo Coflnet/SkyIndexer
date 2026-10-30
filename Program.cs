@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using Coflnet.Security.OpenBao;
 using Coflnet.Sky.Core;
+using Coflnet.Sky.Indexer.Infrastructure;
+using System.Threading;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -24,10 +26,12 @@ namespace Coflnet.Sky.Indexer
             }
             var host = CreateHostBuilder(args).Build();
             HypixelContext.SetConfiguration(host.Services.GetRequiredService<IConfiguration>());
+            new DatabaseTls(host.Services.GetRequiredService<IConfiguration>()).Install();
 
             // migrations
             using (var context = new HypixelContext())
             {
+                DatabaseReadiness.CheckAsync(context, CancellationToken.None).GetAwaiter().GetResult();
                 context.Database.Migrate();
                 PlayerOptOut.Reload(context);
             }

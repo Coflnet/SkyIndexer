@@ -535,6 +535,74 @@ public class AuctionArchiveJobParallelTests
         Assert.That(job.Locations.Count, Is.EqualTo(job.Auctions.Count));
     }
 
+    // ---------------------------------------------------------------- stage timings
+
+    [Test]
+    public async Task IndexGate_OverlappingItems_RecordAWait_AndTheGaugesReturnToTheirBaseline()
+    {
+        var job = new Job(store, cp, ("ARCHIVE:ITEM_PARALLELISM", "2"), ("ARCHIVE:INDEX_WRITE_PARALLELISM", "1"));
+        Seed(job, 2, 2);
+        job.OnIndexWrite = ct => Task.Delay(60, ct); // the second item has to wait for the first one's write
+        var waitCount = ArchiveTelemetry.StageCount(ArchiveTelemetry.Stages.IndexGateWait);
+        var waitSum = ArchiveTelemetry.StageSum(ArchiveTelemetry.Stages.IndexGateWait);
+        var writeCount = ArchiveTelemetry.StageCount(ArchiveTelemetry.Stages.IndexWrite);
+        var itemCount = ArchiveTelemetry.StageCount(ArchiveTelemetry.Stages.Item);
+        var waiting = ArchiveTelemetry.IndexWriteWaiting.Value;
+        var inFlight = ArchiveTelemetry.ItemsInFlight.Value;
+
+        Assert.That(await job.Month(new[] { 1, 2 }), Is.True);
+
+        Assert.That(ArchiveTelemetry.StageCount(ArchiveTelemetry.Stages.IndexGateWait) - waitCount, Is.GreaterThanOrEqualTo(2), "one observation per index write");
+        Assert.That(ArchiveTelemetry.StageSum(ArchiveTelemetry.Stages.IndexGateWait) - waitSum, Is.GreaterThan(0.03), "the item behind the gate waited for the 60 ms write");
+        Assert.That(ArchiveTelemetry.StageCount(ArchiveTelemetry.Stages.IndexWrite) - writeCount, Is.GreaterThanOrEqualTo(2));
+        Assert.That(ArchiveTelemetry.StageCount(ArchiveTelemetry.Stages.Item) - itemCount, Is.EqualTo(2));
+        Assert.That(ArchiveTelemetry.IndexWriteWaiting.Value, Is.EqualTo(waiting));
+        Assert.That(ArchiveTelemetry.ItemsInFlight.Value, Is.EqualTo(inFlight));
+    }
+
+    [Test]
+    public void FailingIndexWrite_LeavesTheGaugesAtTheirBaseline()
+    {
+        var job = new Job(store, cp, ("ARCHIVE:ITEM_PARALLELISM", "3"), ("ARCHIVE:INDEX_WRITE_PARALLELISM", "1"));
+        Seed(job, 3, 2);
+        var failures = 0;
+        job.OnIndexWrite = async ct =>
+        {
+            await Task.Delay(30, ct);
+            if (Interlocked.Increment(ref failures) == 1)
+                throw new InvalidOperationException("primary down"); // the other items are queued at the gate
+        };
+        var waiting = ArchiveTelemetry.IndexWriteWaiting.Value;
+        var inFlight = ArchiveTelemetry.ItemsInFlight.Value;
+
+        Assert.ThrowsAsync<InvalidOperationException>(() => job.Month(new[] { 1, 2, 3 }));
+
+        Assert.That(ArchiveTelemetry.IndexWriteWaiting.Value, Is.EqualTo(waiting));
+        Assert.That(ArchiveTelemetry.ItemsInFlight.Value, Is.EqualTo(inFlight));
+    }
+
+    [Test]
+    public async Task CancelledWhileWaitingAtTheGate_LeavesTheGaugesAtTheirBaseline()
+    {
+        var job = new Job(store, cp, ("ARCHIVE:ITEM_PARALLELISM", "3"), ("ARCHIVE:INDEX_WRITE_PARALLELISM", "1"));
+        Seed(job, 3, 2);
+        using var cts = new CancellationTokenSource();
+        var writing = new TaskCompletionSource();
+        job.OnIndexWrite = async ct => { writing.TrySetResult(); await Task.Delay(Timeout_Infinite, ct); };
+        var waiting = ArchiveTelemetry.IndexWriteWaiting.Value;
+        var inFlight = ArchiveTelemetry.ItemsInFlight.Value;
+
+        var run = job.ArchiveMonthAsync(Sep, new[] { 1, 2, 3 }, ArchiveOptions.From(job.TestConfig), cts.Token);
+        await writing.Task;
+        await Task.Delay(100); // the other items reach the gate
+        Assert.That(ArchiveTelemetry.IndexWriteWaiting.Value, Is.GreaterThan(waiting), "items queue at the gate");
+        cts.Cancel();
+
+        Assert.CatchAsync<OperationCanceledException>(() => run);
+        Assert.That(ArchiveTelemetry.IndexWriteWaiting.Value, Is.EqualTo(waiting));
+        Assert.That(ArchiveTelemetry.ItemsInFlight.Value, Is.EqualTo(inFlight));
+    }
+
     private const int Timeout_Infinite = System.Threading.Timeout.Infinite;
 
     [Test]

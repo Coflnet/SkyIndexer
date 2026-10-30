@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Threading;
@@ -37,6 +38,7 @@ namespace Coflnet.Sky.Indexer.Archive
         private readonly IConfiguration config;
         private readonly ILogger<AuctionArchiveJob> logger;
         private readonly IArchiveItemCheckpoints checkpoints;
+        private readonly ActivitySource activitySource;
         private readonly ConcurrentDictionary<string, ushort> tagIds = new(StringComparer.Ordinal);
 
         private static readonly Prometheus.Counter monthsTotal = Prometheus.Metrics.CreateCounter("sky_indexer_archive_months_total", "Months fully archived (sentinel written)");
@@ -58,13 +60,17 @@ namespace Coflnet.Sky.Indexer.Archive
         private static readonly Prometheus.Gauge lastMonthCompleted = Prometheus.Metrics.CreateGauge("sky_indexer_archive_last_month_completed_timestamp", "Unix time the last month sentinel was written");
 
         /// <summary>DI constructor.</summary>
-        public AuctionArchiveJob(IAuctionBlobStore store, IConfiguration config, ILogger<AuctionArchiveJob> logger, IArchiveItemCheckpoints checkpoints = null)
+        public AuctionArchiveJob(IAuctionBlobStore store, IConfiguration config, ILogger<AuctionArchiveJob> logger, IArchiveItemCheckpoints checkpoints = null, ActivitySource activitySource = null)
         {
+            this.activitySource = activitySource ?? new ActivitySource("AuctionArchiveJob");
             this.checkpoints = checkpoints ?? new NoArchiveItemCheckpoints();
             this.store = store;
             this.config = config;
             this.logger = logger;
         }
+
+        /// <summary>Time a stage (histogram) and, when <paramref name="root"/> is the sampled item span, record it as a child span.</summary>
+        private ArchiveTelemetry.StageScope Stage(string stage, Activity root = null) => ArchiveTelemetry.Start(stage, activitySource, root);
 
         /// <summary>
         /// Keyset page predicate on the <c>(ItemId, End)</c> index: the range <c>End &gt;= cursorEnd AND End &lt; monthEnd</c>,
@@ -240,7 +246,8 @@ namespace Coflnet.Sky.Indexer.Archive
                         failure.Cancel();
                         return;
                     }
-                    await checkpoints.SaveAsync(month, itemId, checkpoint, ttl, token).ConfigureAwait(false);
+                    using (Stage(ArchiveTelemetry.Stages.CheckpointSave))
+                        await checkpoints.SaveAsync(month, itemId, checkpoint, ttl, token).ConfigureAwait(false);
                     // an empty ItemId-month was one cheap index lookup; only pause after real work
                     if (rows > 0)
                         await Delay(TimeSpan.FromMilliseconds(options.TagPauseMs), token).ConfigureAwait(false);
@@ -254,7 +261,10 @@ namespace Coflnet.Sky.Indexer.Archive
                 return false;
             var allFinalized = true;
             foreach (var run in state.Runs.Values.OrderBy(r => r.Tag, StringComparer.Ordinal))
-                allFinalized &= await FinalizeTagMonthAsync(run, cancellationToken).ConfigureAwait(false);
+            {
+                using (Stage(ArchiveTelemetry.Stages.Finalise))
+                    allFinalized &= await FinalizeTagMonthAsync(run, cancellationToken).ConfigureAwait(false);
+            }
             return allFinalized;
         }
 
@@ -376,6 +386,29 @@ namespace Coflnet.Sky.Indexer.Archive
         /// </summary>
         internal async Task<(bool ok, int rows, ItemMonthCheckpoint checkpoint)> ArchiveItemMonthAsync(int itemId, int month, MonthRuns state, ArchiveOptions options, CancellationToken cancellationToken, DateTime? startedAt = null)
         {
+            // one root span per item-month (explicit empty parent: not nested under other items or ambient activities); null when not sampled
+            using var root = activitySource.StartActivity(ArchiveTelemetry.ItemSpanName, ActivityKind.Internal, default(ActivityContext));
+            root?.SetTag("month", month);
+            root?.SetTag("item_id", itemId);
+            ArchiveTelemetry.ItemsInFlight.Inc();
+            try
+            {
+                using (Stage(ArchiveTelemetry.Stages.Item))
+                {
+                    var result = await ArchiveItemMonthCoreAsync(itemId, month, state, options, cancellationToken, startedAt, root).ConfigureAwait(false);
+                    root?.SetTag("rows", result.rows);
+                    root?.SetTag("ok", result.ok);
+                    return result;
+                }
+            }
+            finally
+            {
+                ArchiveTelemetry.ItemsInFlight.Dec();
+            }
+        }
+
+        private async Task<(bool ok, int rows, ItemMonthCheckpoint checkpoint)> ArchiveItemMonthCoreAsync(int itemId, int month, MonthRuns state, ArchiveOptions options, CancellationToken cancellationToken, DateTime? startedAt, Activity root)
+        {
             var archivedAt = startedAt ?? DateTime.UtcNow;
             var local = new Dictionary<string, TagMonthRun>(StringComparer.Ordinal);
             var (monthStart, monthEnd) = ArchiveMonths.MonthRange(month);
@@ -388,11 +421,13 @@ namespace Coflnet.Sky.Indexer.Archive
             while (true)
             {
                 List<SaveAuction> page;
-                (page, take) = await LoadPageResilientAsync(itemId, cursorEnd, cursorId, monthEnd, take, cancellationToken).ConfigureAwait(false);
+                using (Stage(ArchiveTelemetry.Stages.PageQuery, root))
+                    (page, take) = await LoadPageResilientAsync(itemId, cursorEnd, cursorId, monthEnd, take, cancellationToken).ConfigureAwait(false);
                 pages.Inc();
                 if (page.Count == 0)
                     break;
-                await LoadChildrenAsync(page, cancellationToken).ConfigureAwait(false);
+                using (Stage(ArchiveTelemetry.Stages.ChildQuery, root))
+                    await LoadChildrenAsync(page, cancellationToken).ConfigureAwait(false);
                 foreach (var row in page)
                 {
                     if (row.End < cursorEnd || row.End == cursorEnd && row.Id <= cursorId)
@@ -409,7 +444,7 @@ namespace Coflnet.Sky.Indexer.Archive
                         buffers[row.Tag] = buffer = new List<SaveAuction>();
                     buffer.Add(row);
                     total++;
-                    if (buffer.Count >= options.MaxRowsPerPart && !await FlushPartAsync(state, local, indexes, row.Tag, month, buffer, cancellationToken).ConfigureAwait(false))
+                    if (buffer.Count >= options.MaxRowsPerPart && !await FlushPartAsync(state, local, indexes, row.Tag, month, buffer, cancellationToken, root).ConfigureAwait(false))
                         return (false, total, null);
                 }
                 if (page.Count < take)
@@ -417,26 +452,42 @@ namespace Coflnet.Sky.Indexer.Archive
                 await Delay(TimeSpan.FromMilliseconds(options.PagePauseMs), cancellationToken).ConfigureAwait(false);
             }
             foreach (var (tag, buffer) in buffers.OrderBy(b => b.Key, StringComparer.Ordinal))
-                if (buffer.Count > 0 && !await FlushPartAsync(state, local, indexes, tag, month, buffer, cancellationToken).ConfigureAwait(false))
+                if (buffer.Count > 0 && !await FlushPartAsync(state, local, indexes, tag, month, buffer, cancellationToken, root).ConfigureAwait(false))
                     return (false, total, null);
 
             var monthIndex = ArchiveMonths.ToIndex(month);
             foreach (var (tag, index) in indexes.OrderBy(i => i.Key, StringComparer.Ordinal))
             {
-                var tagId = await RetryPrimaryWriteAsync("tag_id", () => GetOrCreateTagIdAsync(tag, cancellationToken), cancellationToken).ConfigureAwait(false);
+                ushort tagId;
+                using (Stage(ArchiveTelemetry.Stages.TagId, root))
+                    tagId = await RetryPrimaryWriteAsync("tag_id", () => GetOrCreateTagIdAsync(tag, cancellationToken), cancellationToken).ConfigureAwait(false);
                 var bidders = index.Bidders.Select(kv => new AuctionBidder { BidderId = kv.Key.bidder, Uid = kv.Key.uid, End = kv.Value.end }).ToList();
                 var sellers = index.Sellers.Select(kv => new AuctionSeller { SellerId = kv.Key.seller, Uid = kv.Key.uid, End = kv.Value }).ToList();
                 if (index.UnnumberedSellers.Count > 0)
                 {
-                    var ids = await PlayerIdLookup.ResolveAsync(index.UnnumberedSellers.Keys.Select(k => k.uuid), ResolvePlayerIdsAsync, cancellationToken).ConfigureAwait(false);
+                    IReadOnlyDictionary<string, int> ids;
+                    using (Stage(ArchiveTelemetry.Stages.PlayerLookup, root))
+                        ids = await PlayerIdLookup.ResolveAsync(index.UnnumberedSellers.Keys.Select(k => k.uuid), ResolvePlayerIdsAsync, cancellationToken).ConfigureAwait(false);
                     sellers.AddRange(ScyllaArchiveImportWorker.ResolveSellers(index.UnnumberedSellers, ids));
                 }
                 // bulk inserts on the primary: serialized (default one at a time) so parallel items do not pile up on its disk
                 var gate = IndexWriteGate(options);
-                await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                using (Stage(ArchiveTelemetry.Stages.IndexGateWait, root))
+                {
+                    ArchiveTelemetry.IndexWriteWaiting.Inc();
+                    try
+                    {
+                        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        ArchiveTelemetry.IndexWriteWaiting.Dec();
+                    }
+                }
                 try
                 {
-                    await WriteIndexRowsAsync(tagId, monthIndex, index.Locations, bidders, sellers, cancellationToken).ConfigureAwait(false);
+                    using (Stage(ArchiveTelemetry.Stages.IndexWrite, root))
+                        await WriteIndexRowsAsync(tagId, monthIndex, index.Locations, bidders, sellers, cancellationToken).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -450,6 +501,7 @@ namespace Coflnet.Sky.Indexer.Archive
             }
             var checkpoint = BuildCheckpoint(local, archivedAt);
             state.Merge(local);
+            root?.SetTag("parts", local.Values.Sum(r => r.Parts.Count));
             return (true, total, checkpoint);
         }
 
@@ -648,8 +700,9 @@ namespace Coflnet.Sky.Indexer.Archive
         }
 
         /// <summary>Write the buffered rows of a tag as that tag-month's next part, verify by uncached read-back and collect the index rows. Clears <paramref name="rows"/>.</summary>
-        private async Task<bool> FlushPartAsync(MonthRuns state, Dictionary<string, TagMonthRun> runs, Dictionary<string, ItemRunIndex> indexes, string tag, int month, List<SaveAuction> rows, CancellationToken cancellationToken)
+        private async Task<bool> FlushPartAsync(MonthRuns state, Dictionary<string, TagMonthRun> runs, Dictionary<string, ItemRunIndex> indexes, string tag, int month, List<SaveAuction> rows, CancellationToken cancellationToken, Activity root = null)
         {
+            using var flush = Stage(ArchiveTelemetry.Stages.PartFlush, root);
             if (!runs.TryGetValue(tag, out var run))
                 runs[tag] = run = new TagMonthRun(tag, month);
             if (!indexes.TryGetValue(tag, out var index))
@@ -657,12 +710,19 @@ namespace Coflnet.Sky.Indexer.Archive
             var part = state.ReservePart(tag);
             if (part > byte.MaxValue)
                 throw new InvalidOperationException($"{run.Tag} {run.Month} needs more than {byte.MaxValue + 1} parts; raise MAX_ROWS_PER_PART");
-            var block = ArchivedAuctionBlock.FromAuctions(run.Tag, run.Month, part, ArchivedAuctionBlock.SourceMariaDb, rows);
-            await store.WriteBlockAsync(block, cancellationToken).ConfigureAwait(false);
+            ArchivedAuctionBlock block;
+            using (Stage(ArchiveTelemetry.Stages.PartSerialize, root))
+                block = ArchivedAuctionBlock.FromAuctions(run.Tag, run.Month, part, ArchivedAuctionBlock.SourceMariaDb, rows);
+            using (Stage(ArchiveTelemetry.Stages.PartUpload, root))
+                await store.WriteBlockAsync(block, cancellationToken).ConfigureAwait(false);
             run.ArchivedAt ??= DateTime.UtcNow;
             partsWritten.Inc();
-            var readBack = await store.ReadBlockAsync(run.Tag, run.Month, part, uncached: true, cancellationToken).ConfigureAwait(false);
-            var difference = block.FirstDifference(readBack);
+            string difference;
+            using (Stage(ArchiveTelemetry.Stages.PartVerify, root))
+            {
+                var readBack = await store.ReadBlockAsync(run.Tag, run.Month, part, uncached: true, cancellationToken).ConfigureAwait(false);
+                difference = block.FirstDifference(readBack);
+            }
             if (difference != null)
             {
                 verifyFailures.Inc();

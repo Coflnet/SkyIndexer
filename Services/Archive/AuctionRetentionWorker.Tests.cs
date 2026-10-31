@@ -31,7 +31,15 @@ public class AuctionRetentionWorkerTests
         public readonly HashSet<(ushort month, long uid)> Locations = new();
         public readonly Queue<HealthResult> Health = new();
         public readonly List<List<DeleteStatement>> Executed = new();
-        public readonly List<(int month, long total, bool completed)> Recorded = new();
+        /// <summary>Committed batches (month, Auctions rows deleted) and months closed with deleted_at.</summary>
+        public readonly List<(int month, long total)> Batches = new();
+        public readonly List<int> Closed = new();
+        /// <summary>archived_months.deleted_rows per (month, tag id), booked in the same step as the delete like the real transaction; tag id 0 is the sentinel.</summary>
+        public readonly Dictionary<(int month, ushort tag), long> DeletedByTag = new();
+        /// <summary>Simulates a process crash right after the Nth committed batch (the delete and its booking are already durable).</summary>
+        public int? CrashAfterBatch;
+        /// <summary>Rows deleted but (wrongly) not booked, to prove the final reconcile catches a bookkeeping drift.</summary>
+        public long UnbookedRows;
         public int DeletedToday;
         /// <summary>Seller rows committed so far and the order of seller inserts versus deletes.</summary>
         public readonly HashSet<(uint seller, uint end, long uid)> Sellers = new();
@@ -43,7 +51,8 @@ public class AuctionRetentionWorkerTests
         public readonly Dictionary<int, List<RetentionTagParts>> MonthParts = new();
         public readonly HashSet<int> SellerPassDone = new();
 
-        public TestableRetentionWorker(InMemoryAuctionBlobStore store, IConfiguration config) : base(store, config, NullLogger<AuctionRetentionWorker>.Instance) => Store = store;
+        public TestableRetentionWorker(InMemoryAuctionBlobStore store, IConfiguration config, bool withProbe = true, Microsoft.Extensions.Logging.ILogger<AuctionRetentionWorker> logger = null)
+            : base(store, config, logger ?? NullLogger<AuctionRetentionWorker>.Instance, store, withProbe ? store : null) => Store = store;
 
         protected override Task<IReadOnlyList<RetentionTagParts>> GetMonthPartsAsync(int month, CancellationToken cancellationToken)
             => Task.FromResult<IReadOnlyList<RetentionTagParts>>(MonthParts.GetValueOrDefault(month) ?? new List<RetentionTagParts>());
@@ -53,6 +62,68 @@ public class AuctionRetentionWorkerTests
             Order.Add("marker:" + month);
             SellerPassDone.Add(month);
             return Task.CompletedTask;
+        }
+
+        /// <summary>Replication state the gate reads: lag (null = NULL), thread states, or an unreadable status.</summary>
+        public double? Lag = 0;
+        public string IoRunning = "Yes";
+        public string SqlRunning = "Yes";
+        public bool ReplicaUnreadable;
+        public int LagReads;
+        protected override Task<ReplicaStatus> ReadReplicaStatusAsync(CancellationToken cancellationToken)
+        {
+            LagReads++;
+            return Task.FromResult(ReplicaUnreadable ? null : new ReplicaStatus(IoRunning, SqlRunning, Lag));
+        }
+
+        /// <summary>Rows the pretended primary has on top of the in-memory Auctions (rows the archive does not know), under <see cref="ExtraPrimaryTag"/>.</summary>
+        public long ExtraPrimaryRows;
+        public string ExtraPrimaryTag = ItemTag;
+        public string ReconcileSource = ArchivedAuctionBlock.SourceMariaDb;
+        public long DeletedByMonth(int month) => DeletedByTag.Where(kv => kv.Key.month == month && kv.Key.tag != 0).Sum(kv => kv.Value);
+        /// <summary>Whole month count queries run against the primary (the final reconcile) and the replica snapshots (the pre-delete gate).</summary>
+        public int PrimaryCountQueries;
+        public int ReplicaSnapshotReads;
+        protected override Task<IReadOnlyDictionary<string, long>> CountPrimaryAuctionsByTagAsync(DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
+        {
+            PrimaryCountQueries++;
+            return Task.FromResult(CountByTag(monthStart, monthEnd));
+        }
+
+        protected override Task<CountSnapshot> ReadCountSnapshotAsync(int month, DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
+        {
+            ReplicaSnapshotReads++;
+            return Task.FromResult(new CountSnapshot(ReconcileRows(month), CountByTag(monthStart, monthEnd)));
+        }
+
+        /// <summary>Notes written to the month sentinels by the abort backoff.</summary>
+        protected override Task<bool> SetMonthBackoffAsync(int month, string note, CancellationToken cancellationToken)
+        {
+            var rows = MonthRows[month];
+            var sentinel = rows.FindIndex(r => r.TagId == 0);
+            if (rows[sentinel].Note != null && !rows[sentinel].Note.StartsWith(BackoffNotePrefix))
+                return Task.FromResult(false);
+            rows[sentinel] = rows[sentinel] with { Note = note };
+            return Task.FromResult(true);
+        }
+
+        private IReadOnlyDictionary<string, long> CountByTag(DateTime monthStart, DateTime monthEnd)
+        {
+            var counts = Auctions.Where(a => a.End >= monthStart && a.End < monthEnd).GroupBy(a => a.Tag ?? "").ToDictionary(g => g.Key, g => (long)g.Count());
+            if (ExtraPrimaryRows != 0)
+                counts[ExtraPrimaryTag] = counts.GetValueOrDefault(ExtraPrimaryTag) + ExtraPrimaryRows;
+            return counts.Where(kv => kv.Value != 0).ToDictionary(kv => kv.Key, kv => kv.Value);
+        }
+
+        protected override Task<IReadOnlyList<ReconcileTagRow>> GetReconcileRowsAsync(int month, CancellationToken cancellationToken)
+            => Task.FromResult(ReconcileRows(month));
+
+        private IReadOnlyList<ReconcileTagRow> ReconcileRows(int month)
+        {
+            var names = VerifiedTags.GetValueOrDefault(month) ?? new Dictionary<string, ushort>();
+            string NameOf(ushort id) => names.Where(kv => kv.Value == id).Select(kv => kv.Key).FirstOrDefault() ?? ItemTag;
+            return (MonthRows.GetValueOrDefault(month) ?? new()).Where(r => r.TagId != 0)
+                .Select(r => new ReconcileTagRow(NameOf(r.TagId), ReconcileSource, r.Rows, DeletedByTag.GetValueOrDefault((month, r.TagId)))).ToList();
         }
 
         protected override Task<int> CountMonthsDeletedSinceAsync(DateTime sinceUtc, CancellationToken cancellationToken) => Task.FromResult(DeletedToday);
@@ -82,41 +153,53 @@ public class AuctionRetentionWorkerTests
             return Task.CompletedTask;
         }
 
-        protected override Task<Dictionary<string, long>> ExecuteDeleteAsync(IReadOnlyList<DeleteStatement> statements, CancellationToken cancellationToken)
+        protected override Task<Dictionary<string, long>> ExecuteDeleteAsync(IReadOnlyList<DeleteStatement> statements, int month, CancellationToken cancellationToken)
         {
             Order.Add("delete");
             Executed.Add(statements.ToList());
             var counts = new Dictionary<string, long>();
             foreach (var s in statements)
             {
-                long affected;
-                if (s.Table == "Auctions")
-                    affected = Auctions.RemoveAll(a => s.Ids.Contains(a.Id));
-                else if (s.Table == "NbtData")
-                {
-                    Assert.That(s.KeepIfReferencedByTable, Is.EqualTo("Auctions"));
-                    var deletable = s.Ids.Where(id => !Auctions.Any(a => a.NbtDataId == id)).ToList();
-                    affected = NbtData.RemoveWhere(deletable.Contains);
-                }
-                else
-                    affected = Children.TryGetValue((s.Table, s.Column), out var rows) ? rows.RemoveAll(s.Ids.Contains) : 0;
+                var affected = Apply(s);
                 counts[s.Table] = counts.GetValueOrDefault(s.Table) + affected;
+                if (s.TagId != null)
+                    Book(month, s.TagId.Value, affected);
             }
+            Batches.Add((month, counts.GetValueOrDefault("Auctions")));
+            if (CrashAfterBatch == Batches.Count)
+                throw new SimulatedCrash();
             return Task.FromResult(counts);
+        }
+
+        /// <summary>The committed state of a batch: the rows are gone and deleted_rows grew, there is no state in between.</summary>
+        private void Book(int month, ushort tag, long affected)
+        {
+            var booked = affected - Math.Min(UnbookedRows, affected);
+            UnbookedRows -= affected - booked;
+            DeletedByTag[(month, tag)] = DeletedByTag.GetValueOrDefault((month, tag)) + booked;
+            DeletedByTag[(month, 0)] = DeletedByTag.GetValueOrDefault((month, (ushort)0)) + booked;
+        }
+
+        private long Apply(DeleteStatement s)
+        {
+            if (s.Table == "Auctions")
+                return Auctions.RemoveAll(a => s.Ids.Contains(a.Id));
+            if (s.Table != "NbtData")
+                return Children.TryGetValue((s.Table, s.Column), out var rows) ? rows.RemoveAll(s.Ids.Contains) : 0;
+            Assert.That(s.KeepIfReferencedByTable, Is.EqualTo("Auctions"));
+            var deletable = s.Ids.Where(id => !Auctions.Any(a => a.NbtDataId == id)).ToList();
+            return NbtData.RemoveWhere(deletable.Contains);
         }
 
         protected override Task<HealthResult> CheckHealthAsync(ArchiveOptions options, CancellationToken cancellationToken)
             => Task.FromResult(Health.Count > 0 ? Health.Dequeue() : new HealthResult(HealthStatus.Ok, "ok"));
 
-        protected override Task RecordDeletedAsync(int month, IReadOnlyDictionary<ushort, long> deletedPerTag, long total, bool completed, CancellationToken cancellationToken)
+        protected override Task MarkMonthDeletedAsync(int month, CancellationToken cancellationToken)
         {
-            Recorded.Add((month, total, completed));
-            if (completed)
-            {
-                var rows = MonthRows[month];
-                for (var i = 0; i < rows.Count; i++)
-                    rows[i] = rows[i] with { DeletedAt = Now };
-            }
+            Closed.Add(month);
+            var rows = MonthRows[month];
+            for (var i = 0; i < rows.Count; i++)
+                rows[i] = rows[i] with { DeletedAt = Now, Note = rows[i].Note != null && rows[i].Note.StartsWith(BackoffNotePrefix) ? null : rows[i].Note };
             return Task.CompletedTask;
         }
 
@@ -125,6 +208,8 @@ public class AuctionRetentionWorkerTests
 
         public Task<int> Run() => RunOnceAsync(Now, CancellationToken.None);
     }
+
+    private class SimulatedCrash : Exception { }
 
     private static int nextId = 1;
 
@@ -135,35 +220,50 @@ public class AuctionRetentionWorkerTests
         return new TestableRetentionWorker(new InMemoryAuctionBlobStore(), ArchiveTestConfig.Build(all.ToArray()));
     }
 
-    /// <summary>Adds an archived (sentinel + verified tag row), fully indexed month with <paramref name="rows"/> auctions and their children.</summary>
+    /// <summary>A receipt without tags: valid for a month whose archive has no tag with parts (the tests that archive parts replace it, see <see cref="ArchiveParts"/>).</summary>
+    private static string EmptyReceipt(int month) => new BackupReceipt { Version = 1, Month = ArchiveMonths.Format(month), Snapshot = "auction-archive-20261101T0300Z", CreatedAt = Now }.ToJson();
+
+    /// <summary>Adds an archived (sentinel + verified tag row), fully indexed month with <paramref name="rows"/> auctions and their children; scylla_at and a backup receipt are in place.</summary>
     private static List<DeleteCandidate> AddArchivedMonth(TestableRetentionWorker w, int month, int rows, int? sharedNbt = null)
+        => AddArchivedMonth(w, month, sharedNbt, (ItemTag, Tag, rows));
+
+    /// <summary>Like the single tag overload with several tags; their auctions end alternately (hour i of tag k is i * tags + k).</summary>
+    private static List<DeleteCandidate> AddArchivedMonth(TestableRetentionWorker w, int month, int? sharedNbt, params (string tag, ushort id, int rows)[] tags)
+    {
+        var added = tags.SelectMany((t, k) => AddTagAuctions(w, month, sharedNbt, t.tag, t.rows, k, tags.Length)).ToList();
+        w.MonthRows[month] = new List<ArchivedMonthRowState> { new(0, (uint)tags.Sum(t => t.rows), (uint)tags.Sum(t => t.rows), Now, Now, null, Now) };
+        foreach (var t in tags)
+            w.MonthRows[month].Add(new(t.id, (uint)t.rows, (uint)t.rows, Now, Now, null));
+        w.VerifiedTags[month] = tags.ToDictionary(t => t.tag, t => t.id);
+        w.Store.RawObjects[BackupReceipt.Key(month)] = EmptyReceipt(month);
+        return added;
+    }
+
+    private static IEnumerable<DeleteCandidate> AddTagAuctions(TestableRetentionWorker w, int month, int? sharedNbt, string tag, int rows, int tagNumber, int tagCount)
     {
         var (start, _) = ArchiveMonths.MonthRange(month);
         var index = ArchiveMonths.ToIndex(month);
-        var added = new List<DeleteCandidate>();
         for (var i = 0; i < rows; i++)
         {
             var id = nextId++;
             var nbt = sharedNbt ?? 10_000 + id;
-            var row = new DeleteCandidate(id, 500_000 + id, ItemTag, start.AddHours(i), nbt, i % 3 == 2 ? 0 : 7_000 + i % 2, (2_000 + id).ToString("x32"));
-            added.Add(row);
+            var row = new DeleteCandidate(id, 500_000 + id, tag, start.AddHours(i * tagCount + tagNumber), nbt, i % 3 == 2 ? 0 : 7_000 + i % 2, (2_000 + id).ToString("x32"));
             w.Auctions.Add(row);
             w.NbtData.Add(nbt);
             w.Locations.Add((index, row.UId));
-            foreach (var (table, column) in new[] { ("Bids", "Uuid"), ("NBTLookups", "AuctionId"), ("Enchantment", "SaveAuctionId"), ("UuId", "SaveAuctionId"), ("UuId", "SaveAuctionId1") })
-            {
-                if (!w.Children.TryGetValue((table, column), out var list))
-                    w.Children[(table, column)] = list = new List<long>();
-                list.Add(id);
-            }
+            AddChildren(w, id);
+            yield return row;
         }
-        w.MonthRows[month] = new List<ArchivedMonthRowState>
+    }
+
+    private static void AddChildren(TestableRetentionWorker w, int id)
+    {
+        foreach (var (table, column) in new[] { ("Bids", "Uuid"), ("NBTLookups", "AuctionId"), ("Enchantment", "SaveAuctionId"), ("UuId", "SaveAuctionId"), ("UuId", "SaveAuctionId1") })
         {
-            new(0, (uint)rows, (uint)rows, Now, Now, null),
-            new(Tag, (uint)rows, (uint)rows, Now, Now, null),
-        };
-        w.VerifiedTags[month] = new Dictionary<string, ushort> { [ItemTag] = Tag };
-        return added;
+            if (!w.Children.TryGetValue((table, column), out var list))
+                w.Children[(table, column)] = list = new List<long>();
+            list.Add(id);
+        }
     }
 
     [Test]
@@ -193,7 +293,7 @@ public class AuctionRetentionWorkerTests
 
         Assert.That(w.Executed, Is.Empty, "nothing deleted");
         Assert.That(w.Auctions, Has.Count.EqualTo(7));
-        Assert.That(w.Recorded.Single().completed, Is.False);
+        Assert.That(w.Batches, Is.Empty);
         Assert.That(w.MonthRows[OldMonth].All(r => r.DeletedAt == null), Is.True, "the month stays open");
     }
 
@@ -265,6 +365,7 @@ public class AuctionRetentionWorkerTests
             Month = month, Parts = parts.Length, Rows = parts.Sum(p => p.Length), PartSha256 = hashes, Source = ArchivedAuctionBlock.SourceMerged,
         })).Wait();
         w.MonthParts[month] = new List<RetentionTagParts> { new(ItemTag, parts.Length, ArchivedAuctionBlock.CombinedSha256(hashes)) };
+        w.Store.RawObjects[BackupReceipt.Key(month)] = ReceiptFor(w, month);   // the NAS mirror saw exactly these parts
         w.Store.Events.Clear();
         return hashes;
     }
@@ -303,7 +404,7 @@ public class AuctionRetentionWorkerTests
 
         Assert.That(w.Sellers.Select(x => (x.seller, x.uid)), Is.EqualTo(new[] { (107u, 7L) }));
         Assert.That(w.SellerPassDone, Does.Contain(OldMonth));
-        Assert.That(w.Recorded.Single(), Is.EqualTo((OldMonth, 0L, true)), "the month is completed although it had no MariaDB rows");
+        Assert.That(w.Closed, Is.EqualTo(new[] { OldMonth }), "the month is completed although it had no MariaDB rows");
         w.Store.Events.Clear();
         await w.Run();
         Assert.That(w.Store.Events.Any(e => e.StartsWith("read:")), Is.False, "a finished month is not read again");
@@ -325,18 +426,52 @@ public class AuctionRetentionWorkerTests
         Assert.That((row.SellerId, row.End, row.Uid), Is.EqualTo((123u, 1599048000u, 77L)));
     }
 
+    /// <summary>The marker only skips the seller rows; every part is still re-read uncached and hash-checked right before the month's first delete.</summary>
     [Test]
-    public async Task MonthWithMarkerIsNotReadAgain_ButStillDeleted()
+    public async Task MonthWithMarkerIsStillReVerifiedUncached_WithoutWritingSellerRows()
     {
         var w = Worker();
         AddArchivedMonth(w, OldMonth, 2);
-        ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) });
+        ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) }, new[] { PassAuction(3, 3, 3) });
+        w.Players[PassUuid(1)] = 101;
         w.SellerPassDone.Add(OldMonth);   // the pass already ran for this month
 
         Assert.That(await w.Run(), Is.EqualTo(1));
 
-        Assert.That(w.Store.Events.Any(e => e.StartsWith("read:")), Is.False);
+        Assert.That(w.Store.Events.Where(e => e.StartsWith("read:")), Is.EqualTo(new[] { $"read:{ItemTag}:{OldMonth}:0:uncached", $"read:{ItemTag}:{OldMonth}:1:uncached" }));
+        Assert.That(w.Order.Where(o => o.StartsWith("sellers:") && o != "sellers:2" && o != "sellers:1"), Is.Empty);
+        Assert.That(w.Order.IndexOf("delete"), Is.GreaterThan(-1));
         Assert.That(w.Auctions, Is.Empty);
+    }
+
+    [TestCase("hash")]
+    [TestCase("missing part")]
+    [TestCase("combined")]
+    public async Task MonthWithMarkerButAPartThatNoLongerVerifiesIsNotDeleted(string defect)
+    {
+        var w = Worker(("ARCHIVE:REQUIRE_BACKUP_RECEIPT", "false"));   // off so that the receipt gate does not pre-empt the part verification under test
+        AddArchivedMonth(w, OldMonth, 2);
+        ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) }, new[] { PassAuction(3, 3, 3) });
+        w.SellerPassDone.Add(OldMonth);
+        switch (defect)
+        {
+            case "hash":
+                var index = await w.Store.ReadIndexAsync(ItemTag);
+                index.Find(OldMonth).PartSha256[1] = new string('a', 64);
+                await w.Store.WriteIndexAsync(index);
+                break;
+            case "missing part":
+                w.Store.Objects.Remove(AuctionBlobKeys.Block(ItemTag, OldMonth, 1));
+                break;
+            case "combined":
+                w.MonthParts[OldMonth] = new List<RetentionTagParts> { new(ItemTag, 2, new string('b', 64)) };
+                break;
+        }
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty, "nothing deleted although the seller backfill marker exists");
+        Assert.That(w.Auctions, Has.Count.EqualTo(2));
     }
 
     [TestCase("hash")]
@@ -344,7 +479,7 @@ public class AuctionRetentionWorkerTests
     [TestCase("combined")]
     public async Task AbortsWithoutDeletingWhenAPartDoesNotVerify(string defect)
     {
-        var w = Worker();
+        var w = Worker(("ARCHIVE:REQUIRE_BACKUP_RECEIPT", "false"));   // off so that the receipt gate does not pre-empt the part verification under test
         AddArchivedMonth(w, OldMonth, 2);
         var hashes = ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) }, new[] { PassAuction(3, 3, 3) });
         w.Players[PassUuid(1)] = 101;
@@ -433,7 +568,7 @@ public class AuctionRetentionWorkerTests
         Assert.That(await w.Run(), Is.EqualTo(0));
         Assert.That(w.Executed, Is.Empty);
         Assert.That(w.Auctions, Has.Count.EqualTo(3));
-        Assert.That(w.Recorded.Single().completed, Is.False);
+        Assert.That(w.Batches, Is.Empty);
     }
 
     [Test]
@@ -441,6 +576,7 @@ public class AuctionRetentionWorkerTests
     {
         var w = Worker();
         AddArchivedMonth(w, OldMonth, 2);
+        w.ExtraPrimaryRows = -1; // the stray row below is not part of the archived count; the count gate must not pre-empt this test
         var (start, _) = ArchiveMonths.MonthRange(OldMonth);
         var stray = new DeleteCandidate(nextId++, 999, "STRAY", start.AddMinutes(30), null);
         w.Auctions.Add(stray);
@@ -455,6 +591,7 @@ public class AuctionRetentionWorkerTests
     {
         var w = Worker();
         AddArchivedMonth(w, OldMonth, 2);
+        w.ExtraPrimaryRows = -1; // the stray row below is not part of the archived count; the count gate must not pre-empt this test
         var (start, _) = ArchiveMonths.MonthRange(OldMonth);
         w.Auctions.Add(new DeleteCandidate(nextId++, 900_001, "NEVER_ARCHIVED", start.AddDays(3), null));
         w.Locations.Add((ArchiveMonths.ToIndex(OldMonth), 900_001));
@@ -471,6 +608,7 @@ public class AuctionRetentionWorkerTests
     {
         var w = Worker();
         AddArchivedMonth(w, OldMonth, 2);
+        w.ExtraPrimaryRows = -1; // the stray row below is not part of the archived count; the count gate must not pre-empt this test
         var (start, _) = ArchiveMonths.MonthRange(OldMonth);
         w.Auctions.Add(new DeleteCandidate(nextId++, 900_002, null, start.AddDays(3), null));
         w.Locations.Add((ArchiveMonths.ToIndex(OldMonth), 900_002));
@@ -494,7 +632,8 @@ public class AuctionRetentionWorkerTests
         Assert.That(w.NbtData, Does.Contain(7L), "still referenced by an auction of another month");
         Assert.That(w.Auctions.Select(a => a.UId), Is.EqualTo(new[] { 42L }));
         Assert.That(w.Children.Values.All(l => l.Count == 0), Is.True);
-        Assert.That(w.Recorded.Single(), Is.EqualTo((OldMonth, 2L, true)));
+        Assert.That(w.Batches, Is.EqualTo(new[] { (OldMonth, 2L) }), "the batch is booked as it is deleted");
+        Assert.That(w.Closed, Is.EqualTo(new[] { OldMonth }), "then the month is closed");
     }
 
     [Test]
@@ -514,13 +653,15 @@ public class AuctionRetentionWorkerTests
     {
         var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "2"));
         AddArchivedMonth(w, OldMonth, 5);
-        w.Health.Enqueue(new HealthResult(HealthStatus.Ok, "ok"));
+        w.Health.Enqueue(new HealthResult(HealthStatus.Ok, "ok"));   // month start
+        w.Health.Enqueue(new HealthResult(HealthStatus.Ok, "ok"));   // first batch
         w.Health.Enqueue(new HealthResult(HealthStatus.Exceeded, "binlog too big"));
 
         Assert.That(await w.Run(), Is.EqualTo(0));
         Assert.That(w.Executed, Has.Count.EqualTo(1));
         Assert.That(w.Auctions, Has.Count.EqualTo(3));
-        Assert.That(w.Recorded.Single(), Is.EqualTo((OldMonth, 2L, false)), "partial counts recorded, month not marked deleted");
+        Assert.That(w.Batches, Is.EqualTo(new[] { (OldMonth, 2L) }), "partial counts booked per batch");
+        Assert.That(w.Closed, Is.Empty, "month not marked deleted");
     }
 
     [Test]
@@ -545,7 +686,7 @@ public class AuctionRetentionWorkerTests
         AddArchivedMonth(w, OldMonth, 1);
         AddArchivedMonth(w, OldMonth2, 1);
         Assert.That(await w.Run(), Is.EqualTo(1));
-        Assert.That(w.Recorded.Select(r => r.month), Is.EqualTo(new[] { OldMonth }), "oldest month first, one per day");
+        Assert.That(w.Closed, Is.EqualTo(new[] { OldMonth }), "oldest month first, one per day");
 
         var capped = Worker();
         AddArchivedMonth(capped, OldMonth, 1);
@@ -553,6 +694,644 @@ public class AuctionRetentionWorkerTests
         Assert.That(await capped.Run(), Is.EqualTo(0));
         Assert.That(capped.Executed, Is.Empty);
     }
+
+    // ------------------------------------------------------------ phase B gates: replica lag, count reconcile, backup receipt
+
+    private static ReplicaStatus Replica(double? lag, string io = "Yes", string sql = "Yes") => new(io, sql, lag);
+
+    [Test]
+    public void ReplicaEvaluation()
+    {
+        var o = ArchiveOptions.From(ArchiveTestConfig.Build());
+        Assert.That(o.MaxReplicaLagSeconds, Is.EqualTo(300));
+        Assert.That(o.RequireBackupReceipt, Is.True, "default on");
+        Assert.That(o.RequireReplicaHealthy, Is.True, "default on");
+        Assert.That(ArchiveOptions.From(ArchiveTestConfig.Build(("ARCHIVE:REQUIRE_REPLICA_HEALTHY", "false"))).RequireReplicaHealthy, Is.False);
+        Assert.That(AuctionRetentionWorker.EvaluateReplica(Replica(0), o).Status, Is.EqualTo(HealthStatus.Ok));
+        Assert.That(AuctionRetentionWorker.EvaluateReplica(Replica(300), o).Status, Is.EqualTo(HealthStatus.Ok));
+        Assert.That(AuctionRetentionWorker.EvaluateReplica(Replica(301), o).Status, Is.EqualTo(HealthStatus.Exceeded));
+        Assert.That(AuctionRetentionWorker.EvaluateReplica(Replica(null), o).Status, Is.EqualTo(HealthStatus.Unavailable), "NULL lag");
+        Assert.That(AuctionRetentionWorker.EvaluateReplica(null, o).Status, Is.EqualTo(HealthStatus.Unavailable), "unreadable status");
+        Assert.That(ArchiveOptions.From(ArchiveTestConfig.Build(("ARCHIVE:MAX_REPLICA_LAG_SECONDS", "5"))).MaxReplicaLagSeconds, Is.EqualTo(5));
+        Assert.That(AuctionRetentionWorker.ReplicaStatusSql, Is.EqualTo("SHOW SLAVE STATUS"));
+    }
+
+    /// <summary>A stopped IO or SQL thread reports a small or frozen lag at best: both must say Yes.</summary>
+    [TestCase("No", "Yes")]
+    [TestCase("Yes", "No")]
+    [TestCase("Connecting", "Yes")]
+    [TestCase(null, "Yes")]
+    [TestCase("Yes", null)]
+    public void ReplicaWithAStoppedThreadIsNotHealthyEvenWithZeroLag(string io, string sql)
+    {
+        var result = AuctionRetentionWorker.EvaluateReplica(Replica(0, io, sql), ArchiveOptions.From(ArchiveTestConfig.Build()));
+        Assert.That(result.Status, Is.EqualTo(HealthStatus.Unavailable));
+        Assert.That(result.Reason, Does.Contain("Slave_"));
+    }
+
+    [TestCase("No", "Yes")]
+    [TestCase("Yes", "No")]
+    public async Task StoppedReplicationThreadStopsDeleting(string io, string sql)
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        w.IoRunning = io;
+        w.SqlRunning = sql;
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(w.Auctions, Has.Count.EqualTo(3));
+    }
+
+    [Test]
+    public async Task ReplicaLagTooHighStopsDeleting()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        w.Lag = 301;
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(w.Auctions, Has.Count.EqualTo(3));
+        Assert.That(w.MonthRows[OldMonth].All(r => r.DeletedAt == null), Is.True);
+    }
+
+    /// <summary>M1: the replica gate does not depend on REQUIRE_HEALTH_CHECKS; only its own option switches it off.</summary>
+    [TestCase("unreadable")]
+    [TestCase("null lag")]
+    [TestCase("too high")]
+    public async Task ReplicaGateIgnoresRequireHealthChecks(string defect)
+    {
+        var lenient = Worker(("ARCHIVE:REQUIRE_HEALTH_CHECKS", "false"));
+        AddArchivedMonth(lenient, OldMonth, 3);
+        lenient.Lag = defect == "too high" ? 301 : defect == "null lag" ? null : 0;
+        lenient.ReplicaUnreadable = defect == "unreadable";
+
+        Assert.That(await lenient.Run(), Is.EqualTo(0));
+
+        Assert.That(lenient.Executed, Is.Empty);
+        Assert.That(lenient.Auctions, Has.Count.EqualTo(3));
+    }
+
+    [Test]
+    public async Task ReplicaGateCanBeSwitchedOffOnlyByItsOwnOption()
+    {
+        var off = Worker(("ARCHIVE:REQUIRE_REPLICA_HEALTHY", "false"));
+        AddArchivedMonth(off, OldMonth, 3);
+        off.ReplicaUnreadable = true;
+        Assert.That(await off.Run(), Is.EqualTo(1));
+        Assert.That(off.LagReads, Is.EqualTo(0), "not even read");
+
+        var on = Worker();
+        AddArchivedMonth(on, OldMonth, 3);
+        on.ReplicaUnreadable = true;
+        Assert.That(await on.Run(), Is.EqualTo(0), "no replica status: fail closed");
+    }
+
+    /// <summary>Minor 3: the cheap gates run before the primary count, the receipt HEADs and the uncached part re-read.</summary>
+    [Test]
+    public async Task CheapGatesRunBeforeTheExpensiveMonthGates()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 2);
+        ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) });
+        w.Lag = 301;
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Store.Events, Is.Empty, "no part was read");
+        Assert.That(w.Order, Is.Empty, "no seller rows");
+        Assert.That(w.LagReads, Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task LagIsReadBeforeEveryBatch()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "2"));
+        AddArchivedMonth(w, OldMonth, 5);
+        await w.Run();
+        Assert.That(w.LagReads, Is.EqualTo(5), "the month start + 3 batches + the empty probe that ends the month");
+    }
+
+    [Test]
+    public async Task CountMismatchAbortsTheMonth_MoreRowsOnThePrimaryThanArchived()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        w.ExtraPrimaryRows = 1;   // a row ending in the month that phase 1 never archived
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(w.Auctions, Has.Count.EqualTo(3));
+        Assert.That(await w.CountProblemAsync(OldMonth, ArchiveMonths.MonthRange(OldMonth).start, ArchiveMonths.MonthRange(OldMonth).end, CancellationToken.None),
+            Does.Contain("HYPERION").And.Contain("4 auctions").And.Contain("archived 3"));
+    }
+
+    [Test]
+    public async Task PreDeleteCountReadsTheReplicaSnapshotAndOnlyTheFinalReconcileThePrimary()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+
+        Assert.That(await w.Run(), Is.EqualTo(1));
+
+        Assert.That(w.ReplicaSnapshotReads, Is.EqualTo(1), "expectations and counts of the gate come from one replica snapshot");
+        Assert.That(w.PrimaryCountQueries, Is.EqualTo(1), "only the final reconcile (empty End range) runs on the primary");
+    }
+
+    [Test]
+    public async Task MissingReceiptStopsBeforeAnyCountQuery()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        w.Store.RawObjects.Remove(BackupReceipt.Key(OldMonth));
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.ReplicaSnapshotReads + w.PrimaryCountQueries, Is.EqualTo(0), "the receipt gate is cheaper than the month long GROUP BY");
+        Assert.That(w.Auctions, Has.Count.EqualTo(3));
+    }
+
+    [Test]
+    public async Task AbortedMonthBacksOffAndIsRetriedAfterTheBackoff()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        w.ExtraPrimaryRows = 1;
+        Assert.That(await w.RunOnceAsync(Now, CancellationToken.None), Is.EqualTo(0));
+        Assert.That(w.ReplicaSnapshotReads, Is.EqualTo(1));
+        Assert.That(w.MonthRows[OldMonth][0].Note, Does.StartWith("retention_backoff_until=2026-10-22T12:00:00Z; "), "persisted on the sentinel");
+
+        w.ExtraPrimaryRows = 0;
+        Assert.That(await w.RunOnceAsync(Now.AddHours(23), CancellationToken.None), Is.EqualTo(0), "still backing off");
+        Assert.That(w.ReplicaSnapshotReads, Is.EqualTo(1), "no count query within the backoff");
+
+        Assert.That(await w.RunOnceAsync(Now.AddHours(25), CancellationToken.None), Is.EqualTo(1), "retried after the backoff");
+        Assert.That(w.Auctions, Is.Empty);
+    }
+
+    [Test]
+    public async Task BackoffHoursOfZeroRetriesEveryRun()
+    {
+        var w = Worker(("ARCHIVE:ABORT_BACKOFF_HOURS", "0"));
+        AddArchivedMonth(w, OldMonth, 3);
+        w.ExtraPrimaryRows = 1;
+        await w.Run();
+        await w.Run();
+        Assert.That(w.ReplicaSnapshotReads, Is.EqualTo(2));
+        Assert.That(w.MonthRows[OldMonth][0].Note, Is.Null);
+    }
+
+    [Test]
+    public void BackoffNoteRoundTripsAndIsBoundedTo255Characters()
+    {
+        var until = new DateTime(2026, 10, 22, 12, 0, 0, DateTimeKind.Utc);
+        var note = AuctionRetentionWorker.BuildBackoffNote(until, new string('x', 500));
+        Assert.That(note, Has.Length.EqualTo(255));
+        Assert.That(AuctionRetentionWorker.BackoffUntil(note), Is.EqualTo(until));
+        Assert.That(AuctionRetentionWorker.BackoffUntil("phase one note"), Is.Null);
+        Assert.That(AuctionRetentionWorker.BackoffUntil(null), Is.Null);
+    }
+
+    /// <summary>The month long count must stay an End index range with one GROUP BY, never a per row subquery.</summary>
+    [Test]
+    public void CountQueryIsAnEndRangeWithOneGroupByTag()
+    {
+        var options = new DbContextOptionsBuilder<HypixelContext>().UseMySql("server=localhost", new MariaDbServerVersion("10.5.5")).Options;
+        using var db = new HypixelContext(options);
+        var sql = AuctionRetentionWorker.CountByTagQuery(db, new DateTime(2023, 1, 1), new DateTime(2023, 2, 1)).ToQueryString();
+
+        Assert.That(sql, Does.Contain("FROM `Auctions`").And.Contain("`a`.`End` >=").And.Contain("`a`.`End` <").And.Contain("GROUP BY `a`.`Tag`"));
+        Assert.That(System.Text.RegularExpressions.Regex.Matches(sql, "SELECT").Count, Is.EqualTo(1), "no correlated subquery");
+        Assert.That(sql, Does.Not.Contain("JOIN"));
+    }
+
+    [Test]
+    public void ReplicaSnapshotIsReadOnlyAndConsistent()
+    {
+        Assert.That(AuctionRetentionWorker.SnapshotSql, Is.EqualTo("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"));
+        Assert.That(AuctionRetentionWorker.SnapshotIsolationSql, Is.EqualTo("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"), "runs before the snapshot on the same connection");
+    }
+
+    [Test]
+    public async Task BackoffThatCannotBeStoredBecauseOfAnOperatorNoteWarnsAndKeepsTheNote()
+    {
+        var log = new ListLogger<AuctionRetentionWorker>();
+        var w = new TestableRetentionWorker(new InMemoryAuctionBlobStore(), ArchiveTestConfig.Build(("ARCHIVE:DELETE_MARIADB", "true"), ("ARCHIVE:OLDEST_MONTH", "2023-01")), logger: log);
+        AddArchivedMonth(w, OldMonth, 3);
+        w.MonthRows[OldMonth][0] = w.MonthRows[OldMonth][0] with { Note = "operator: hold" };
+        w.ExtraPrimaryRows = 1;
+
+        await w.Run();
+
+        Assert.That(w.MonthRows[OldMonth][0].Note, Is.EqualTo("operator: hold"));
+        Assert.That(log.Entries.Any(e => e.level == Microsoft.Extensions.Logging.LogLevel.Warning && e.message.Contains("could not be stored") && e.message.Contains("operator note")), Is.True);
+        Assert.That(log.Entries.Any(e => e.message.Contains("backs off until")), Is.False);
+    }
+
+    [Test]
+    public async Task DeletedMonthClearsItsBackoffNote()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        w.ExtraPrimaryRows = 1;
+        await w.RunOnceAsync(Now, CancellationToken.None);
+        Assert.That(w.MonthRows[OldMonth][0].Note, Does.StartWith(AuctionRetentionWorker.BackoffNotePrefix));
+
+        w.ExtraPrimaryRows = 0;
+        Assert.That(await w.RunOnceAsync(Now.AddHours(25), CancellationToken.None), Is.EqualTo(1));
+
+        Assert.That(w.MonthRows[OldMonth][0].Note, Is.Null);
+    }
+
+    [Test]
+    public async Task CountMismatchAbortsTheMonth_FewerRowsOnThePrimaryThanArchived()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        w.ExtraPrimaryRows = -1;
+        Assert.That(await w.Run(), Is.EqualTo(0));
+        Assert.That(w.Executed, Is.Empty);
+    }
+
+    [Test]
+    public async Task MergedTagMonthsSubtractTheScyllaOnlyRowsOfTheManifest()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        // 3 MariaDB rows + 2 Scylla-only rows archived in total
+        w.MonthRows[OldMonth] = new List<ArchivedMonthRowState> { new(0, 5, 5, Now, Now, null, Now), new(Tag, 5, 5, Now, Now, null) };
+        w.ReconcileSource = ArchivedAuctionBlock.SourceMerged;
+        await w.Store.WriteMetaAsync(AuctionBlobKeys.ScyllaManifest(OldMonth), new ScyllaMonthManifest { Month = OldMonth, CompletedAt = Now }
+            .Upsert(new ScyllaTagImport { Tag = ItemTag, FirstNewPart = 1, NewParts = 1, NewRows = 2, NewPartSha256 = new() { "x" } }));
+        var (start, end) = ArchiveMonths.MonthRange(OldMonth);
+
+        Assert.That(await w.CountProblemAsync(OldMonth, start, end, CancellationToken.None), Is.Null);
+        w.ExtraPrimaryRows = 2;
+        Assert.That(await w.CountProblemAsync(OldMonth, start, end, CancellationToken.None), Is.Not.Null);
+    }
+
+    [Test]
+    public async Task MergedTagMonthWithoutManifestEntryCanNotBeReconciled()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        w.ReconcileSource = ArchivedAuctionBlock.SourceMerged;
+        Assert.That(await w.Run(), Is.EqualTo(0));
+        Assert.That(w.Executed, Is.Empty);
+    }
+
+    [Test]
+    public async Task ScyllaOnlyTagMonthsHaveNoMariaDbRowsToCount()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 0);
+        w.MonthRows[OldMonth] = new List<ArchivedMonthRowState> { new(0, 9, 9, Now, Now, null, Now), new(Tag, 9, 9, Now, Now, null) };
+        w.ReconcileSource = ArchivedAuctionBlock.SourceScylla;
+        await w.Run();
+        Assert.That(w.Closed, Is.EqualTo(new[] { OldMonth }), "the month closes: 9 Scylla-only rows, 0 expected on the primary");
+    }
+
+    [Test]
+    public async Task ResumedMonthExpectsArchivedMinusAlreadyDeleted()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "2"));
+        AddArchivedMonth(w, OldMonth, 6);
+        w.Health.Enqueue(new HealthResult(HealthStatus.Ok, "ok"));   // month start
+        w.Health.Enqueue(new HealthResult(HealthStatus.Ok, "ok"));   // first batch
+        w.Health.Enqueue(new HealthResult(HealthStatus.Exceeded, "binlog"));
+        Assert.That(await w.Run(), Is.EqualTo(0));
+        Assert.That(w.Auctions, Has.Count.EqualTo(4), "one batch of 2 deleted, then the health stop");
+        Assert.That(w.DeletedByMonth(OldMonth), Is.EqualTo(2));
+
+        Assert.That(await w.Run(), Is.EqualTo(1), "the resumed month reconciles 6 - 2 = 4");
+        Assert.That(w.Auctions, Is.Empty);
+    }
+
+    /// <summary>M2: the booking is atomic with the delete, so a resumed month matches exactly; any difference aborts.</summary>
+    [Test]
+    public async Task ResumedMonthMatchesExactlyWithoutTolerance()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "2"));
+        AddArchivedMonth(w, OldMonth, 6);
+        w.DeletedByTag[(OldMonth, Tag)] = 1;
+        var (start, end) = ArchiveMonths.MonthRange(OldMonth);
+        // archived 6, 1 booked deleted -> exactly 5 must be left; the primary has 4 (one batch of the booking is missing: rows vanished unbooked)
+        w.Auctions.RemoveRange(0, 2);
+        Assert.That(await w.CountProblemAsync(OldMonth, start, end, CancellationToken.None), Does.Contain("expected 5"));
+        w.Auctions.Add(new DeleteCandidate(nextId++, 1, ItemTag, start.AddDays(1), null));
+        Assert.That(await w.CountProblemAsync(OldMonth, start, end, CancellationToken.None), Is.Null, "5 == 6 - 1");
+        w.ExtraPrimaryRows = 1;
+        Assert.That(await w.CountProblemAsync(OldMonth, start, end, CancellationToken.None), Does.Contain("6 auctions"), "6 > 5");
+    }
+
+    /// <summary>M2: a crash right after a committed batch leaves delete and booking in step, the next run finishes the month.</summary>
+    [Test]
+    public async Task CrashBetweenBatchesResumesExactlyAndBooksEveryRowOnce()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "2"));
+        AddArchivedMonth(w, OldMonth, 6);
+        w.CrashAfterBatch = 1;
+
+        Assert.ThrowsAsync<SimulatedCrash>(() => w.Run());
+
+        Assert.That(w.Auctions, Has.Count.EqualTo(4), "one batch of 2 committed before the crash");
+        Assert.That(w.DeletedByMonth(OldMonth), Is.EqualTo(2), "booked in the same step");
+        Assert.That(w.Closed, Is.Empty);
+        w.CrashAfterBatch = null;
+
+        Assert.That(await w.Run(), Is.EqualTo(1), "the resumed month reconciles 6 - 2 = 4 exactly");
+
+        Assert.That(w.Auctions, Is.Empty);
+        Assert.That(w.DeletedByTag[(OldMonth, Tag)], Is.EqualTo(6));
+        Assert.That(w.DeletedByTag[(OldMonth, 0)], Is.EqualTo(6), "sentinel");
+        Assert.That(w.Closed, Is.EqualTo(new[] { OldMonth }));
+    }
+
+    /// <summary>Minor 5: a month total that matches is not enough, every tag has to match (one extra HYPERION row hidden by one missing TERMINATOR row).</summary>
+    [Test]
+    public async Task CompensatingPerTagDifferencesAbortTheMonth()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, null, (ItemTag, Tag, 3), ("TERMINATOR", 6, 2));
+        var terminator = w.Auctions.First(a => a.Tag == "TERMINATOR");
+        w.Auctions.Remove(terminator);
+        w.ExtraPrimaryRows = 1;   // same total as archived, wrong split
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(await w.CountProblemAsync(OldMonth, ArchiveMonths.MonthRange(OldMonth).start, ArchiveMonths.MonthRange(OldMonth).end, CancellationToken.None),
+            Does.Contain("TERMINATOR").Or.Contain("HYPERION"));
+    }
+
+    /// <summary>Minor 5 + test gap: a multi tag month deletes per tag, books per tag (affected rows) and closes only when every tag adds up.</summary>
+    [Test]
+    public async Task MultiTagMonthBooksEveryTagAndTheSentinel()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "3"));
+        AddArchivedMonth(w, OldMonth, null, (ItemTag, Tag, 5), ("TERMINATOR", 6, 3));
+
+        Assert.That(await w.Run(), Is.EqualTo(1));
+
+        Assert.That(w.Auctions, Is.Empty);
+        Assert.That(w.DeletedByTag[(OldMonth, Tag)], Is.EqualTo(5));
+        Assert.That(w.DeletedByTag[(OldMonth, 6)], Is.EqualTo(3));
+        Assert.That(w.DeletedByTag[(OldMonth, 0)], Is.EqualTo(8));
+        Assert.That(w.Executed.SelectMany(b => b).Where(st => st.Table == "Auctions").Select(st => st.TagId).Distinct().Order(), Is.EqualTo(new ushort?[] { Tag, 6 }), "one Auctions delete per tag");
+        Assert.That(w.Closed, Is.EqualTo(new[] { OldMonth }));
+    }
+
+    /// <summary>Minor 5: after the loop the month only closes when the booked rows add up to what phase 1 archived.</summary>
+    [Test]
+    public async Task MonthIsNotClosedWhenTheBookedRowsDoNotAddUp()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        w.UnbookedRows = 1;   // a bookkeeping bug: one deleted row never reached deleted_rows
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Auctions, Is.Empty, "the rows are gone");
+        Assert.That(w.Closed, Is.Empty, "but the month stays open: deleted 2 booked of 3 archived");
+        Assert.That(w.MonthRows[OldMonth].All(r => r.DeletedAt == null), Is.True);
+    }
+
+    [Test]
+    public async Task MonthWithoutScyllaAtWaitsAndNothingIsReadOrWritten()
+    {
+        var w = Worker(("ARCHIVE:REQUIRE_SCYLLA_IMPORT", "true"));
+        AddArchivedMonth(w, OldMonth, 3);
+        AddArchivedMonth(w, OldMonth2, 2);
+        w.MonthRows[OldMonth][0] = w.MonthRows[OldMonth][0] with { ScyllaAt = null };   // the newer month (scylla_at set) must wait behind the older one
+        ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) });
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(w.Batches.Count + w.Closed.Count, Is.EqualTo(0), "no state written");
+        Assert.That(w.Order, Is.Empty, "no seller rows or markers");
+        Assert.That(w.Store.Events, Is.Empty, "no R2 read");
+        Assert.That(w.LagReads, Is.EqualTo(0));
+        Assert.That(w.Auctions, Has.Count.EqualTo(5));
+    }
+
+    [Test]
+    public async Task MonthWithScyllaAtProceedsToTheNextGates()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        Assert.That(await w.Run(), Is.EqualTo(1));
+        Assert.That(w.Auctions, Is.Empty);
+
+        var blocked = Worker();
+        AddArchivedMonth(blocked, OldMonth, 3);
+        blocked.Store.RawObjects.Remove(BackupReceipt.Key(OldMonth));
+        Assert.That(await blocked.Run(), Is.EqualTo(0), "scylla_at passed, the missing backup receipt gate now blocks");
+        Assert.That(blocked.Executed, Is.Empty);
+    }
+
+    // --- backup receipt
+
+    private static string ReceiptFor(TestableRetentionWorker w, int month, Action<BackupReceipt> tweak = null)
+    {
+        var entry = w.Store.ReadIndexAsync(ItemTag).Result.Find(month);
+        var receipt = new BackupReceipt
+        {
+            Version = 1, Month = ArchiveMonths.Format(month), Snapshot = "auction-archive-20261101T0300Z", CreatedAt = Now,
+            Tags = new List<BackupReceiptTag>
+            {
+                new()
+                {
+                    Tag = ItemTag, Parts = entry.Parts, Rows = entry.Rows, PartSha256 = entry.PartSha256.ToList(),
+                    Objects = Enumerable.Range(0, entry.Parts).Select(p => new BackupReceiptObject
+                    {
+                        Key = AuctionBlobKeys.Block(ItemTag, month, p), ETag = w.Store.GetETagAsync(AuctionBlobKeys.Block(ItemTag, month, p)).Result.Trim('"'), Size = 1,
+                    }).ToList(),
+                },
+            },
+        };
+        tweak?.Invoke(receipt);
+        return receipt.ToJson();
+    }
+
+    private static TestableRetentionWorker ReceiptWorker(bool withReceipt = true, Action<BackupReceipt> tweak = null)
+    {
+        var w = Worker(("ARCHIVE:REQUIRE_BACKUP_RECEIPT", "true"));
+        AddArchivedMonth(w, OldMonth, 2);
+        ArchiveParts(w, OldMonth, new[] { PassAuction(1, 1, 1) }, new[] { PassAuction(3, 3, 3) });
+        w.SellerPassDone.Add(OldMonth);
+        if (withReceipt)
+            w.Store.RawObjects[BackupReceipt.Key(OldMonth)] = ReceiptFor(w, OldMonth, tweak);
+        else
+            w.Store.RawObjects.Remove(BackupReceipt.Key(OldMonth));
+        return w;
+    }
+
+    [Test]
+    public async Task DeletesAMonthCoveredByTheBackupReceipt()
+    {
+        var w = ReceiptWorker();
+        Assert.That(await w.Run(), Is.EqualTo(1));
+        Assert.That(w.Auctions, Is.Empty);
+    }
+
+    [Test]
+    public async Task MissingBackupReceiptBlocksTheMonth()
+    {
+        var w = ReceiptWorker(withReceipt: false);
+        Assert.That(await w.Run(), Is.EqualTo(0));
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(w.Store.Events.Any(e => e.StartsWith("read:")), Is.False, "the cheap receipt gate runs before the R2 re-verification");
+    }
+
+    [Test]
+    public async Task ReceiptGateCanBeDisabledExplicitly()
+    {
+        var w = Worker(("ARCHIVE:REQUIRE_BACKUP_RECEIPT", "false"));
+        AddArchivedMonth(w, OldMonth, 2);
+        Assert.That(await w.Run(), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task UnstampedOrInvalidReceiptBlocksTheMonth([Values("unstamped", "garbage")] string kind)
+    {
+        var w = ReceiptWorker(tweak: r => { if (kind == "unstamped") r.Snapshot = ""; });
+        if (kind == "garbage")
+            w.Store.RawObjects[BackupReceipt.Key(OldMonth)] = "{ nope";
+        Assert.That(await w.Run(), Is.EqualTo(0));
+        Assert.That(w.Executed, Is.Empty);
+    }
+
+    [Test]
+    public async Task ChangedETagBlocksTheMonth()
+    {
+        var w = ReceiptWorker();
+        // a privacy erasure rewrote part 1 after the backup
+        var block = await w.Store.ReadBlockAsync(ItemTag, OldMonth, 1);
+        block.ItemBytes[0] = new byte[] { 1, 2, 3 };
+        await w.Store.WriteBlockAsync(block);
+        w.Store.Events.Clear();
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(await w.BackupReceiptProblemAsync(OldMonth, CancellationToken.None), Does.Contain("rewritten since the backup"));
+    }
+
+    [Test]
+    public async Task PartsAddedSinceTheBackupBlockTheMonth()
+    {
+        var w = ReceiptWorker();
+        // the Scylla import added part 2 to the tag index and archived_months after the receipt was written
+        var third = ArchivedAuctionBlock.FromAuctions(ItemTag, OldMonth, 2, ArchivedAuctionBlock.SourceScylla, new[] { PassAuction(9, 9, 9) });
+        await w.Store.WriteBlockAsync(third);
+        var index = await w.Store.ReadIndexAsync(ItemTag);
+        var entry = index.Find(OldMonth);
+        entry.Parts = 3;
+        entry.Rows += 1;
+        entry.PartSha256.Add(third.Sha256());
+        await w.Store.WriteIndexAsync(index);
+        var hashes = entry.PartSha256.ToList();
+        w.MonthParts[OldMonth] = new List<RetentionTagParts> { new(ItemTag, 3, ArchivedAuctionBlock.CombinedSha256(hashes)) };
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(await w.BackupReceiptProblemAsync(OldMonth, CancellationToken.None), Does.Contain("changed since the backup"));
+    }
+
+    [Test]
+    public async Task ReceiptThatMissesATagBlocksTheMonth()
+    {
+        var w = ReceiptWorker(tweak: r => r.Tags.Clear());
+        Assert.That(await w.Run(), Is.EqualTo(0));
+        Assert.That(await w.BackupReceiptProblemAsync(OldMonth, CancellationToken.None), Does.Contain("is not in the backup receipt"));
+    }
+
+    [Test]
+    public async Task ReceiptForAnotherMonthBlocksTheMonth()
+    {
+        var w = ReceiptWorker(tweak: r => r.Month = "2023-02");
+        Assert.That(await w.Run(), Is.EqualTo(0));
+    }
+
+    [Test]
+    public async Task NoObjectProbeFailsClosed()
+    {
+        var w = new TestableRetentionWorker(new InMemoryAuctionBlobStore(), ArchiveTestConfig.Build(("ARCHIVE:DELETE_MARIADB", "true"), ("ARCHIVE:OLDEST_MONTH", "2023-01")), withProbe: false);
+        AddArchivedMonth(w, OldMonth, 3);
+
+        Assert.That(await w.Run(), Is.EqualTo(0), "the run aborts the month");
+
+        Assert.That(w.Executed, Is.Empty, "nothing deleted");
+        Assert.That(w.Auctions, Has.Count.EqualTo(3));
+        Assert.That(w.Closed, Is.Empty);
+        Assert.ThrowsAsync<InvalidOperationException>(() => w.BackupReceiptProblemAsync(OldMonth, CancellationToken.None), "and the gate itself throws instead of passing");
+    }
+
+    // --- minor 1: the GET of the re-verify must return the receipt's ETag
+
+    /// <summary>The object was replaced between the receipt HEAD and the part GET: the decoded bytes are not the backed up ones.</summary>
+    [Test]
+    public async Task PartReplacedBetweenTheReceiptCheckAndTheReadBackBlocksTheMonth()
+    {
+        var w = ReceiptWorker();
+        w.Store.GetETagOverride = key => "\"replaced-after-head\"";
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Executed, Is.Empty);
+        Assert.That(w.Auctions, Has.Count.EqualTo(2));
+        Assert.That(w.Closed, Is.Empty);
+    }
+
+    [Test]
+    public void PartProblemComparesTheGetETagWithTheReceipt()
+    {
+        var w = ReceiptWorker();
+        var receipt = BackupReceipt.Parse(w.Store.RawObjects[BackupReceipt.Key(OldMonth)]);
+        var block = w.Store.ReadBlockAsync(ItemTag, OldMonth, 0).Result;
+        var expected = receipt.Tags.Single().Objects[0].ETag;
+        var hash = block.Sha256();
+
+        Assert.That(AuctionRetentionWorker.PartProblem(ItemTag, OldMonth, 0, block, "\"" + expected + "\"", hash, receipt), Is.Null, "quotes do not matter");
+        Assert.That(AuctionRetentionWorker.PartProblem(ItemTag, OldMonth, 0, block, "\"other\"", hash, receipt), Does.Contain("ETag"));
+        Assert.That(AuctionRetentionWorker.PartProblem(ItemTag, OldMonth, 0, block, null, hash, receipt), Does.Contain("ETag"), "no ETag from the GET fails closed");
+        Assert.That(AuctionRetentionWorker.PartProblem(ItemTag, OldMonth, 0, block, null, hash, null), Is.Null, "no receipt gate, no ETag check");
+        Assert.That(AuctionRetentionWorker.PartProblem(ItemTag, OldMonth, 0, null, expected, hash, receipt), Does.Contain("missing"));
+    }
+
+    // --- minor 7: disabled safety gates are loud
+
+    [Test]
+    public void DisabledGatesListsEveryGateSwitchedOff()
+    {
+        Assert.That(AuctionRetentionWorker.DisabledGates(ArchiveOptions.From(ArchiveTestConfig.Build())), Is.Empty);
+        var all = ArchiveOptions.From(ArchiveTestConfig.Build(("ARCHIVE:REQUIRE_BACKUP_RECEIPT", "false"), ("ARCHIVE:REQUIRE_SCYLLA_IMPORT", "false"),
+            ("ARCHIVE:REQUIRE_REPLICA_HEALTHY", "false"), ("ARCHIVE:REQUIRE_HEALTH_CHECKS", "false")));
+        Assert.That(AuctionRetentionWorker.DisabledGates(all), Is.EquivalentTo(new[] { "backup_receipt", "scylla_import", "replica_healthy", "health_checks" }));
+    }
+
+    [Test]
+    public async Task DisabledGatesWarnAndSetTheGauge()
+    {
+        var log = new ListLogger<AuctionRetentionWorker>();
+        var config = ArchiveTestConfig.Build(("ARCHIVE:DELETE_MARIADB", "true"), ("ARCHIVE:OLDEST_MONTH", "2023-01"), ("ARCHIVE:REQUIRE_REPLICA_HEALTHY", "false"));
+        var w = new TestableRetentionWorker(new InMemoryAuctionBlobStore(), config, logger: log);
+
+        await w.Run();
+
+        Assert.That(log.Entries.Any(e => e.level == Microsoft.Extensions.Logging.LogLevel.Warning && e.message.Contains("SAFETY GATES DISABLED") && e.message.Contains("replica_healthy")), Is.True);
+        Assert.That(SafetyDisabled("replica_healthy"), Is.EqualTo(1));
+        Assert.That(SafetyDisabled("backup_receipt"), Is.EqualTo(0));
+        await Worker().Run();
+        Assert.That(SafetyDisabled("replica_healthy"), Is.EqualTo(0), "the gauge follows the configuration of the latest run");
+    }
+
+    private static double SafetyDisabled(string gate) => AuctionRetentionWorker.SafetyDisabledValue(gate);
 
     [Test]
     public void HealthEvaluation()

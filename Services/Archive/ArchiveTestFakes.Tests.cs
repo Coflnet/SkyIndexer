@@ -10,8 +10,31 @@ using Microsoft.Extensions.Configuration;
 namespace Coflnet.Sky.Indexer.Archive;
 
 /// <summary>Dictionary-backed <see cref="IAuctionBlobStore"/> that stores the real compressed wire format.</summary>
-internal class InMemoryAuctionBlobStore : IAuctionBlobStore, IArchiveMetaStore
+internal class InMemoryAuctionBlobStore : IAuctionBlobStore, IArchiveMetaStore, IArchiveObjectProbe
 {
+    /// <summary>Plain (not Brotli/MessagePack) objects such as backup receipts, by full key.</summary>
+    public readonly Dictionary<string, string> RawObjects = new();
+
+    public Task<string> ReadTextAsync(string key, CancellationToken cancellationToken = default)
+        => Task.FromResult(RawObjects.GetValueOrDefault(key));
+
+    /// <summary>Quoted MD5 of the stored bytes, like a single-part R2 PUT; null when the object does not exist.</summary>
+    public Task<string> GetETagAsync(string key, CancellationToken cancellationToken = default)
+    {
+        lock (gate)
+            return Task.FromResult(Objects.TryGetValue(key, out var bytes) ? "\"" + Convert.ToHexString(System.Security.Cryptography.MD5.HashData(bytes)).ToLowerInvariant() + "\"" : null);
+    }
+
+    /// <summary>Replaces the ETag the GET of <see cref="ReadBlockWithETagAsync"/> reports (an object that was replaced between the HEAD and the GET); null keeps the real one.</summary>
+    public Func<string, string> GetETagOverride;
+
+    public async Task<(ArchivedAuctionBlock Block, string ETag)> ReadBlockWithETagAsync(string tag, int month, int part, CancellationToken cancellationToken = default)
+    {
+        var block = await ReadBlockAsync(tag, month, part, true, cancellationToken);
+        var key = AuctionBlobKeys.Block(tag, month, part);
+        return (block, GetETagOverride?.Invoke(key) ?? await GetETagAsync(key, cancellationToken));
+    }
+
     public readonly Dictionary<string, byte[]> Objects = new();
     public readonly List<string> Events;
     /// <summary>When set, uncached block reads flip one item byte, like a corrupted upload.</summary>

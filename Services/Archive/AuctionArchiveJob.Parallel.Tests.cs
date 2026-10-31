@@ -80,6 +80,8 @@ public class AuctionArchiveJobParallelTests
             => Task.FromResult<IReadOnlyDictionary<int, DateTime>>(Auctions.GroupBy(a => a.ItemId).ToDictionary(g => g.Key, g => g.Min(a => a.End)));
         protected override Task<ArchiveMonthState> GetMonthStateAsync(int month, CancellationToken ct)
             => Task.FromResult(new ArchiveMonthState(Months.ContainsKey((0, ArchiveMonths.ToIndex(month))), new HashSet<ushort>()));
+        protected override Task<bool> IsMonthDeletedAsync(int month, CancellationToken ct) => Task.FromResult(false);
+        protected override Task<bool> IsTagMonthDeletedAsync(string tag, int month, CancellationToken ct) => Task.FromResult(false);
         protected override Task<ushort> GetOrCreateTagIdAsync(string tag, CancellationToken ct) => Task.FromResult(Tags.GetOrAdd(tag, _ => (ushort)(Tags.Count + 1)));
 
         protected override async Task<List<SaveAuction>> LoadPageAsync(int itemId, DateTime cursorEnd, int cursorId, DateTime monthEnd, int pageSize, CancellationToken ct)

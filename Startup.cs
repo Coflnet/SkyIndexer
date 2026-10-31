@@ -77,6 +77,7 @@ namespace Coflnet.Sky.Indexer
             services.AddSingleton<S3AuctionBlobStore>();
             services.AddSingleton<IAuctionBlobStore>(p => p.GetRequiredService<S3AuctionBlobStore>());
             services.AddSingleton<IArchiveMetaStore>(p => p.GetRequiredService<S3AuctionBlobStore>());
+            services.AddSingleton<IArchiveObjectProbe>(p => p.GetRequiredService<S3AuctionBlobStore>());
             var archiveEnabled = bool.TryParse(Configuration["ARCHIVE:ENABLED"], out var archive) && archive;
             var s3Enabled = bool.TryParse(Configuration["S3:ENABLED"], out var s3) && s3;
             services.AddSingleton<IArchiveItemCheckpoints, RedisArchiveItemCheckpoints>();

@@ -151,6 +151,11 @@ namespace Coflnet.Sky.Indexer.Archive
                 var state = await GetMonthStateAsync(month.Value, cancellationToken).ConfigureAwait(false);
                 if (!state.HasSentinel || state.ScyllaAt != null)
                     continue;
+                if (await IsMonthDeletedAsync(month.Value, cancellationToken).ConfigureAwait(false))
+                {
+                    RefuseDeleted("any import", null, month.Value);
+                    continue;
+                }
                 var manifest = await meta.ReadMetaAsync<ScyllaMonthManifest>(key, cancellationToken).ConfigureAwait(false);
                 if (manifest == null)
                     continue;
@@ -209,6 +214,12 @@ namespace Coflnet.Sky.Indexer.Archive
                 return false;
             }
 
+            // never import into a deleted month (checked first, and again right before the index rows and the archived_months row)
+            if (ArchiveDeletedMonthGuard.IsDeleted(row) || await IsTagMonthDeletedAsync(entry.Tag, month, cancellationToken).ConfigureAwait(false))
+            {
+                RefuseDeleted("the index rows and the archived_months row", entry.Tag, month);
+                return false;
+            }
             var phaseOneParts = row?.Parts ?? 0;
             var newHashes = entry.NewPartSha256 ?? new List<string>();
             if (entry.NewParts <= 0 || newHashes.Count != entry.NewParts)
@@ -247,6 +258,11 @@ namespace Coflnet.Sky.Indexer.Archive
                 return Reject($"the parts hold {rows} rows, the manifest says {entry.NewRows}");
 
             // pass 2: write the index rows part by part (idempotent, so a crash here is safe for the re-run)
+            if (await IsTagMonthDeletedAsync(entry.Tag, month, cancellationToken).ConfigureAwait(false))
+            {
+                RefuseDeleted("the index rows and the archived_months row", entry.Tag, month);
+                return false;
+            }
             var tagId = await GetOrCreateTagIdAsync(entry.Tag, cancellationToken).ConfigureAwait(false);
             var monthIndex = ArchiveMonths.ToIndex(month);
             long locationCount = 0;
@@ -298,6 +314,11 @@ namespace Coflnet.Sky.Indexer.Archive
             bidsWithoutBidder.Inc(withoutBidder);
 
             // the archived_months row with scylla_at (the marker) last
+            if (await IsTagMonthDeletedAsync(entry.Tag, month, cancellationToken).ConfigureAwait(false))
+            {
+                RefuseDeleted("the archived_months row", entry.Tag, month);
+                return false;
+            }
             var now = DateTime.UtcNow;
             await UpsertArchivedMonthAsync(new ArchivedMonth
             {
@@ -409,6 +430,22 @@ namespace Coflnet.Sky.Indexer.Archive
             var sentinel = await db.ArchivedMonths.AsNoTracking().Where(m => m.TagId == 0 && m.Month == index)
                 .Select(m => new { m.ScyllaAt }).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
             return new ScyllaImportMonthState(sentinel != null, sentinel?.ScyllaAt);
+        }
+
+        /// <summary>The month sentinel or the tag-month's row has <c>deleted_at</c> / <c>deleted_rows &gt; 0</c>: importing would write index rows and counts for a month whose MariaDB rows are (partly) gone.</summary>
+        protected virtual Task<bool> IsTagMonthDeletedAsync(string tag, int month, CancellationToken cancellationToken)
+            => ArchiveDeletedMonthGuard.IsTagMonthDeletedAsync(tag, month, cancellationToken);
+
+        /// <summary>The month sentinel has <c>deleted_at</c> / <c>deleted_rows &gt; 0</c>.</summary>
+        protected virtual Task<bool> IsMonthDeletedAsync(int month, CancellationToken cancellationToken)
+            => ArchiveDeletedMonthGuard.IsMonthDeletedAsync(month, cancellationToken);
+
+        private bool RefuseDeleted(string what, string tag, int month)
+        {
+            ArchiveDeletedMonthGuard.Refused.WithLabels("scylla_import").Inc();
+            errors.Inc();
+            logger.LogError("Scylla import refused for {Tag} {Month}: archived_months says it (or its month) is deleted from MariaDB; {What} is not written", tag ?? "(any tag)", ArchiveMonths.Format(month), what);
+            return true;
         }
 
         /// <summary>The <c>archived_months</c> row of a tag-month, null when the tag or the row does not exist.</summary>

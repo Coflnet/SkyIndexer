@@ -60,6 +60,22 @@ public class AuctionArchiveJobTests
                 rows.Where(r => r.TagId != 0 && r.VerifiedAt != null).Select(r => r.TagId).ToHashSet()));
         }
 
+        /// <summary>Runs when the first page's children are loaded, i.e. while an item is being walked (to flip deletion state mid-run).</summary>
+        public Action OnChildren;
+
+        protected override Task<bool> IsMonthDeletedAsync(int month, CancellationToken cancellationToken)
+        {
+            var index = ArchiveMonths.ToIndex(month);
+            return Task.FromResult(Months.Values.Any(m => m.TagId == 0 && m.Month == index && ArchiveDeletedMonthGuard.IsDeleted(m)));
+        }
+
+        protected override Task<bool> IsTagMonthDeletedAsync(string tag, int month, CancellationToken cancellationToken)
+        {
+            var index = ArchiveMonths.ToIndex(month);
+            Tags.TryGetValue(tag, out var id);
+            return Task.FromResult(Months.Values.Any(m => m.Month == index && (m.TagId == 0 || m.TagId == id && id != 0) && ArchiveDeletedMonthGuard.IsDeleted(m)));
+        }
+
         protected override Task<ushort> GetOrCreateTagIdAsync(string tag, CancellationToken cancellationToken)
         {
             if (!Tags.TryGetValue(tag, out var id))
@@ -77,6 +93,7 @@ public class AuctionArchiveJobTests
         protected override Task LoadChildrenAsync(List<SaveAuction> page, CancellationToken cancellationToken)
         {
             Events.Add("children");
+            OnChildren?.Invoke();
             return Task.CompletedTask;
         }
 
@@ -591,5 +608,112 @@ public class AuctionArchiveJobTests
         await job.ExecuteTask;
         Assert.That(job.SchemaEnsured, Is.False);
         Assert.That(events, Is.Empty);
+    }
+
+    // ------------------------------------------------------------ M3: never (re)write a deleted month
+
+    private static double Refused() => ArchiveDeletedMonthGuard.Refused.WithLabels("archive_job").Value;
+
+    private TestableArchiveJob TwoTagJob(Action<TestableArchiveJob> setup = null)
+    {
+        var job = Job(("ARCHIVE:OLDEST_MONTH", "2026-09"));
+        job.Auctions.Add(Auction(1, "HYPERION", new DateTime(2026, 9, 3)));
+        job.Auctions.Add(Auction(2, "TERMINATOR", new DateTime(2026, 9, 4)));
+        job.Tags["HYPERION"] = 1;
+        job.Tags["TERMINATOR"] = 2;
+        setup?.Invoke(job);
+        return job;
+    }
+
+    private static ArchivedMonth Row(ushort tag, uint? deletedRows, DateTime? deletedAt = null) => new()
+    {
+        TagId = tag, Month = ArchiveMonths.ToIndex(Sep), Parts = 1, Rows = 7, Source = "mariadb", Sha256 = new string('c', 64),
+        ArchivedAt = Now, VerifiedAt = Now, IndexRows = 7, DeletedRows = deletedRows, DeletedAt = deletedAt,
+    };
+
+    [TestCase(3u, false)]
+    [TestCase(0u, true)]
+    public async Task TagMonthWithDeletedRowsIsNeverRewritten_AndTheMonthGetsNoSentinel(uint deletedRows, bool viaDeletedAt)
+    {
+        var job = TwoTagJob(j => j.Months[(1, ArchiveMonths.ToIndex(Sep))] = Row(1, deletedRows, viaDeletedAt ? Now : null));
+        var before = Refused();
+
+        Assert.That(await job.Run(Now), Is.EqualTo(0), "a dropped tag must not complete the month (no sentinel with a silently missing tag)");
+        Assert.That(job.Months.ContainsKey((0, ArchiveMonths.ToIndex(Sep))), Is.False, "no sentinel");
+
+        Assert.That(store.Objects.Keys.Where(k => k.Contains("/HYPERION/")), Is.Empty, "no block and no tag index for the deleted tag-month");
+        Assert.That(job.Locations.Values.Any(l => l.tag == 1), Is.False, "no index rows for the deleted tag-month");
+        Assert.That(job.Months[(1, ArchiveMonths.ToIndex(Sep))].Rows, Is.EqualTo(7u), "archived_months row of the deleted tag-month untouched");
+        Assert.That(Refused(), Is.GreaterThan(before));
+    }
+
+    [Test]
+    public async Task DeletedSentinelRefusesTheWholeMonth()
+    {
+        var job = TwoTagJob();
+        job.Months[(0, ArchiveMonths.ToIndex(Sep))] = Row(0, 5);
+        var before = Refused();
+
+        var ok = await job.ArchiveMonthAsync(Sep, new[] { 1, 2 }, ArchiveOptions.From(ArchiveTestConfig.Build()), CancellationToken.None);
+
+        Assert.That(ok, Is.False);
+        Assert.That(store.Objects, Is.Empty);
+        Assert.That(job.Locations, Is.Empty);
+        Assert.That(Refused(), Is.GreaterThan(before));
+    }
+
+    /// <summary>The month was fine when the item started but got deleted rows while it walked: checked again right before the block is written.</summary>
+    [Test]
+    public async Task DeletionThatStartsWhileAnItemWalksIsHonouredBeforeTheFlush()
+    {
+        var job = TwoTagJob();
+        job.OnChildren = () => job.Months[(1, ArchiveMonths.ToIndex(Sep))] = Row(1, 2);
+
+        await job.Run(Now);
+
+        Assert.That(store.Objects.Keys.Where(k => k.Contains("/HYPERION/")), Is.Empty);
+        Assert.That(job.Locations.Values.Any(l => l.tag == 1), Is.False);
+    }
+
+    /// <summary>Two items feed one tag; the first finished (parts, index rows, run merged), then the tag gets deleted rows: no tag index entry or marker for it.</summary>
+    [Test]
+    public async Task TagDeletedAfterAnItemFinishedIsNotFinalised()
+    {
+        var job = Job(("ARCHIVE:OLDEST_MONTH", "2026-09"));
+        job.Auctions.Add(Auction(1, "HYPERION", new DateTime(2026, 9, 3)));
+        job.Auctions.Add(Auction(2, "HYPERION", new DateTime(2026, 9, 4)));
+        job.Tags["HYPERION"] = 1;
+        var calls = 0;
+        job.OnChildren = () => { if (++calls == 2) job.Months[(1, ArchiveMonths.ToIndex(Sep))] = Row(1, 1); };
+
+        await job.Run(Now);
+
+        Assert.That(store.Objects.Keys, Does.Not.Contain("auctions/v2/HYPERION/index.msgpack.br"), "no tag index entry");
+        Assert.That(job.Months[(1, ArchiveMonths.ToIndex(Sep))].Rows, Is.EqualTo(7u), "the row was not replaced");
+        Assert.That(events.Any(e => e.StartsWith("archived_month:1")), Is.False);
+    }
+
+    [Test]
+    public async Task MonthsWithoutDeletedDataStillArchiveNormally()
+    {
+        var job = TwoTagJob();
+        Assert.That(await job.Run(Now), Is.EqualTo(1));
+        Assert.That(store.Objects.Keys.Where(k => k.Contains("/HYPERION/")), Is.Not.Empty);
+    }
+
+    /// <summary>Documents the decision: a resume legitimately rewrites the same part keys, so blocks are NOT written with If-None-Match.</summary>
+    [Test]
+    public async Task ResumeRewritesPartsOfAMonthWithoutDeletedRows()
+    {
+        var job = TwoTagJob();
+        await job.Run(Now);
+        var keys = store.Objects.Keys.OrderBy(k => k).ToList();
+        job.Months.Clear();
+        events.Clear();
+
+        Assert.That(await job.Run(Now), Is.EqualTo(1));
+
+        Assert.That(events.Count(e => e.StartsWith("write:")), Is.EqualTo(2));
+        Assert.That(store.Objects.Keys.OrderBy(k => k), Is.EqualTo(keys));
     }
 }

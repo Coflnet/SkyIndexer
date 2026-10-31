@@ -101,6 +101,15 @@ public class ArchiveItemCheckpointsTests
             var index = ArchiveMonths.ToIndex(month);
             return Task.FromResult(new ArchiveMonthState(Months.ContainsKey((0, index)), new HashSet<ushort>()));
         }
+        protected override Task<bool> IsMonthDeletedAsync(int month, CancellationToken ct) => Task.FromResult(false);
+        /// <summary>Tag whose archived_months row counts as deleted (set after the checkpoints were written, like a retention run that started meanwhile).</summary>
+        public string DeletedTag;
+        public int TagGuardChecks;
+        protected override Task<bool> IsTagMonthDeletedAsync(string tag, int month, CancellationToken ct)
+        {
+            TagGuardChecks++;
+            return Task.FromResult(tag == DeletedTag);
+        }
         protected override Task<ushort> GetOrCreateTagIdAsync(string tag, CancellationToken ct)
         {
             if (!Tags.TryGetValue(tag, out var id))
@@ -240,6 +249,59 @@ public class ArchiveItemCheckpointsTests
         Assert.That(restarted.Months[(restarted.Tags["A"], ArchiveMonths.ToIndex(Sep))].IndexRows, Is.EqualTo(freshMonths[(fresh.Tags["A"], ArchiveMonths.ToIndex(Sep))].IndexRows));
         Assert.That(store.Objects.Keys, Does.Contain("auctions/v2/A/2026-09/003.msgpack.br").Or.Contain("auctions/v2/A/2026-09/002.msgpack.br"), "item 4 continues after the restored parts");
         Assert.That(logger.Entries.Any(e => e.message.Contains("3 finished items skipped") && e.message.Contains("item 4")), Is.True, string.Join("\n", logger.Entries.Select(e => e.message)));
+    }
+
+    /// <summary>M3 resume path: restored checkpoint runs of a tag-month that got deleted rows meanwhile are never finalised (no tag index entry, no archived_months row), other tags are.</summary>
+    [Test]
+    public async Task Restart_NeverFinalisesARestoredTagMonthThatWasDeletedMeanwhile()
+    {
+        var fresh = Seeded();
+        await fresh.Month(Items);
+        var saved = checkpoints.Data[Sep];
+        var indexBefore = await store.ReadIndexAsync("A");
+        var blocksBefore = store.Objects.Keys.Where(k => k.StartsWith("auctions/v2/A/2026-09/")).OrderBy(k => k).ToList();
+        checkpoints = new FakeCheckpoints();
+        foreach (var i in new[] { 1, 2, 3, 4 })   // every item restored: only the finalisation can refuse
+            checkpoints.Data[Sep] = (checkpoints.Data.GetValueOrDefault(Sep) ?? new()).Also(d => d[i] = saved[i]);
+        var restarted = Seeded();
+        restarted.DeletedTag = "A";
+        var refusedBefore = ArchiveDeletedMonthGuard.Refused.WithLabels("archive_job").Value;
+
+        Assert.That(await restarted.Month(Items), Is.False, "the month is incomplete: no sentinel with a silently dropped tag");
+
+        Assert.That(restarted.Months.Keys.Select(k => k.tag), Is.EqualTo(new[] { restarted.Tags["B"] }), "archived_months row written for B only, none for A");
+        Assert.That((await store.ReadIndexAsync("A")).ETag, Is.EqualTo(indexBefore.ETag), "tag index of A untouched");
+        Assert.That(store.Objects.Keys.Where(k => k.StartsWith("auctions/v2/A/2026-09/")).OrderBy(k => k), Is.EqualTo(blocksBefore), "no block of A written");
+        Assert.That(ArchiveDeletedMonthGuard.Refused.WithLabels("archive_job").Value, Is.GreaterThan(refusedBefore));
+    }
+
+    /// <summary>m6: a refusal while an item walks fails that item: no checkpoint for it, the month gets no sentinel and no tag is silently dropped.</summary>
+    [Test]
+    public async Task RefusalMidItem_FailsTheItem_NoCheckpoint_NoSentinel()
+    {
+        var job = Seeded();
+        job.DeletedTag = "A";
+        var refusedBefore = ArchiveDeletedMonthGuard.Refused.WithLabels("archive_job").Value;
+
+        Assert.That(await job.Run(), Is.EqualTo(0));
+
+        Assert.That(job.Months.ContainsKey((0, ArchiveMonths.ToIndex(Sep))), Is.False, "no sentinel");
+        Assert.That(checkpoints.Data.GetValueOrDefault(Sep)?.ContainsKey(1) ?? false, Is.False, "item 1 wrote rows of the refused tag: no checkpoint");
+        Assert.That(store.Objects.Keys.Where(k => k.StartsWith("auctions/v2/A/")), Is.Empty, "nothing of A written");
+        Assert.That(ArchiveDeletedMonthGuard.Refused.WithLabels("archive_job").Value, Is.GreaterThan(refusedBefore));
+    }
+
+    /// <summary>m1: the tag-month guard is read once per tag and item (before its first block) and at finalisation, not on every part flush.</summary>
+    [Test]
+    public async Task TagMonthGuardIsReadOncePerItemAndTagAndAtFinalisation()
+    {
+        var job = new Job(store, checkpoints);
+        job.Auctions.AddRange(new[] { Auction(1, "A"), Auction(1, "A"), Auction(1, "A"), Auction(1, "A"), Auction(1, "A"), Auction(1, "B") });   // A needs 3 parts at 2 rows per part
+
+        Assert.That(await job.Month(new[] { 1 }), Is.True);
+
+        Assert.That(store.Objects.Keys.Count(k => k.StartsWith("auctions/v2/A/2026-09/0")), Is.EqualTo(3));
+        Assert.That(job.TagGuardChecks, Is.EqualTo(4), "A and B once while the item walks + A and B at finalisation");
     }
 
     [Test]

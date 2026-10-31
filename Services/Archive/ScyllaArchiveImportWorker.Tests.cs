@@ -42,6 +42,16 @@ public class ScyllaArchiveImportWorkerTests
         protected override Task<ArchivedMonth> GetTagRowAsync(string tag, int month, CancellationToken cancellationToken)
             => Task.FromResult(Row(tag, month));
 
+        protected override Task<bool> IsMonthDeletedAsync(int month, CancellationToken cancellationToken)
+            => Task.FromResult(Months.TryGetValue((0, ArchiveMonths.ToIndex(month)), out var s) && ArchiveDeletedMonthGuard.IsDeleted(s));
+
+        protected override Task<bool> IsTagMonthDeletedAsync(string tag, int month, CancellationToken cancellationToken)
+        {
+            var idx = ArchiveMonths.ToIndex(month);
+            var sentinel = Months.TryGetValue((0, idx), out var s) && ArchiveDeletedMonthGuard.IsDeleted(s);
+            return Task.FromResult(sentinel || Tags.TryGetValue(tag, out var id) && Months.TryGetValue((id, idx), out var r) && ArchiveDeletedMonthGuard.IsDeleted(r));
+        }
+
         protected override Task<ushort> GetOrCreateTagIdAsync(string tag, CancellationToken cancellationToken)
         {
             if (!Tags.TryGetValue(tag, out var id))
@@ -59,6 +69,7 @@ public class ScyllaArchiveImportWorkerTests
         protected override Task WriteIndexRowsAsync(ushort tagId, ushort month, IReadOnlyList<(long uid, byte part)> locations, IReadOnlyList<AuctionBidder> bidders, IReadOnlyList<AuctionSeller> sellers, CancellationToken cancellationToken)
         {
             Events.Add($"index_rows:{tagId}");
+            OnWrite?.Invoke();
             WriteCalls.Add((locations.ToList(), bidders.Count));
             foreach (var (uid, part) in locations)
                 if (!Locations.TryGetValue(uid, out var existing) || existing.tag == tagId && existing.month == month)
@@ -89,6 +100,8 @@ public class ScyllaArchiveImportWorkerTests
         public int SchemaChecks;
         protected override Task<bool> SchemaReadyAsync(CancellationToken cancellationToken) { SchemaChecks++; return Task.FromResult(SchemaReady); }
 
+        public Action OnWrite;
+        public Task<bool> ImportTagAsyncForTest(ScyllaTagImport entry) => ImportTagAsync(Sep, entry, Row(entry.Tag, Sep), CancellationToken.None);
         public Task<int> Run() => RunOnceAsync(CancellationToken.None);
     }
 
@@ -134,7 +147,7 @@ public class ScyllaArchiveImportWorkerTests
     /// What phase 1 and the sweep leave behind: HYPERION has a MariaDB part 0 and archived_months row plus a Scylla part 1;
     /// TERMINATOR only a Scylla part 0. The tag indexes already list the Scylla parts, the manifest hands them over.
     /// </summary>
-    private ScyllaMonthManifest Scenario(bool completed = true)
+    private ScyllaMonthManifest Scenario(bool completed = true, bool hyperionDeleted = false)
     {
         var p0 = WriteBlock(Hyperion, 0, ArchivedAuctionBlock.SourceMariaDb, Auction(1, 1, Hyperion));
         var p1 = WriteBlock(Hyperion, 1, ArchivedAuctionBlock.SourceScylla, Auction(2, 2, Hyperion, (500, 70), (500, 90), (501, 80)), Auction(3, 3, Hyperion, (0, 10)));
@@ -145,7 +158,7 @@ public class ScyllaArchiveImportWorkerTests
         worker.Months[(1, SepIndex)] = new ArchivedMonth
         {
             TagId = 1, Month = SepIndex, Parts = 1, Rows = 1, SoldRows = 0, Source = ArchivedAuctionBlock.SourceMariaDb, Sha256 = ArchivedAuctionBlock.CombinedSha256(new[] { p0 }),
-            ArchivedAt = Now.AddDays(-30), VerifiedAt = Now.AddDays(-30), IndexRows = 1, IndexBidderRows = 0, DeletedRows = 1, DeletedAt = Now.AddDays(-2), Note = "phase one note",
+            ArchivedAt = Now.AddDays(-30), VerifiedAt = Now.AddDays(-30), IndexRows = 1, IndexBidderRows = 0, DeletedRows = hyperionDeleted ? 1u : null, DeletedAt = hyperionDeleted ? Now.AddDays(-2) : null, Note = "phase one note",
         };
         worker.Locations[1] = (1, SepIndex, 0);
         worker.Months[(0, SepIndex)] = new ArchivedMonth { TagId = 0, Month = SepIndex, Source = "mariadb", Sha256 = new string('0', 64), ArchivedAt = Now, VerifiedAt = Now };
@@ -179,7 +192,7 @@ public class ScyllaArchiveImportWorkerTests
             Assert.That(hyperion.IndexBidderRows, Is.EqualTo(1u), "bidder 500 (max 90); 501 unknown, 0 anonymous");
             Assert.That(hyperion.ScyllaAt, Is.Not.Null);
             Assert.That(hyperion.ArchivedAt, Is.EqualTo(Now.AddDays(-30)));
-            Assert.That((hyperion.DeletedRows, hyperion.DeletedAt), Is.EqualTo(((uint?)1, (DateTime?)Now.AddDays(-2))), "retention columns carried, never changed");
+            Assert.That((hyperion.DeletedRows, hyperion.DeletedAt), Is.EqualTo(((uint?)null, (DateTime?)null)), "retention columns carried, never changed");
             Assert.That(hyperion.Note, Is.EqualTo("phase one note; scylla import: +2 rows in 1 parts, 2 bids without bidder"));
         });
         var terminator = worker.Row(Terminator, Sep);
@@ -493,5 +506,56 @@ public class ScyllaArchiveImportWorkerTests
         Assert.That(ScyllaArchiveImportWorker.IsPlayerUuid(Hex(5)), Is.True);
         Assert.That(ScyllaArchiveImportWorker.IsPlayerUuid(Hex(0)), Is.False);
         Assert.That(ScyllaArchiveImportWorker.IsPlayerUuid("unknown"), Is.False);
+    }
+
+    // ------------------------------------------------------------ M3: never import into a deleted month
+
+    private static double Refused() => ArchiveDeletedMonthGuard.Refused.WithLabels("scylla_import").Value;
+
+    [Test]
+    public async Task RefusesToImportIntoATagMonthWithDeletedRows_ButImportsTheOtherTag()
+    {
+        Scenario(hyperionDeleted: true);
+        var before = Refused();
+        var locationsBefore = worker.Locations.ToDictionary(kv => kv.Key, kv => kv.Value);
+
+        Assert.That(await worker.Run(), Is.EqualTo(0), "the month is not marked complete while a tag is refused");
+
+        Assert.That(worker.Locations.ContainsKey(2), Is.False, "no index rows for the deleted tag-month");
+        Assert.That(worker.Row(Hyperion, Sep).Rows, Is.EqualTo(1u), "archived_months row untouched");
+        Assert.That(worker.Row(Hyperion, Sep).ScyllaAt, Is.Null);
+        Assert.That(worker.Row(Terminator, Sep)?.ScyllaAt, Is.Not.Null, "other tags import");
+        Assert.That(worker.Months[(0, SepIndex)].ScyllaAt, Is.Null);
+        Assert.That(Refused(), Is.GreaterThan(before));
+        Assert.That(log.Entries.Any(e => e.level == Microsoft.Extensions.Logging.LogLevel.Error && e.message.Contains("refused")), Is.True);
+    }
+
+    [Test]
+    public async Task RefusesToImportIntoAMonthWhoseSentinelIsDeleted()
+    {
+        Scenario();
+        worker.Months[(0, SepIndex)].DeletedAt = Now;
+        var before = Refused();
+
+        Assert.That(await worker.Run(), Is.EqualTo(0));
+
+        Assert.That(events.Where(e => e.StartsWith("index_rows") || e.StartsWith("archived_month")), Is.Empty);
+        Assert.That(Refused(), Is.GreaterThan(before));
+    }
+
+    [Test]
+    public async Task RefusesWhenTheTagMonthGetsDeletedRowsWhileTheImportRuns()
+    {
+        var m = Scenario();
+        var entry = m.Find(Terminator);
+        var row = new ArchivedMonth { TagId = 2, Month = SepIndex, Sha256 = ArchivedAuctionBlock.CombinedSha256(Array.Empty<string>()) };
+        worker.Tags[Terminator] = 2;
+        worker.Months[(2, SepIndex)] = row;
+        worker.OnWrite = () => row.DeletedRows = 4; // retention started after the verification pass, before the marker
+
+        var ok = await worker.ImportTagAsyncForTest(entry);
+
+        Assert.That(ok, Is.False);
+        Assert.That(events.Any(e => e.StartsWith("archived_month:2")), Is.False, "marker not written");
     }
 }

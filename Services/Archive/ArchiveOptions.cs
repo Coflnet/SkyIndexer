@@ -40,12 +40,25 @@ namespace Coflnet.Sky.Indexer.Archive
         /// <summary>Hours the Redis item-month checkpoints live (refreshed on every item); expired means a full re-walk of the month.</summary>
         public int CheckpointTtlHours { get; init; } = 48;
         public bool DeleteMariaDb { get; init; }
+        /// <summary>Hours a month that the retention worker aborted is left alone (persisted in the sentinel note, survives restarts); 0 retries on every run.</summary>
+        public int AbortBackoffHours { get; init; } = 24;
         public int MaxDeleteMonthsPerDay { get; init; } = 1;
         public int DeleteBatchSize { get; init; } = 5000;
         public int DeletePauseMs { get; init; } = 500;
         public double MaxBinlogGb { get; init; } = 100;
         public long MaxHistoryListLength { get; init; } = 1_000_000;
         public bool RequireHealthChecks { get; init; } = true;
+        /// <summary>
+        /// The replica gate (<c>DBReadOnlyConnection</c> replica: both replication threads running and lag at most <see cref="MaxReplicaLagSeconds"/>) is
+        /// evaluated before the month gates and before every batch, independent of <see cref="RequireHealthChecks"/>. Default true, fails closed when the status can not be read.
+        /// </summary>
+        public bool RequireReplicaHealthy { get; init; } = true;
+        /// <summary>Retention pauses while the replica (<c>DBReadOnlyConnection</c>) is further behind than this.</summary>
+        public int MaxReplicaLagSeconds { get; init; } = 300;
+        /// <summary>A month is deleted from MariaDB only when <c>auctions/v2/_meta/backup/{yyyy-MM}.json</c> covers its current R2 state, see <see cref="Coflnet.Sky.Core.Archive.BackupReceipt"/>.</summary>
+        public bool RequireBackupReceipt { get; init; } = true;
+        /// <summary>A month is deleted only once its sentinel has <c>scylla_at</c> (Scylla sweep and import finished).</summary>
+        public bool RequireScyllaImport { get; init; } = true;
         /// <summary>
         /// <c>yyyyMM</c> parsed from <c>OLDEST_MONTH</c> (<c>yyyy-MM</c>). SkyBlock launched on 2019-06-11, so no auction
         /// ends before 2019-06; every empty month still costs one page query per ItemId. Raise this default as the
@@ -79,12 +92,17 @@ namespace Coflnet.Sky.Indexer.Archive
                 ImportPollMinutes = System.Math.Max(1, Int(s["IMPORT_POLL_MINUTES"], d.ImportPollMinutes)),
                 CheckpointTtlHours = System.Math.Max(1, Int(s["CHECKPOINT_TTL_HOURS"], d.CheckpointTtlHours)),
                 DeleteMariaDb = Bool(s["DELETE_MARIADB"], false),
+                AbortBackoffHours = System.Math.Max(0, Int(s["ABORT_BACKOFF_HOURS"], d.AbortBackoffHours)),
                 MaxDeleteMonthsPerDay = Int(s["MAX_DELETE_MONTHS_PER_DAY"], d.MaxDeleteMonthsPerDay),
                 DeleteBatchSize = System.Math.Max(1, Int(s["DELETE_BATCH_SIZE"], d.DeleteBatchSize)),
                 DeletePauseMs = Int(s["DELETE_PAUSE_MS"], d.DeletePauseMs),
                 MaxBinlogGb = double.TryParse(s["MAX_BINLOG_GB"], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var gb) ? gb : d.MaxBinlogGb,
                 MaxHistoryListLength = long.TryParse(s["MAX_HISTORY_LIST_LENGTH"], out var h) ? h : d.MaxHistoryListLength,
                 RequireHealthChecks = Bool(s["REQUIRE_HEALTH_CHECKS"], true),
+                RequireReplicaHealthy = Bool(s["REQUIRE_REPLICA_HEALTHY"], true),
+                MaxReplicaLagSeconds = System.Math.Max(0, Int(s["MAX_REPLICA_LAG_SECONDS"], d.MaxReplicaLagSeconds)),
+                RequireBackupReceipt = Bool(s["REQUIRE_BACKUP_RECEIPT"], true),
+                RequireScyllaImport = Bool(s["REQUIRE_SCYLLA_IMPORT"], true),
                 OldestMonth = string.IsNullOrWhiteSpace(s["OLDEST_MONTH"]) ? d.OldestMonth : ArchiveMonths.Parse(s["OLDEST_MONTH"]),
             };
         }

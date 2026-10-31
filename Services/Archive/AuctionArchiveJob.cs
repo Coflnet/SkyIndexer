@@ -206,6 +206,11 @@ namespace Coflnet.Sky.Indexer.Archive
         /// are skipped without a query. Null skips nothing.</param>
         internal async Task<bool> ArchiveMonthAsync(int month, IReadOnlyList<int> itemIds, ArchiveOptions options, CancellationToken cancellationToken, IReadOnlyDictionary<int, int> firstMonths = null)
         {
+            if (await IsMonthDeletedAsync(month, cancellationToken).ConfigureAwait(false))
+            {
+                Refuse("any block or index row", null, month);
+                return false;
+            }
             var ttl = TimeSpan.FromHours(options.CheckpointTtlHours);
             var state = new MonthRuns();
             var done = await RestoreCheckpointsAsync(month, itemIds, state, firstMonths, ttl, cancellationToken).ConfigureAwait(false);
@@ -259,9 +264,22 @@ namespace Coflnet.Sky.Indexer.Archive
             }
             if (Volatile.Read(ref failed) != 0)
                 return false;
+            if (await IsMonthDeletedAsync(month, cancellationToken).ConfigureAwait(false))
+            {
+                Refuse("the tag indexes and the month sentinel", null, month);
+                return false;
+            }
             var allFinalized = true;
             foreach (var run in state.Runs.Values.OrderBy(r => r.Tag, StringComparer.Ordinal))
             {
+                // checked right before the tag index entry and the archived_months row are written (also for runs restored from checkpoints)
+                if (await IsTagMonthDeletedAsync(run.Tag, month, cancellationToken).ConfigureAwait(false))
+                {
+                    // the other tags are still finalised, but the month is incomplete: no sentinel with a silently dropped tag
+                    Refuse("the tag index entry and archived_months row", run.Tag, month);
+                    allFinalized = false;
+                    continue;
+                }
                 using (Stage(ArchiveTelemetry.Stages.Finalise))
                     allFinalized &= await FinalizeTagMonthAsync(run, cancellationToken).ConfigureAwait(false);
             }
@@ -409,7 +427,13 @@ namespace Coflnet.Sky.Indexer.Archive
 
         private async Task<(bool ok, int rows, ItemMonthCheckpoint checkpoint)> ArchiveItemMonthCoreAsync(int itemId, int month, MonthRuns state, ArchiveOptions options, CancellationToken cancellationToken, DateTime? startedAt, Activity root)
         {
+            if (await IsMonthDeletedAsync(month, cancellationToken).ConfigureAwait(false))
+            {
+                Refuse("any block or index row", null, month);
+                return (false, 0, null);
+            }
             var archivedAt = startedAt ?? DateTime.UtcNow;
+            var approved = new HashSet<string>(StringComparer.Ordinal);
             var local = new Dictionary<string, TagMonthRun>(StringComparer.Ordinal);
             var (monthStart, monthEnd) = ArchiveMonths.MonthRange(month);
             var buffers = new Dictionary<string, List<SaveAuction>>(StringComparer.Ordinal);
@@ -444,7 +468,7 @@ namespace Coflnet.Sky.Indexer.Archive
                         buffers[row.Tag] = buffer = new List<SaveAuction>();
                     buffer.Add(row);
                     total++;
-                    if (buffer.Count >= options.MaxRowsPerPart && !await FlushPartAsync(state, local, indexes, row.Tag, month, buffer, cancellationToken, root).ConfigureAwait(false))
+                    if (buffer.Count >= options.MaxRowsPerPart && !await FlushPartAsync(state, local, indexes, approved, row.Tag, month, buffer, cancellationToken, root).ConfigureAwait(false))
                         return (false, total, null);
                 }
                 if (page.Count < take)
@@ -452,7 +476,7 @@ namespace Coflnet.Sky.Indexer.Archive
                 await Delay(TimeSpan.FromMilliseconds(options.PagePauseMs), cancellationToken).ConfigureAwait(false);
             }
             foreach (var (tag, buffer) in buffers.OrderBy(b => b.Key, StringComparer.Ordinal))
-                if (buffer.Count > 0 && !await FlushPartAsync(state, local, indexes, tag, month, buffer, cancellationToken, root).ConfigureAwait(false))
+                if (buffer.Count > 0 && !await FlushPartAsync(state, local, indexes, approved, tag, month, buffer, cancellationToken, root).ConfigureAwait(false))
                     return (false, total, null);
 
             var monthIndex = ArchiveMonths.ToIndex(month);
@@ -700,9 +724,20 @@ namespace Coflnet.Sky.Indexer.Archive
         }
 
         /// <summary>Write the buffered rows of a tag as that tag-month's next part, verify by uncached read-back and collect the index rows. Clears <paramref name="rows"/>.</summary>
-        private async Task<bool> FlushPartAsync(MonthRuns state, Dictionary<string, TagMonthRun> runs, Dictionary<string, ItemRunIndex> indexes, string tag, int month, List<SaveAuction> rows, CancellationToken cancellationToken, Activity root = null)
+        private async Task<bool> FlushPartAsync(MonthRuns state, Dictionary<string, TagMonthRun> runs, Dictionary<string, ItemRunIndex> indexes, HashSet<string> approved, string tag, int month, List<SaveAuction> rows, CancellationToken cancellationToken, Activity root = null)
         {
             using var flush = Stage(ArchiveTelemetry.Stages.PartFlush, root);
+            // checked once per tag and item, right before its first block is written (the item may have walked for hours since the month was
+            // last checked). A refusal fails the item: it gets no checkpoint, so the month can not get its sentinel with a silently dropped tag.
+            if (!approved.Contains(tag))
+            {
+                if (await IsTagMonthDeletedAsync(tag, month, cancellationToken).ConfigureAwait(false))
+                {
+                    Refuse("a block", tag, month);
+                    return false;
+                }
+                approved.Add(tag);
+            }
             if (!runs.TryGetValue(tag, out var run))
                 runs[tag] = run = new TagMonthRun(tag, month);
             if (!indexes.TryGetValue(tag, out var index))
@@ -882,6 +917,23 @@ namespace Coflnet.Sky.Indexer.Archive
             db.Database.SetCommandTimeout(TimeSpan.FromMinutes(10));
             var rows = await db.Auctions.AsNoTracking().GroupBy(a => a.ItemId).Select(g => new { ItemId = g.Key, First = g.Min(a => a.End) }).ToListAsync(cancellationToken).ConfigureAwait(false);
             return rows.ToDictionary(r => r.ItemId, r => r.First);
+        }
+
+        /// <summary>The month sentinel has <c>deleted_at</c> or <c>deleted_rows &gt; 0</c>: nothing of the month may be written (see <see cref="ArchiveDeletedMonthGuard"/>).</summary>
+        protected virtual Task<bool> IsMonthDeletedAsync(int month, CancellationToken cancellationToken)
+            => ArchiveDeletedMonthGuard.IsMonthDeletedAsync(month, cancellationToken);
+
+        /// <summary>The tag row or the sentinel of the tag-month has <c>deleted_at</c> or <c>deleted_rows &gt; 0</c>.</summary>
+        protected virtual Task<bool> IsTagMonthDeletedAsync(string tag, int month, CancellationToken cancellationToken)
+            => ArchiveDeletedMonthGuard.IsTagMonthDeletedAsync(tag, month, cancellationToken);
+
+        /// <summary>Count and log a refused write; always true.</summary>
+        private bool Refuse(string what, string tag, int month)
+        {
+            ArchiveDeletedMonthGuard.Refused.WithLabels("archive_job").Inc();
+            errors.Inc();
+            logger.LogError("Refusing to write {What} of {Tag} {Month}: archived_months says it (or its month) is deleted from MariaDB, the archive is the only copy; nothing is (re)written for it", what, tag ?? "(any tag)", month);
+            return true;
         }
 
         /// <summary>Sentinel and verified tags of a month.</summary>

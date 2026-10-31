@@ -21,7 +21,7 @@ namespace Coflnet.Sky.Indexer.Archive
     /// <c>S3:BUCKET</c>, <c>S3:ACCESS_KEY</c>, <c>S3:SECRET_KEY</c>, <c>S3:USE_PATH_STYLE</c>.
     /// Blocks are cached in a dedicated bytes-bounded <see cref="MemoryCache"/>; indexes are never cached.
     /// </summary>
-    public class S3AuctionBlobStore : IAuctionBlobStore, IArchiveMetaStore, IDisposable
+    public class S3AuctionBlobStore : IAuctionBlobStore, IArchiveMetaStore, IArchiveObjectProbe, IDisposable
     {
         private readonly ILogger<S3AuctionBlobStore> logger;
         private readonly MemoryCache cache;
@@ -279,6 +279,49 @@ namespace Coflnet.Sky.Indexer.Archive
             } while (response.IsTruncated == true && !string.IsNullOrEmpty(response.NextContinuationToken));
             keys.Sort(StringComparer.Ordinal);
             return keys;
+        }
+
+        /// <inheritdoc/>
+        public async Task<string> ReadTextAsync(string key, CancellationToken cancellationToken = default)
+        {
+            if (!enabled)
+                return null;
+            try
+            {
+                using var response = await client.GetObjectAsync(new GetObjectRequest { BucketName = bucket, Key = key }, cancellationToken).ConfigureAwait(false);
+                using var reader = new System.IO.StreamReader(response.ResponseStream, System.Text.Encoding.UTF8);
+                return await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return null;
+            }
+        }
+
+        /// <inheritdoc/>
+        public async Task<(ArchivedAuctionBlock Block, string ETag)> ReadBlockWithETagAsync(string tag, int month, int part, CancellationToken cancellationToken = default)
+        {
+            if (!enabled)
+                return (null, null);
+            blobReads.Inc();
+            var (block, _, etag) = await GetAsync<ArchivedAuctionBlock>(AuctionBlobKeys.Block(tag, month, part), cancellationToken).ConfigureAwait(false);
+            return (block, etag);
+        }
+
+        /// <inheritdoc/>
+        public async Task<string> GetETagAsync(string key, CancellationToken cancellationToken = default)
+        {
+            if (!enabled)
+                return null;
+            try
+            {
+                var response = await client.GetObjectMetadataAsync(new GetObjectMetadataRequest { BucketName = bucket, Key = key }, cancellationToken).ConfigureAwait(false);
+                return response.ETag;
+            }
+            catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return null;
+            }
         }
 
         /// <summary>412, or the PreconditionFailed / ConditionalRequestConflict error codes (409 when two conditional writes race).</summary>

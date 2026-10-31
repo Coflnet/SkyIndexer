@@ -1,7 +1,7 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /build
 RUN echo "new revision "
-ARG HYPIXEL_CORE_REVISION=18ea1aaf3c3298d7eff54cd4e342243318141d10
+ARG HYPIXEL_CORE_REVISION=3c20d257db9475147773081efe9925f30754ee1e
 RUN git clone --depth=1 https://github.com/Coflnet/HypixelSkyblock.git dev \
     && git -C dev fetch --depth=1 origin "$HYPIXEL_CORE_REVISION" \
     && git -C dev checkout --detach FETCH_HEAD

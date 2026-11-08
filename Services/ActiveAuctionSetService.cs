@@ -243,20 +243,12 @@ public class ActiveAuctionSetService : IHostedService
 
     private async Task ConsumeCancelled(CancellationToken token)
     {
-        while (!token.IsCancellationRequested)
-        {
-            try
-            {
-                await Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(config, config["TOPICS:MISSING_AUCTION"], MarkCancelled,
-                    token, "sky-indexer-cancelled", 100, AutoOffsetReset.Latest);
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception e)
-            {
-                logger.LogError(e, "cancelled auction consumer failed, restarting");
-                try { await Task.Delay(TimeSpan.FromSeconds(10), token); } catch (OperationCanceledException) { }
-            }
-        }
+        var backoff = new ConsumeBackoff();
+        var resetting = ConsumeRetryLoop.ResetAfterBatch<SaveAuction>(backoff, MarkCancelled);
+        await ConsumeRetryLoop.RunAsync("indexer cancelled",
+            () => Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(config, config["TOPICS:MISSING_AUCTION"], resetting,
+                token, "sky-indexer-cancelled", 100, AutoOffsetReset.Latest),
+            backoff, logger, token);
     }
 
     /// <summary>

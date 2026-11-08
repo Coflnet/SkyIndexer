@@ -12,6 +12,8 @@ using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
 using Coflnet.Sky.Core;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Hosting;
 using MessagePack;
 
@@ -40,9 +42,11 @@ namespace Coflnet.Sky.Indexer
         private ConcurrentQueue<AuctionResult> endedAuctionsQueue;
         private IConfiguration config;
         private ActiveAuctionSetService activeAuctionSet;
+        private ILogger<Indexer> logger;
 
-        public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue, NBT nbt, ItemPrices itemPrices, ItemDetails itemDetails, ActiveAuctionSetService activeAuctionSet)
+        public Indexer(IConfiguration config, ConcurrentQueue<AuctionResult> endedAuctionsQueue, NBT nbt, ItemPrices itemPrices, ItemDetails itemDetails, ActiveAuctionSetService activeAuctionSet, ILogger<Indexer> logger = null)
         {
+            this.logger = logger ?? NullLogger<Indexer>.Instance;
             this.config = config;
             this.endedAuctionsQueue = endedAuctionsQueue;
             this.nbt = nbt;
@@ -74,42 +78,13 @@ namespace Coflnet.Sky.Indexer
             stopToken.Register(() => tokenSource.Cancel());
             Console.WriteLine("Starting consuming updates");
             SemaphoreSlim semaphore = new SemaphoreSlim(1, 1);
-            try
-            {
-                var newConsumer = Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
-                    config,
-                    [SoldAuctionTopic, NewAuctionsTopic],
-                    LockedToDb(semaphore),
-                    tokenSource.Token,
-                    "sky-indexer-latest",
-                    100,
-                    AutoOffsetReset.Latest
-                    );
-                var deleteConsumer = Kafka.KafkaConsumer.ConsumeBatch<DeleteRequest>(
-                    config,
-                    ["sky-delete-auctions"],
-                    DeleteFromDb(semaphore),
-                    tokenSource.Token,
-                    "sky-indexer",
-                    50,
-                    AutoOffsetReset.Earliest
-                    );
-                await Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
-                    config,
-                    new string[] { NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic },
-                    LockedToDb(semaphore),
-                    tokenSource.Token,
-                    "sky-indexer",
-                    300
-                    );
-            }
-            catch (Exception e)
-            {
-                dev.Logger.Instance.Error(e, $"consuming failed {e.GetType().Name}");
-            }
-            // cancel all as they will be restarted
-            tokenSource.Cancel();
-            throw new Exception("Kafka consumer failed");
+            await Task.WhenAll(
+                ConsumeWithRetry<SaveAuction>("indexer latest", [SoldAuctionTopic, NewAuctionsTopic], LockedToDb(semaphore),
+                    tokenSource.Token, "sky-indexer-latest", 100, AutoOffsetReset.Latest),
+                ConsumeWithRetry<DeleteRequest>("indexer delete", ["sky-delete-auctions"], DeleteFromDb(semaphore),
+                    tokenSource.Token, "sky-indexer", 50, AutoOffsetReset.Earliest),
+                ConsumeWithRetry<SaveAuction>("indexer all", [NewBidTopic, AuctionEndedTopic, NewAuctionsTopic, SoldAuctionTopic, MissingAuctionsTopic],
+                    LockedToDb(semaphore), tokenSource.Token, "sky-indexer", 300));
 
             Func<IEnumerable<SaveAuction>, Task> LockedToDb(SemaphoreSlim semaphore)
             {
@@ -126,6 +101,16 @@ namespace Coflnet.Sky.Indexer
                     }
                 };
             }
+        }
+
+        private Task ConsumeWithRetry<T>(string name, string[] topics, Func<IEnumerable<T>, Task> handler,
+            CancellationToken token, string groupId, int batchSize, AutoOffsetReset start = AutoOffsetReset.Earliest)
+        {
+            var backoff = new ConsumeBackoff();
+            var resetting = ConsumeRetryLoop.ResetAfterBatch(backoff, handler);
+            return ConsumeRetryLoop.RunAsync(name,
+                () => Kafka.KafkaConsumer.ConsumeBatch<T>(config, topics, resetting, token, groupId, batchSize, start),
+                backoff, logger, token);
         }
 
         private Func<IEnumerable<DeleteRequest>, Task> DeleteFromDb(SemaphoreSlim semaphore)

@@ -7,41 +7,35 @@ using Microsoft.EntityFrameworkCore;
 using Coflnet.Sky.Core;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
 
 namespace Coflnet.Sky.Indexer;
 public class NbtFixer : BackgroundService
 {
     private IConfiguration config;
+    private ILogger<NbtFixer> logger;
 
-    public NbtFixer(IConfiguration config)
+    public NbtFixer(IConfiguration config, ILogger<NbtFixer> logger = null)
     {
         this.config = config;
+        this.logger = logger ?? NullLogger<NbtFixer>.Instance;
     }
     protected override async Task ExecuteAsync(CancellationToken stopToken)
     {
-        var tokenSource = new CancellationTokenSource();
-        stopToken.Register(() => tokenSource.Cancel());
         Console.WriteLine("Starting consuming updates");
-        try
-        {
-            await Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
+        var backoff = new ConsumeBackoff();
+        var resetting = ConsumeRetryLoop.ResetAfterBatch<SaveAuction>(backoff, ToDb);
+        await ConsumeRetryLoop.RunAsync("indexer nbtfix",
+            () => Kafka.KafkaConsumer.ConsumeBatch<SaveAuction>(
                 config,
                 new string[] { Indexer.NewAuctionsTopic },
-                ToDb,
-                tokenSource.Token,
+                resetting,
+                stopToken,
                 "sky-indexer-nbtfix",
-                50
-                );
-        }
-        catch (Exception e)
-        {
-            dev.Logger.Instance.Error(e, $"consuming failed {e.GetType().Name}");
-        }
-        // cancel all as they will be restarted
-        tokenSource.Cancel();
-        throw new Exception("Kafka consumer failed");
-
+                50),
+            backoff, logger, stopToken);
     }
 
     private async Task ToDb(IEnumerable<SaveAuction> auctions)

@@ -112,6 +112,7 @@ public class AuctionRetentionWorker : BackgroundService
     private static readonly Prometheus.Counter sellerPassParts = Prometheus.Metrics.CreateCounter("sky_indexer_retention_seller_pass_parts", "Archived parts read back (verified and decoded once) by the retention seller pass");
     private static readonly Prometheus.Counter sellerPassMonths = Prometheus.Metrics.CreateCounter("sky_indexer_archive_seller_backfill_months_done", "Months whose archived parts were fully read back for seller rows");
     private static readonly Prometheus.Counter waitingForScylla = Prometheus.Metrics.CreateCounter("sky_indexer_retention_waiting_for_scylla_import", "Retention runs stopped at a month whose sentinel has no scylla_at yet");
+    private static readonly Prometheus.Counter countWindowSplits = Prometheus.Metrics.CreateCounter("sky_indexer_retention_count_window_splits", "Per tag count windows split in half after a statement timeout");
     private static readonly Prometheus.Counter batches = Prometheus.Metrics.CreateCounter("sky_indexer_retention_batches", "Delete batches committed");
     private static readonly Prometheus.Counter monthsDeleted = Prometheus.Metrics.CreateCounter("sky_indexer_retention_months_deleted", "Months whose MariaDB rows were fully deleted");
     private static readonly Prometheus.Counter healthStops = Prometheus.Metrics.CreateCounter("sky_indexer_retention_health_stops", "Delete runs stopped by the binlog / purge lag / replica gate");
@@ -496,14 +497,15 @@ public class AuctionRetentionWorker : BackgroundService
     /// The cheap operational gates: binlog / purge lag (stops on exceeded, and on unavailable while <c>REQUIRE_HEALTH_CHECKS</c>) and the replica
     /// (<c>REQUIRE_REPLICA_HEALTHY</c>, evaluated independent of the health checks). Returns the reason to stop, null when deleting may go on.
     /// </summary>
-    private async Task<string> OperationalStopReasonAsync(ArchiveOptions options, CancellationToken cancellationToken)
+    internal async Task<string> OperationalStopReasonAsync(ArchiveOptions options, CancellationToken cancellationToken)
     {
         var health = await CheckHealthAsync(options, cancellationToken).ConfigureAwait(false);
         if (health.Status == HealthStatus.Exceeded || health.Status == HealthStatus.Unavailable && options.RequireHealthChecks)
             return health.Reason;
         if (!options.RequireReplicaHealthy)
             return null;
-        var replica = EvaluateReplica(await ReadReplicaStatusOrNullAsync(cancellationToken).ConfigureAwait(false), options);
+        var (status, unreadableReason) = await ReadReplicaStatusOrReasonAsync(cancellationToken).ConfigureAwait(false);
+        var replica = EvaluateReplica(status, options, unreadableReason);
         return replica.Status == HealthStatus.Ok ? null : replica.Reason;
     }
 
@@ -616,10 +618,10 @@ public class AuctionRetentionWorker : BackgroundService
     /// The replica gate from its replication status: both threads (<c>Slave_IO_Running</c>, <c>Slave_SQL_Running</c>) must say <c>Yes</c> and
     /// <c>Seconds_Behind_Master</c> must be known and at most <c>MAX_REPLICA_LAG_SECONDS</c>. Anything unreadable is <see cref="HealthStatus.Unavailable"/> (stops).
     /// </summary>
-    internal static HealthResult EvaluateReplica(ReplicaStatus status, ArchiveOptions options)
+    internal static HealthResult EvaluateReplica(ReplicaStatus status, ArchiveOptions options, string unreadableReason = null)
     {
         if (status == null)
-            return new HealthResult(HealthStatus.Unavailable, "replica status could not be read (no replica configured, no row, or SHOW SLAVE STATUS not permitted: needs SLAVE MONITOR / REPLICA MONITOR)");
+            return new HealthResult(HealthStatus.Unavailable, unreadableReason ?? NoReplicaRowReason);
         if (!IsYes(status.IoRunning))
             return new HealthResult(HealthStatus.Unavailable, $"replica Slave_IO_Running is '{status.IoRunning}', not Yes");
         if (!IsYes(status.SqlRunning))
@@ -633,16 +635,30 @@ public class AuctionRetentionWorker : BackgroundService
 
     private static bool IsYes(string value) => string.Equals(value, "Yes", StringComparison.OrdinalIgnoreCase);
 
-    private async Task<ReplicaStatus> ReadReplicaStatusOrNullAsync(CancellationToken cancellationToken)
+    internal const string NoReplicaConfiguredReason = "replica status not read: no DBReadOnlyConnection configured (the archive job reads from the primary, which is not a replica)";
+    internal const string NoReplicaRowReason = "replica status not read: SHOW SLAVE STATUS returned no row (the read connection is not a replica)";
+
+    /// <summary>Thrown by <see cref="ReadReplicaStatusAsync"/> when no <c>DBReadOnlyConnection</c> is configured.</summary>
+    internal sealed class ReplicaNotConfiguredException : Exception
+    {
+    }
+
+    /// <summary>The replica status, or null plus the reason it is unavailable (not configured, no row, or the query failed; failures are logged at Warning).</summary>
+    private async Task<(ReplicaStatus status, string reason)> ReadReplicaStatusOrReasonAsync(CancellationToken cancellationToken)
     {
         try
         {
-            return await ReadReplicaStatusAsync(cancellationToken).ConfigureAwait(false);
+            var status = await ReadReplicaStatusAsync(cancellationToken).ConfigureAwait(false);
+            return (status, status == null ? NoReplicaRowReason : null);
+        }
+        catch (ReplicaNotConfiguredException)
+        {
+            return (null, NoReplicaConfiguredReason);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            logger.LogDebug(ex, "Reading the replica status failed");
-            return null;
+            logger.LogWarning(ex, "Reading the replica status failed, deleting stops");
+            return (null, $"replica status query failed: {ex.GetType().Name}: {ex.Message} (SHOW SLAVE STATUS needs SLAVE MONITOR / REPLICA MONITOR)");
         }
     }
 
@@ -899,12 +915,80 @@ public class AuctionRetentionWorker : BackgroundService
         try
         {
             var rows = await ReconcileRowsQuery(db, ArchiveMonths.ToIndex(month)).ToListAsync(cancellationToken).ConfigureAwait(false);
-            var counts = await CountByTagQuery(db, monthStart, monthEnd).ToListAsync(cancellationToken).ConfigureAwait(false);
-            return new CountSnapshot(rows.Select(ToReconcileRow).ToList(), ToCountMap(counts));
+            var counts = await CountByTagInWindowsAsync(monthStart, monthEnd, (from, to, ct) => CountWindowInSnapshotAsync(db, from, to, ct), logger, cancellationToken).ConfigureAwait(false);
+            return new CountSnapshot(rows.Select(ToReconcileRow).ToList(), counts);
         }
         finally
         {
             await RollbackSnapshotAsync(db).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Counts one window; after a statement timeout the snapshot transaction must still be open, otherwise later windows would read a different point in time.</summary>
+    private static async Task<List<TagCount>> CountWindowInSnapshotAsync(HypixelContext db, DateTime from, DateTime to, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await CountByTagQuery(db, from, to).ToListAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (AuctionArchiveJob.IsStatementTimeout(ex))
+        {
+            var inTransaction = await db.Database.SqlQueryRaw<long>("SELECT CAST(@@in_transaction AS SIGNED) AS `Value`").SingleAsync(cancellationToken).ConfigureAwait(false);
+            if (inTransaction == 0)
+                throw new SnapshotLostException(ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The snapshot transaction ended after a statement timeout. It wraps that timeout for diagnostics, so the window splitter must exclude it
+    /// explicitly (<see cref="AuctionArchiveJob.IsStatementTimeout"/> walks inner exceptions); it always fails the gate.
+    /// </summary>
+    internal sealed class SnapshotLostException : InvalidOperationException
+    {
+        public SnapshotLostException(Exception timeout)
+            : base("the replica snapshot transaction ended after a statement timeout, the counts would not share one snapshot", timeout)
+        {
+        }
+    }
+
+    private static readonly TimeSpan CountWindow = TimeSpan.FromDays(1);
+    internal static readonly TimeSpan MinCountWindow = TimeSpan.FromMinutes(15);
+
+    /// <summary>The half-open day windows that exactly tile [monthStart, monthEnd); the last one is clipped.</summary>
+    internal static IEnumerable<(DateTime From, DateTime To)> CountWindows(DateTime monthStart, DateTime monthEnd)
+    {
+        for (var from = monthStart; from < monthEnd; from += CountWindow)
+            yield return (from, from + CountWindow < monthEnd ? from + CountWindow : monthEnd);
+    }
+
+    /// <summary>
+    /// Per tag counts of [monthStart, monthEnd) summed over day windows, so no single statement runs into the server's <c>max_statement_time</c>. A window that
+    /// still times out is split in half, but never into halves shorter than <see cref="MinCountWindow"/> (from a day that ends at 22.5 min windows); then the timeout is rethrown.
+    /// </summary>
+    internal static async Task<IReadOnlyDictionary<string, long>> CountByTagInWindowsAsync(DateTime monthStart, DateTime monthEnd,
+        Func<DateTime, DateTime, CancellationToken, Task<List<TagCount>>> countWindow, ILogger logger, CancellationToken cancellationToken)
+    {
+        var all = new List<TagCount>();
+        foreach (var (from, to) in CountWindows(monthStart, monthEnd))
+            await CountWindowSplittingAsync(from, to, countWindow, logger, all, cancellationToken).ConfigureAwait(false);
+        return ToCountMap(all);
+    }
+
+    private static async Task CountWindowSplittingAsync(DateTime from, DateTime to, Func<DateTime, DateTime, CancellationToken, Task<List<TagCount>>> countWindow,
+        ILogger logger, List<TagCount> sink, CancellationToken cancellationToken)
+    {
+        try
+        {
+            sink.AddRange(await countWindow(from, to, cancellationToken).ConfigureAwait(false));
+        }
+        catch (Exception ex) when (ex is not SnapshotLostException && AuctionArchiveJob.IsStatementTimeout(ex) && !cancellationToken.IsCancellationRequested && (to - from) / 2 >= MinCountWindow)
+        {
+            var mid = from + (to - from) / 2;
+            countWindowSplits.Inc();
+            logger.LogWarning("Retention: count window {From:u} - {To:u} hit the statement timeout, splitting at {Mid:u}", from, to, mid);
+            await CountWindowSplittingAsync(from, mid, countWindow, logger, sink, cancellationToken).ConfigureAwait(false);
+            await CountWindowSplittingAsync(mid, to, countWindow, logger, sink, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -943,8 +1027,7 @@ public class AuctionRetentionWorker : BackgroundService
     {
         using var db = new HypixelContext();
         db.Database.SetCommandTimeout(TimeSpan.FromMinutes(30));
-        var rows = await CountByTagQuery(db, monthStart, monthEnd).ToListAsync(cancellationToken).ConfigureAwait(false);
-        return ToCountMap(rows);
+        return await CountByTagInWindowsAsync(monthStart, monthEnd, (from, to, ct) => CountByTagQuery(db, from, to).ToListAsync(ct), logger, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>The receipt JSON of a month, null when it does not exist. Fails (fail closed) when no object probe is configured.</summary>
@@ -959,13 +1042,13 @@ public class AuctionRetentionWorker : BackgroundService
     internal const string ReplicaStatusSql = "SHOW SLAVE STATUS";
 
     /// <summary>
-    /// Replication state of the replica behind <c>DBReadOnlyConnection</c> (the connection the archive job reads from), null when no replica
-    /// is configured or the statement returns no row. A missing privilege throws (the caller treats it as unreadable).
+    /// Replication state of the replica behind <c>DBReadOnlyConnection</c> (the connection the archive job reads from), null when the statement
+    /// returns no row. No replica configured throws <see cref="ReplicaNotConfiguredException"/>, a missing privilege throws too (the caller treats both as unreadable).
     /// </summary>
     protected virtual async Task<ReplicaStatus> ReadReplicaStatusAsync(CancellationToken cancellationToken)
     {
         if (!ArchiveReadContext.UsesReadReplica(config))
-            return null;
+            throw new ReplicaNotConfiguredException();
         using var db = ArchiveReadContext.Open(config);
         var connection = db.Database.GetDbConnection();
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);

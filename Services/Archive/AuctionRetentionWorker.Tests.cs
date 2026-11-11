@@ -69,10 +69,17 @@ public class AuctionRetentionWorkerTests
         public string IoRunning = "Yes";
         public string SqlRunning = "Yes";
         public bool ReplicaUnreadable;
+        /// <summary>Makes the replica read throw, or run the real implementation (which needs a configured DBReadOnlyConnection).</summary>
+        public Exception ReplicaFailure;
+        public bool UseRealReplicaRead;
         public int LagReads;
         protected override Task<ReplicaStatus> ReadReplicaStatusAsync(CancellationToken cancellationToken)
         {
             LagReads++;
+            if (ReplicaFailure != null)
+                throw ReplicaFailure;
+            if (UseRealReplicaRead)
+                return base.ReadReplicaStatusAsync(cancellationToken);
             return Task.FromResult(ReplicaUnreadable ? null : new ReplicaStatus(IoRunning, SqlRunning, Lag));
         }
 
@@ -790,6 +797,43 @@ public class AuctionRetentionWorkerTests
         Assert.That(await on.Run(), Is.EqualTo(0), "no replica status: fail closed");
     }
 
+    [Test]
+    public async Task ReplicaQueryFailureStopsWithTheCauseAndLogsAWarning()
+    {
+        var log = new ListLogger<AuctionRetentionWorker>();
+        var w = new TestableRetentionWorker(new InMemoryAuctionBlobStore(), ArchiveTestConfig.Build(), logger: log);
+        w.ReplicaFailure = new InvalidOperationException("Access denied; you need (at least one of) the SUPER, SLAVE MONITOR privilege(s)");
+
+        var reason = await w.OperationalStopReasonAsync(ArchiveOptions.From(ArchiveTestConfig.Build()), default);
+
+        Assert.That(reason, Does.Contain("InvalidOperationException").And.Contain("SLAVE MONITOR privilege(s)"));
+        Assert.That(log.Entries.Any(e => e.level == Microsoft.Extensions.Logging.LogLevel.Warning && e.message.Contains("SLAVE MONITOR privilege(s)")), Is.True);
+    }
+
+    [Test]
+    public async Task ReplicaWithoutStatusRowStopsWithANotAReplicaReason()
+    {
+        var w = Worker();
+        w.ReplicaUnreadable = true;
+
+        var reason = await w.OperationalStopReasonAsync(ArchiveOptions.From(ArchiveTestConfig.Build()), default);
+
+        Assert.That(reason, Is.EqualTo(AuctionRetentionWorker.NoReplicaRowReason));
+        Assert.That(reason, Does.Contain("no row").And.Contain("not a replica"));
+    }
+
+    [Test]
+    public async Task MissingReadConnectionStopsWithANotConfiguredReason()
+    {
+        var w = Worker();
+        w.UseRealReplicaRead = true;
+
+        var reason = await w.OperationalStopReasonAsync(ArchiveOptions.From(ArchiveTestConfig.Build()), default);
+
+        Assert.That(reason, Is.EqualTo(AuctionRetentionWorker.NoReplicaConfiguredReason));
+        Assert.That(reason, Does.Contain("no DBReadOnlyConnection configured"));
+    }
+
     /// <summary>Minor 3: the cheap gates run before the primary count, the receipt HEADs and the uncached part re-read.</summary>
     [Test]
     public async Task CheapGatesRunBeforeTheExpensiveMonthGates()
@@ -1400,5 +1444,113 @@ public class AuctionRetentionWorkerTests
     {
         Assert.That(AuctionRetentionWorker.ParseHistoryLength(null), Is.Null);
         Assert.That(AuctionRetentionWorker.ParseHistoryLength("n/a"), Is.Null);
+    }
+
+    // ---- windowed per tag count ----
+
+    private static MySqlConnector.MySqlException StatementTimeout()
+    {
+        var ctor = typeof(MySqlConnector.MySqlException).GetConstructors(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)
+            .First(c => c.GetParameters().Length > 0 && c.GetParameters()[0].ParameterType == typeof(MySqlConnector.MySqlErrorCode));
+        var args = ctor.GetParameters().Select((p, i) => i == 0 ? (object)(MySqlConnector.MySqlErrorCode)1969 : p.ParameterType == typeof(string) ? "Query execution was interrupted (max_statement_time exceeded)" : p.HasDefaultValue ? p.DefaultValue : null).ToArray();
+        return (MySqlConnector.MySqlException)ctor.Invoke(args);
+    }
+
+    [TestCase(2026, 7, 31)]
+    [TestCase(2026, 2, 28)]
+    [TestCase(2024, 2, 29)]
+    public void CountWindowsTileTheMonthExactly(int year, int month, int days)
+    {
+        var start = new DateTime(year, month, 1, 0, 0, 0, DateTimeKind.Utc);
+        var end = start.AddMonths(1);
+        var windows = AuctionRetentionWorker.CountWindows(start, end).ToList();
+        Assert.That(windows, Has.Count.EqualTo(days));
+        Assert.That(windows[0].From, Is.EqualTo(start));
+        Assert.That(windows[^1].To, Is.EqualTo(end));
+        for (int i = 1; i < windows.Count; i++)
+            Assert.That(windows[i].From, Is.EqualTo(windows[i - 1].To));
+    }
+
+    [Test]
+    public void CountWindowsClipTheLastWindow()
+    {
+        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
+        var windows = AuctionRetentionWorker.CountWindows(start, start.AddHours(30)).ToList();
+        Assert.That(windows, Has.Count.EqualTo(2));
+        Assert.That(windows[1], Is.EqualTo((start.AddDays(1), start.AddHours(30))));
+    }
+
+    [Test]
+    public async Task WindowedCountSumsPerTagCaseInsensitiveAndNullAsEmpty()
+    {
+        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
+        var map = await AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(3), (from, to, ct) =>
+        {
+            var day = (int)(from - start).TotalDays;
+            return Task.FromResult(new List<TagCount>
+            {
+                new() { Tag = day == 1 ? "hyperion" : "HYPERION", Count = 10 },
+                new() { Tag = null, Count = day + 1 },
+            });
+        }, NullLogger.Instance, CancellationToken.None);
+        Assert.That(map["Hyperion"], Is.EqualTo(30));
+        Assert.That(map[""], Is.EqualTo(6));
+        Assert.That(map, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public async Task TimedOutWindowIsSplitInHalvesAndCountsStayComplete()
+    {
+        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
+        var calls = new List<(DateTime from, DateTime to)>();
+        var map = await AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(2), (from, to, ct) =>
+        {
+            calls.Add((from, to));
+            if (from == start && to == start.AddDays(1))
+                throw StatementTimeout();
+            return Task.FromResult(new List<TagCount> { new() { Tag = "A", Count = (long)(to - from).TotalHours } });
+        }, NullLogger.Instance, CancellationToken.None);
+        Assert.That(calls, Does.Contain((start, start.AddHours(12))));
+        Assert.That(calls, Does.Contain((start.AddHours(12), start.AddDays(1))));
+        Assert.That(map["A"], Is.EqualTo(48));
+    }
+
+    [Test]
+    public void WindowStillTimingOutAtMinimumRethrows()
+    {
+        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
+        var smallest = TimeSpan.MaxValue;
+        Assert.ThrowsAsync<MySqlConnector.MySqlException>(() => AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(1), (from, to, ct) =>
+        {
+            smallest = TimeSpan.FromTicks(Math.Min(smallest.Ticks, (to - from).Ticks));
+            throw StatementTimeout();
+        }, NullLogger.Instance, CancellationToken.None));
+        Assert.That(smallest, Is.GreaterThanOrEqualTo(AuctionRetentionWorker.MinCountWindow));
+    }
+
+    [Test]
+    public void NonTimeoutExceptionIsRethrownWithoutSplitting()
+    {
+        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
+        var calls = 0;
+        Assert.ThrowsAsync<InvalidOperationException>(() => AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(1), (from, to, ct) =>
+        {
+            calls++;
+            throw new InvalidOperationException("boom");
+        }, NullLogger.Instance, CancellationToken.None));
+        Assert.That(calls, Is.EqualTo(1));
+    }
+
+    [Test]
+    public void SnapshotLostIsRethrownWithoutSplittingEvenThoughItWrapsATimeout()
+    {
+        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
+        var calls = 0;
+        Assert.ThrowsAsync<AuctionRetentionWorker.SnapshotLostException>(() => AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(1), (from, to, ct) =>
+        {
+            calls++;
+            throw new AuctionRetentionWorker.SnapshotLostException(StatementTimeout());
+        }, NullLogger.Instance, CancellationToken.None));
+        Assert.That(calls, Is.EqualTo(1), "a lost snapshot must fail the gate, not be split and counted in autocommit");
     }
 }

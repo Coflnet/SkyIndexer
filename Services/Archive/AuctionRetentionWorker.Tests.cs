@@ -151,7 +151,12 @@ public class AuctionRetentionWorkerTests
                 .Select(r => new ReconcileTagRow(NameOf(r.TagId), ReconcileSource, r.Rows, DeletedByTag.GetValueOrDefault((month, r.TagId)))).ToList();
         }
 
-        protected override Task<int> CountMonthsDeletedSinceAsync(DateTime sinceUtc, CancellationToken cancellationToken) => Task.FromResult(DeletedToday);
+        protected override Task<int> CountMonthsDeletedSinceAsync(DateTime sinceUtc, long minRows, CancellationToken cancellationToken)
+        {
+            CountedMinRows = minRows;
+            return Task.FromResult(DeletedToday);
+        }
+        public long CountedMinRows;
 
         protected override Task<IReadOnlyList<ArchivedMonthRowState>> GetArchivedMonthRowsAsync(int month, CancellationToken cancellationToken)
             => Task.FromResult<IReadOnlyList<ArchivedMonthRowState>>(MonthRows.GetValueOrDefault(month) ?? new List<ArchivedMonthRowState>());
@@ -720,17 +725,36 @@ public class AuctionRetentionWorkerTests
     [Test]
     public async Task DailyMonthCapIsRespected()
     {
-        var w = Worker();
+        var w = Worker(("ARCHIVE:SMALL_MONTH_ROWS", "1"));
         AddArchivedMonth(w, OldMonth, 1);
         AddArchivedMonth(w, OldMonth2, 1);
         Assert.That(await w.Run(), Is.EqualTo(1));
         Assert.That(w.Closed, Is.EqualTo(new[] { OldMonth }), "oldest month first, one per day");
 
-        var capped = Worker();
+        var capped = Worker(("ARCHIVE:SMALL_MONTH_ROWS", "1"));
         AddArchivedMonth(capped, OldMonth, 1);
         capped.DeletedToday = 1;
         Assert.That(await capped.Run(), Is.EqualTo(0));
         Assert.That(capped.Executed, Is.Empty);
+    }
+
+    [Test]
+    public async Task SmallMonthsDoNotCountTowardTheDailyCap()
+    {
+        var w = Worker(("ARCHIVE:SMALL_MONTH_ROWS", "3"));
+        AddArchivedMonth(w, OldMonth, 2);
+        AddArchivedMonth(w, OldMonth2, 3);
+        Assert.That(await w.Run(), Is.EqualTo(2));
+        Assert.That(w.Closed, Is.EqualTo(new[] { OldMonth, OldMonth2 }), "the 2-row month is below the threshold, the 3-row month is the one counted month of the day");
+        Assert.That(w.CountedMinRows, Is.EqualTo(3), "earlier months today are counted with the same threshold");
+    }
+
+    [Test]
+    public void SmallMonthRowsDefaultsTo100kAndEmptyMonthsNeverCount()
+    {
+        Assert.That(ArchiveOptions.From(ArchiveTestConfig.Build()).SmallMonthRows, Is.EqualTo(100_000));
+        var zero = ArchiveOptions.From(ArchiveTestConfig.Build(("ARCHIVE:SMALL_MONTH_ROWS", "0")));
+        Assert.That(AuctionRetentionWorker.MinCountedRows(zero), Is.EqualTo(1));
     }
 
     // ------------------------------------------------------------ phase B gates: replica lag, count reconcile, backup receipt

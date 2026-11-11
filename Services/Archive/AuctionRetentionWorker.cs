@@ -225,12 +225,14 @@ public class AuctionRetentionWorker : BackgroundService
             return 0;
         }
         var dayStart = new DateTime(nowUtc.Year, nowUtc.Month, nowUtc.Day, 0, 0, 0, DateTimeKind.Utc);
-        var doneToday = await CountMonthsDeletedSinceAsync(dayStart, cancellationToken).ConfigureAwait(false);
+        var minCountedRows = MinCountedRows(options);
+        var doneToday = await CountMonthsDeletedSinceAsync(dayStart, minCountedRows, cancellationToken).ConfigureAwait(false);
         var firstInWindow = ArchiveMonths.OldestInWindow(nowUtc, options.WindowYears);
         var completed = 0;
+        var counted = 0;
         for (var month = options.OldestMonth; month < firstInWindow; month = ArchiveMonths.Next(month))
         {
-            if (doneToday + completed >= options.MaxDeleteMonthsPerDay)
+            if (doneToday + counted >= options.MaxDeleteMonthsPerDay)
                 break;
             var readiness = await GetReadinessAsync(month, options, nowUtc, cancellationToken).ConfigureAwait(false);
             if (readiness == MonthReadiness.WaitForScylla || readiness == MonthReadiness.BackedOff)
@@ -242,9 +244,14 @@ public class AuctionRetentionWorker : BackgroundService
                 break;
             if (deleted > 0)
                 completed++;
+            if (deleted >= minCountedRows)
+                counted++;
         }
         return completed;
     }
+
+    /// <summary>Deleted auctions from which a month counts toward the daily limit; empty months never count.</summary>
+    internal static long MinCountedRows(ArchiveOptions options) => System.Math.Max(1, options.SmallMonthRows);
 
     private async Task<MonthReadiness> GetReadinessAsync(int month, ArchiveOptions options, DateTime nowUtc, CancellationToken cancellationToken)
     {
@@ -1138,10 +1145,10 @@ public class AuctionRetentionWorker : BackgroundService
     }
 
     /// <summary>Months deleted (with rows) since the given UTC instant, from the sentinels.</summary>
-    protected virtual async Task<int> CountMonthsDeletedSinceAsync(DateTime sinceUtc, CancellationToken cancellationToken)
+    protected virtual async Task<int> CountMonthsDeletedSinceAsync(DateTime sinceUtc, long minRows, CancellationToken cancellationToken)
     {
         using var db = new ArchiveContext();
-        return await db.ArchivedMonths.AsNoTracking().CountAsync(m => m.TagId == 0 && m.DeletedAt >= sinceUtc && m.DeletedRows > 0, cancellationToken).ConfigureAwait(false);
+        return await db.ArchivedMonths.AsNoTracking().CountAsync(m => m.TagId == 0 && m.DeletedAt >= sinceUtc && m.DeletedRows >= minRows, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Tags of the month with their part counts and combined hashes (tag rows of <c>archived_months</c>).</summary>

@@ -43,6 +43,8 @@ namespace Coflnet.Sky.Indexer.Archive
         /// <summary>Hours a month that the retention worker aborted is left alone (persisted in the sentinel note, survives restarts); 0 retries on every run.</summary>
         public int AbortBackoffHours { get; init; } = 24;
         public int MaxDeleteMonthsPerDay { get; init; } = 1;
+        /// <summary>A month whose delete removed fewer auctions than this does not count toward <see cref="MaxDeleteMonthsPerDay"/> (2019-2020 months are mostly in Scylla, tiny in MariaDB).</summary>
+        public long SmallMonthRows { get; init; } = 100_000;
         public int DeleteBatchSize { get; init; } = 5000;
         public int DeletePauseMs { get; init; } = 500;
         public double MaxBinlogGb { get; init; } = 100;
@@ -94,6 +96,7 @@ namespace Coflnet.Sky.Indexer.Archive
                 DeleteMariaDb = Bool(s["DELETE_MARIADB"], false),
                 AbortBackoffHours = System.Math.Max(0, Int(s["ABORT_BACKOFF_HOURS"], d.AbortBackoffHours)),
                 MaxDeleteMonthsPerDay = Int(s["MAX_DELETE_MONTHS_PER_DAY"], d.MaxDeleteMonthsPerDay),
+                SmallMonthRows = System.Math.Max(0, Int(s["SMALL_MONTH_ROWS"], (int)d.SmallMonthRows)),
                 DeleteBatchSize = System.Math.Max(1, Int(s["DELETE_BATCH_SIZE"], d.DeleteBatchSize)),
                 DeletePauseMs = Int(s["DELETE_PAUSE_MS"], d.DeletePauseMs),
                 MaxBinlogGb = double.TryParse(s["MAX_BINLOG_GB"], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var gb) ? gb : d.MaxBinlogGb,

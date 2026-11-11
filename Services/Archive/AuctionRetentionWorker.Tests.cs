@@ -91,10 +91,28 @@ public class AuctionRetentionWorkerTests
         /// <summary>Whole month count queries run against the primary (the final reconcile) and the replica snapshots (the pre-delete gate).</summary>
         public int PrimaryCountQueries;
         public int ReplicaSnapshotReads;
-        protected override Task<IReadOnlyDictionary<string, long>> CountPrimaryAuctionsByTagAsync(DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
+        /// <summary>ItemIds the final reconcile counted, per call.</summary>
+        public readonly List<IReadOnlyList<int>> PrimaryCountedItems = new();
+        protected override Task<IReadOnlyDictionary<string, long>> CountPrimaryAuctionsByTagAsync(IReadOnlyList<int> itemIds, DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
         {
             PrimaryCountQueries++;
-            return Task.FromResult(CountByTag(monthStart, monthEnd));
+            PrimaryCountedItems.Add(itemIds.ToList());
+            return Task.FromResult(CountByTag(monthStart, monthEnd, itemIds));
+        }
+
+        /// <summary>Items of the pretended Auctions table that have no row in the in-memory list (their first auction ends after the tested months).</summary>
+        public readonly Dictionary<int, DateTime> OtherItems = new() { [999] = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc) };
+        public int ItemListReads;
+        /// <summary>Runs after each ItemId list read, e.g. to insert a row of a new item while the walk runs.</summary>
+        public Action<int> AfterItemListRead;
+        protected override Task<IReadOnlyDictionary<int, DateTime>> GetPrimaryItemFirstEndsAsync(CancellationToken cancellationToken)
+        {
+            ItemListReads++;
+            var firstEnds = new Dictionary<int, DateTime>(OtherItems);
+            foreach (var g in Auctions.GroupBy(a => a.ItemId))
+                firstEnds[g.Key] = g.Min(a => a.End);
+            AfterItemListRead?.Invoke(ItemListReads);
+            return Task.FromResult<IReadOnlyDictionary<int, DateTime>>(firstEnds);
         }
 
         protected override Task<CountSnapshot> ReadCountSnapshotAsync(int month, DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
@@ -114,9 +132,9 @@ public class AuctionRetentionWorkerTests
             return Task.FromResult(true);
         }
 
-        private IReadOnlyDictionary<string, long> CountByTag(DateTime monthStart, DateTime monthEnd)
+        private IReadOnlyDictionary<string, long> CountByTag(DateTime monthStart, DateTime monthEnd, IReadOnlyList<int> itemIds = null)
         {
-            var counts = Auctions.Where(a => a.End >= monthStart && a.End < monthEnd).GroupBy(a => a.Tag ?? "").ToDictionary(g => g.Key, g => (long)g.Count());
+            var counts = Auctions.Where(a => a.End >= monthStart && a.End < monthEnd && (itemIds == null || itemIds.Contains(a.ItemId))).GroupBy(a => a.Tag ?? "").ToDictionary(g => g.Key, g => (long)g.Count());
             if (ExtraPrimaryRows != 0)
                 counts[ExtraPrimaryTag] = counts.GetValueOrDefault(ExtraPrimaryTag) + ExtraPrimaryRows;
             return counts.Where(kv => kv.Value != 0).ToDictionary(kv => kv.Key, kv => kv.Value);
@@ -141,8 +159,18 @@ public class AuctionRetentionWorkerTests
         protected override Task<IReadOnlyDictionary<string, ushort>> GetVerifiedTagsAsync(int month, CancellationToken cancellationToken)
             => Task.FromResult<IReadOnlyDictionary<string, ushort>>(VerifiedTags.GetValueOrDefault(month) ?? new Dictionary<string, ushort>());
 
-        protected override Task<IReadOnlyList<DeleteCandidate>> LoadDeleteBatchAsync(DateTime cursor, DateTime monthEnd, int batchSize, CancellationToken cancellationToken)
-            => Task.FromResult<IReadOnlyList<DeleteCandidate>>(Auctions.Where(a => a.End >= cursor && a.End < monthEnd).OrderBy(a => a.End).Take(batchSize).ToList());
+        /// <summary>Every delete batch load (item, rows returned), in order.</summary>
+        public readonly List<(int itemId, int rows)> Loads = new();
+        protected override Task<IReadOnlyList<DeleteCandidate>> LoadDeleteBatchAsync(int itemId, DateTime cursorEnd, int cursorId, DateTime monthEnd, int batchSize, CancellationToken cancellationToken)
+        {
+            // the keyset semantics of AuctionArchiveJob.PageFilter
+            var batch = Auctions.Where(a => a.ItemId == itemId && a.End >= cursorEnd && a.End < monthEnd && (a.End > cursorEnd || a.Id > cursorId))
+                .OrderBy(a => a.End).ThenBy(a => a.Id).Take(batchSize).ToList();
+            Loads.Add((itemId, batch.Count));
+            if (Loads.Count > 10_000)
+                throw new InvalidOperationException("delete walk does not terminate");
+            return Task.FromResult<IReadOnlyList<DeleteCandidate>>(batch);
+        }
 
         protected override Task<int> CountLocatedUidsAsync(ushort monthIndex, IReadOnlyList<long> uids, CancellationToken cancellationToken)
             => Task.FromResult(uids.Count(u => Locations.Contains((monthIndex, u))));
@@ -187,10 +215,13 @@ public class AuctionRetentionWorkerTests
             DeletedByTag[(month, 0)] = DeletedByTag.GetValueOrDefault((month, (ushort)0)) + booked;
         }
 
+        /// <summary>Auction ids a delete leaves in place (a row deleted concurrently or kept for any other reason).</summary>
+        public readonly HashSet<long> KeepAuctionIds = new();
+
         private long Apply(DeleteStatement s)
         {
             if (s.Table == "Auctions")
-                return Auctions.RemoveAll(a => s.Ids.Contains(a.Id));
+                return Auctions.RemoveAll(a => s.Ids.Contains(a.Id) && !KeepAuctionIds.Contains(a.Id));
             if (s.Table != "NbtData")
                 return Children.TryGetValue((s.Table, s.Column), out var rows) ? rows.RemoveAll(s.Ids.Contains) : 0;
             Assert.That(s.KeepIfReferencedByTable, Is.EqualTo("Auctions"));
@@ -856,7 +887,7 @@ public class AuctionRetentionWorkerTests
         var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "2"));
         AddArchivedMonth(w, OldMonth, 5);
         await w.Run();
-        Assert.That(w.LagReads, Is.EqualTo(5), "the month start + 3 batches + the empty probe that ends the month");
+        Assert.That(w.LagReads, Is.EqualTo(4), "the month start + right before each of the 3 batches (an empty load needs no gate)");
     }
 
     [Test]
@@ -883,7 +914,7 @@ public class AuctionRetentionWorkerTests
         Assert.That(await w.Run(), Is.EqualTo(1));
 
         Assert.That(w.ReplicaSnapshotReads, Is.EqualTo(1), "expectations and counts of the gate come from one replica snapshot");
-        Assert.That(w.PrimaryCountQueries, Is.EqualTo(1), "only the final reconcile (empty End range) runs on the primary");
+        Assert.That(w.PrimaryCountQueries, Is.EqualTo(1), "only the final reconcile (empty month) runs on the primary");
     }
 
     [Test]
@@ -940,17 +971,61 @@ public class AuctionRetentionWorkerTests
         Assert.That(AuctionRetentionWorker.BackoffUntil(null), Is.Null);
     }
 
-    /// <summary>The month long count must stay an End index range with one GROUP BY, never a per row subquery.</summary>
-    [Test]
-    public void CountQueryIsAnEndRangeWithOneGroupByTag()
-    {
-        var options = new DbContextOptionsBuilder<HypixelContext>().UseMySql("server=localhost", new MariaDbServerVersion("10.5.5")).Options;
-        using var db = new HypixelContext(options);
-        var sql = AuctionRetentionWorker.CountByTagQuery(db, new DateTime(2023, 1, 1), new DateTime(2023, 2, 1)).ToQueryString();
+    private static HypixelContext MariaDbModel()
+        => new(new DbContextOptionsBuilder<HypixelContext>().UseMySql("server=localhost", new MariaDbServerVersion("10.5.5")).Options);
 
-        Assert.That(sql, Does.Contain("FROM `Auctions`").And.Contain("`a`.`End` >=").And.Contain("`a`.`End` <").And.Contain("GROUP BY `a`.`Tag`"));
+    /// <summary>
+    /// Regression: Auctions has no End index in production (only (ItemId, End)), so an End-only filter full-scans ~700 M rows. The count must be one
+    /// ItemId equality plus the End range with one GROUP BY, no IN list, no subquery.
+    /// </summary>
+    [Test]
+    public void CountQueryIsOneItemIdWithAnEndRangeAndOneGroupByTag()
+    {
+        using var db = MariaDbModel();
+        var sql = AuctionRetentionWorker.ItemCountByTagQuery(db, 42, new DateTime(2023, 1, 1), new DateTime(2023, 2, 1)).ToQueryString();
+        TestContext.Out.WriteLine(sql);
+
+        Assert.That(sql, Does.Contain("FROM `Auctions`").And.Contain("`a`.`ItemId` = @").And.Contain("`a`.`End` >= @").And.Contain("`a`.`End` < @").And.Contain("GROUP BY `a`.`Tag`"));
+        Assert.That(sql, Does.Not.Contain(" IN ").And.Not.Contain("JSON").And.Not.Contain("JOIN"));
         Assert.That(System.Text.RegularExpressions.Regex.Matches(sql, "SELECT").Count, Is.EqualTo(1), "no correlated subquery");
-        Assert.That(sql, Does.Not.Contain("JOIN"));
+    }
+
+    /// <summary>Regression: the delete batch was <c>WHERE End &gt;= cursor ORDER BY End LIMIT n</c> (full scan + filesort per batch on the primary).</summary>
+    [Test]
+    public void DeleteBatchQueryIsOneItemIdKeysetOrderedByEndThenId()
+    {
+        using var db = MariaDbModel();
+        var sql = AuctionRetentionWorker.DeleteBatchQuery(db, 42, new DateTime(2023, 1, 1), 0, new DateTime(2023, 2, 1), 5000).ToQueryString();
+        TestContext.Out.WriteLine(sql);
+
+        Assert.That(sql, Does.Contain("FROM `Auctions`").And.Contain("`a`.`ItemId` = @").And.Contain("`a`.`End` >= @").And.Contain("`a`.`End` < @").And.Contain("`a`.`Id` > @"));
+        Assert.That(sql, Does.Contain("ORDER BY `a`.`End`, `a`.`Id`").And.Contain("LIMIT 5000"));
+        Assert.That(sql, Does.Not.Contain(" IN ").And.Not.Contain("JSON").And.Not.Contain("JOIN"));
+    }
+
+    /// <summary>The ItemId list is shared with the archive job: one GROUP BY ItemId with MIN(End), the loose index scan on (ItemId, End).</summary>
+    [Test]
+    public void ItemListQueryIsOneGroupByItemIdWithMinEnd()
+    {
+        using var db = MariaDbModel();
+        var sql = AuctionItemFirstEnds.Query(db).ToQueryString();
+        TestContext.Out.WriteLine(sql);
+        Assert.That(sql, Does.Contain("MIN(`a`.`End`)").And.Contain("GROUP BY `a`.`ItemId`"));
+    }
+
+    [Test]
+    public void ItemsFirstSeenAtOrAfterTheMonthEndAreSkipped()
+    {
+        var monthEnd = new DateTime(2023, 2, 1);
+        var firstEnds = new Dictionary<int, DateTime> { [7] = new(2020, 1, 1), [3] = new(2023, 1, 31, 23, 59, 59), [9] = monthEnd, [5] = new(2024, 1, 1) };
+        Assert.That(AuctionItemFirstEnds.ItemsEndingBefore(firstEnds, monthEnd), Is.EqualTo(new[] { 3, 7 }), "ascending, first End before the month end only");
+    }
+
+    [Test]
+    public void EmptyItemListFailsClosed()
+    {
+        Assert.Throws<InvalidOperationException>(() => AuctionItemFirstEnds.ItemsEndingBefore(new Dictionary<int, DateTime>(), new DateTime(2023, 2, 1)));
+        Assert.Throws<InvalidOperationException>(() => AuctionItemFirstEnds.ItemsEndingBefore(null, new DateTime(2023, 2, 1)));
     }
 
     [Test]
@@ -1446,7 +1521,7 @@ public class AuctionRetentionWorkerTests
         Assert.That(AuctionRetentionWorker.ParseHistoryLength("n/a"), Is.Null);
     }
 
-    // ---- windowed per tag count ----
+    // ---- per item tag count ----
 
     private static MySqlConnector.MySqlException StatementTimeout()
     {
@@ -1456,71 +1531,51 @@ public class AuctionRetentionWorkerTests
         return (MySqlConnector.MySqlException)ctor.Invoke(args);
     }
 
-    [TestCase(2026, 7, 31)]
-    [TestCase(2026, 2, 28)]
-    [TestCase(2024, 2, 29)]
-    public void CountWindowsTileTheMonthExactly(int year, int month, int days)
-    {
-        var start = new DateTime(year, month, 1, 0, 0, 0, DateTimeKind.Utc);
-        var end = start.AddMonths(1);
-        var windows = AuctionRetentionWorker.CountWindows(start, end).ToList();
-        Assert.That(windows, Has.Count.EqualTo(days));
-        Assert.That(windows[0].From, Is.EqualTo(start));
-        Assert.That(windows[^1].To, Is.EqualTo(end));
-        for (int i = 1; i < windows.Count; i++)
-            Assert.That(windows[i].From, Is.EqualTo(windows[i - 1].To));
-    }
+    private static readonly DateTime CountStart = new(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
+    private static readonly DateTime CountEnd = CountStart.AddMonths(1);
 
     [Test]
-    public void CountWindowsClipTheLastWindow()
+    public async Task PerItemCountQueriesEveryItemOnceAndMergesTagsCaseInsensitively()
     {
-        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
-        var windows = AuctionRetentionWorker.CountWindows(start, start.AddHours(30)).ToList();
-        Assert.That(windows, Has.Count.EqualTo(2));
-        Assert.That(windows[1], Is.EqualTo((start.AddDays(1), start.AddHours(30))));
-    }
-
-    [Test]
-    public async Task WindowedCountSumsPerTagCaseInsensitiveAndNullAsEmpty()
-    {
-        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
-        var map = await AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(3), (from, to, ct) =>
+        var calls = new List<(int item, DateTime from, DateTime to)>();
+        var map = await AuctionRetentionWorker.CountByTagPerItemAsync(new[] { 1, 2, 3 }, CountStart, CountEnd, (item, from, to, ct) =>
         {
-            var day = (int)(from - start).TotalDays;
+            calls.Add((item, from, to));
             return Task.FromResult(new List<TagCount>
             {
-                new() { Tag = day == 1 ? "hyperion" : "HYPERION", Count = 10 },
-                new() { Tag = null, Count = day + 1 },
+                new() { Tag = item == 2 ? "hyperion" : "HYPERION", Count = 10 },
+                new() { Tag = null, Count = item },
             });
         }, NullLogger.Instance, CancellationToken.None);
+
+        Assert.That(calls, Is.EqualTo(new[] { (1, CountStart, CountEnd), (2, CountStart, CountEnd), (3, CountStart, CountEnd) }), "one month long query per item");
         Assert.That(map["Hyperion"], Is.EqualTo(30));
         Assert.That(map[""], Is.EqualTo(6));
         Assert.That(map, Has.Count.EqualTo(2));
     }
 
     [Test]
-    public async Task TimedOutWindowIsSplitInHalvesAndCountsStayComplete()
+    public async Task TimedOutItemSplitsItsEndRangeAndCountsStayComplete()
     {
-        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
-        var calls = new List<(DateTime from, DateTime to)>();
-        var map = await AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(2), (from, to, ct) =>
+        var calls = new List<(int item, DateTime from, DateTime to)>();
+        var mid = CountStart + (CountEnd - CountStart) / 2;
+        var map = await AuctionRetentionWorker.CountByTagPerItemAsync(new[] { 1, 2 }, CountStart, CountEnd, (item, from, to, ct) =>
         {
-            calls.Add((from, to));
-            if (from == start && to == start.AddDays(1))
+            calls.Add((item, from, to));
+            if (item == 2 && from == CountStart && to == CountEnd)
                 throw StatementTimeout();
             return Task.FromResult(new List<TagCount> { new() { Tag = "A", Count = (long)(to - from).TotalHours } });
         }, NullLogger.Instance, CancellationToken.None);
-        Assert.That(calls, Does.Contain((start, start.AddHours(12))));
-        Assert.That(calls, Does.Contain((start.AddHours(12), start.AddDays(1))));
-        Assert.That(map["A"], Is.EqualTo(48));
+
+        Assert.That(calls, Is.EqualTo(new[] { (1, CountStart, CountEnd), (2, CountStart, CountEnd), (2, CountStart, mid), (2, mid, CountEnd) }), "only the timed out item is split");
+        Assert.That(map["A"], Is.EqualTo(2 * 31 * 24));
     }
 
     [Test]
-    public void WindowStillTimingOutAtMinimumRethrows()
+    public void ItemStillTimingOutAtTheMinimumRangeRethrows()
     {
-        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
         var smallest = TimeSpan.MaxValue;
-        Assert.ThrowsAsync<MySqlConnector.MySqlException>(() => AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(1), (from, to, ct) =>
+        Assert.ThrowsAsync<MySqlConnector.MySqlException>(() => AuctionRetentionWorker.CountByTagPerItemAsync(new[] { 1 }, CountStart, CountStart.AddDays(1), (item, from, to, ct) =>
         {
             smallest = TimeSpan.FromTicks(Math.Min(smallest.Ticks, (to - from).Ticks));
             throw StatementTimeout();
@@ -1531,9 +1586,8 @@ public class AuctionRetentionWorkerTests
     [Test]
     public void NonTimeoutExceptionIsRethrownWithoutSplitting()
     {
-        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
         var calls = 0;
-        Assert.ThrowsAsync<InvalidOperationException>(() => AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(1), (from, to, ct) =>
+        Assert.ThrowsAsync<InvalidOperationException>(() => AuctionRetentionWorker.CountByTagPerItemAsync(new[] { 1, 2 }, CountStart, CountEnd, (item, from, to, ct) =>
         {
             calls++;
             throw new InvalidOperationException("boom");
@@ -1544,13 +1598,129 @@ public class AuctionRetentionWorkerTests
     [Test]
     public void SnapshotLostIsRethrownWithoutSplittingEvenThoughItWrapsATimeout()
     {
-        var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
         var calls = 0;
-        Assert.ThrowsAsync<AuctionRetentionWorker.SnapshotLostException>(() => AuctionRetentionWorker.CountByTagInWindowsAsync(start, start.AddDays(1), (from, to, ct) =>
+        Assert.ThrowsAsync<AuctionRetentionWorker.SnapshotLostException>(() => AuctionRetentionWorker.CountByTagPerItemAsync(new[] { 1, 2 }, CountStart, CountEnd, (item, from, to, ct) =>
         {
             calls++;
             throw new AuctionRetentionWorker.SnapshotLostException(StatementTimeout());
         }, NullLogger.Instance, CancellationToken.None));
         Assert.That(calls, Is.EqualTo(1), "a lost snapshot must fail the gate, not be split and counted in autocommit");
+    }
+
+    // ---- item by item delete walk ----
+
+    /// <summary>Re-assigns the month's in-memory auctions to ItemIds round robin (the tag stays the row's own).</summary>
+    private static void SpreadOverItems(TestableRetentionWorker w, params int[] itemIds)
+    {
+        for (var i = 0; i < w.Auctions.Count; i++)
+            w.Auctions[i] = w.Auctions[i] with { ItemId = itemIds[i % itemIds.Length] };
+    }
+
+    [Test]
+    public async Task DeleteWalkGoesItemByItemWithSeveralBatchesPerItem()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "2"));
+        AddArchivedMonth(w, OldMonth, 7);
+        SpreadOverItems(w, 10, 20);   // 4 rows of item 10, 3 of item 20
+        var (start, _) = ArchiveMonths.MonthRange(OldMonth);
+        // item 30 is listed (first End before the month) but has no row in it; item 999 is first seen after the month
+        w.OtherItems[30] = start.AddYears(-1);
+
+        Assert.That(await w.Run(), Is.EqualTo(1));
+
+        Assert.That(w.Loads, Is.EqualTo(new[] { (10, 2), (10, 2), (10, 0), (20, 2), (20, 1), (20, 0), (30, 0) }), "ascending ItemIds, item 999 never loaded");
+        Assert.That(w.Batches.Select(b => b.total), Is.EqualTo(new[] { 2L, 2L, 2L, 1L }));
+        Assert.That(w.Auctions, Is.Empty);
+        Assert.That(w.Closed, Is.EqualTo(new[] { OldMonth }));
+        Assert.That(w.LagReads, Is.EqualTo(5), "month start + right before each of the 4 batches, none for empty loads");
+    }
+
+    [Test]
+    public async Task BatchesNeverSpanTwoItems()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "3"));
+        AddArchivedMonth(w, OldMonth, 4);
+        SpreadOverItems(w, 10, 20);
+        var itemOf = w.Auctions.ToDictionary(a => (long)a.Id, a => a.ItemId);
+
+        Assert.That(await w.Run(), Is.EqualTo(1));
+
+        foreach (var batch in w.Executed)
+            Assert.That(batch.Single(s => s.Table == "Auctions").Ids.Select(id => itemOf[id]).Distinct().Count(), Is.EqualTo(1));
+        Assert.That(w.Executed, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public async Task BatchProblemInALaterItemAbortsTheMonth()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "2"));
+        AddArchivedMonth(w, OldMonth, 4);
+        SpreadOverItems(w, 10, 20);
+        // an item 20 row lost its auction_locations row: the batch safety check refuses it
+        var unlocated = w.Auctions.First(a => a.ItemId == 20);
+        w.Locations.Remove((ArchiveMonths.ToIndex(OldMonth), unlocated.UId));
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Batches, Is.EqualTo(new[] { (OldMonth, 2L) }), "item 10 was deleted, nothing of item 20's first batch");
+        Assert.That(w.Auctions.Count(a => a.ItemId == 20), Is.EqualTo(2));
+        Assert.That(w.Closed, Is.Empty);
+        Assert.That(w.MonthRows[OldMonth][0].Note, Does.Contain("auction_locations"));
+    }
+
+    [Test]
+    public async Task HealthStopBetweenItemsStopsTheWalk()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "5"));
+        AddArchivedMonth(w, OldMonth, 4);
+        SpreadOverItems(w, 10, 20);
+        w.Health.Enqueue(new HealthResult(HealthStatus.Ok, "ok"));   // month start
+        w.Health.Enqueue(new HealthResult(HealthStatus.Ok, "ok"));   // item 10
+        w.Health.Enqueue(new HealthResult(HealthStatus.Exceeded, "binlog"));   // item 20
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Batches, Is.EqualTo(new[] { (OldMonth, 2L) }));
+        Assert.That(w.Auctions.Select(a => a.ItemId).Distinct(), Is.EqualTo(new[] { 20 }));
+        Assert.That(w.Closed, Is.Empty);
+        Assert.That(w.MonthRows[OldMonth][0].Note, Is.Null, "a health stop is no abort, no backoff");
+    }
+
+    /// <summary>A row the delete leaves in place is never loaded again (keyset cursor), the walk ends and the final reconcile finds the leftover.</summary>
+    [Test]
+    public async Task RowsKeptByADeleteDoNotLoopTheWalkAndFailTheFinalReconcile()
+    {
+        var w = Worker(("ARCHIVE:DELETE_BATCH_SIZE", "2"));
+        var rows = AddArchivedMonth(w, OldMonth, 5);
+        w.KeepAuctionIds.Add(rows[0].Id);
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.Loads, Is.EqualTo(new[] { (0, 2), (0, 2), (0, 1), (0, 0) }), "the kept row is behind the cursor");
+        Assert.That(w.Auctions.Select(a => a.Id), Is.EqualTo(new[] { rows[0].Id }));
+        Assert.That(w.Closed, Is.Empty);
+        Assert.That(w.MonthRows[OldMonth][0].Note, Does.Contain("final reconcile failed"));
+    }
+
+    [Test]
+    public async Task FinalReconcileReadsTheItemListAgainAndCatchesAnItemAddedDuringTheWalk()
+    {
+        var w = Worker();
+        AddArchivedMonth(w, OldMonth, 3);
+        var (start, _) = ArchiveMonths.MonthRange(OldMonth);
+        // right after the walk read its list, a row of a brand new item ends in the month
+        w.AfterItemListRead = reads =>
+        {
+            if (reads == 1)
+                w.Auctions.Add(new DeleteCandidate(nextId++, 900_002, ItemTag, start.AddDays(5), null, ItemId: 77));
+        };
+
+        Assert.That(await w.Run(), Is.EqualTo(0));
+
+        Assert.That(w.ItemListReads, Is.EqualTo(2), "the walk and the final reconcile each read the list");
+        Assert.That(w.PrimaryCountedItems.Single(), Does.Contain(77));
+        Assert.That(w.Loads.Select(l => l.itemId), Does.Not.Contain(77), "the walk missed the new item");
+        Assert.That(w.Closed, Is.Empty, "the month is not marked deleted");
+        Assert.That(w.MonthRows[OldMonth][0].Note, Does.Contain("final reconcile failed"));
     }
 }

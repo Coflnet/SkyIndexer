@@ -915,8 +915,7 @@ namespace Coflnet.Sky.Indexer.Archive
         {
             using var db = ArchiveReadContext.Open(config);
             db.Database.SetCommandTimeout(TimeSpan.FromMinutes(10));
-            var rows = await db.Auctions.AsNoTracking().GroupBy(a => a.ItemId).Select(g => new { ItemId = g.Key, First = g.Min(a => a.End) }).ToListAsync(cancellationToken).ConfigureAwait(false);
-            return rows.ToDictionary(r => r.ItemId, r => r.First);
+            return await AuctionItemFirstEnds.ReadAsync(db, cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary>The month sentinel has <c>deleted_at</c> or <c>deleted_rows &gt; 0</c>: nothing of the month may be written (see <see cref="ArchiveDeletedMonthGuard"/>).</summary>

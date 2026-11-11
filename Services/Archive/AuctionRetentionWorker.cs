@@ -17,7 +17,8 @@ namespace Coflnet.Sky.Indexer.Archive;
 /// <summary>Auction row picked for deletion.</summary>
 /// <param name="SellerId"><c>Auctions.SellerId</c> (<c>Players.Id</c>); 0 is not necessarily anonymous (the Numberer sets 0 for duplicate players and old rows were never numbered)</param>
 /// <param name="AuctioneerId"><c>Auctions.AuctioneerId</c> (32-char hex uuid), resolved to <c>Players.Id</c> when <paramref name="SellerId"/> is 0</param>
-public record DeleteCandidate(int Id, long UId, string Tag, DateTime End, int? NbtDataId, int SellerId = 0, string AuctioneerId = null);
+/// <param name="ItemId"><c>Auctions.ItemId</c>; the delete walk loads one ItemId at a time over <c>IX_Auctions_ItemId_End</c></param>
+public record DeleteCandidate(int Id, long UId, string Tag, DateTime End, int? NbtDataId, int SellerId = 0, string AuctioneerId = null, int ItemId = 0);
 
 /// <summary>The bookkeeping columns of one <c>archived_months</c> row that the retention gates read.</summary>
 public record ArchivedMonthRowState(ushort TagId, uint Rows, uint? IndexRows, DateTime? VerifiedAt, DateTime ArchivedAt, DateTime? DeletedAt, DateTime? ScyllaAt = null, string Note = null);
@@ -59,7 +60,7 @@ public class ReconcileRowResult
     public long DeletedRows { get; set; }
 }
 
-/// <summary>One group of <see cref="AuctionRetentionWorker.CountByTagQuery"/>.</summary>
+/// <summary>One group of <see cref="AuctionRetentionWorker.ItemCountByTagQuery"/>.</summary>
 public class TagCount
 {
     public string Tag { get; set; }
@@ -112,7 +113,7 @@ public class AuctionRetentionWorker : BackgroundService
     private static readonly Prometheus.Counter sellerPassParts = Prometheus.Metrics.CreateCounter("sky_indexer_retention_seller_pass_parts", "Archived parts read back (verified and decoded once) by the retention seller pass");
     private static readonly Prometheus.Counter sellerPassMonths = Prometheus.Metrics.CreateCounter("sky_indexer_archive_seller_backfill_months_done", "Months whose archived parts were fully read back for seller rows");
     private static readonly Prometheus.Counter waitingForScylla = Prometheus.Metrics.CreateCounter("sky_indexer_retention_waiting_for_scylla_import", "Retention runs stopped at a month whose sentinel has no scylla_at yet");
-    private static readonly Prometheus.Counter countWindowSplits = Prometheus.Metrics.CreateCounter("sky_indexer_retention_count_window_splits", "Per tag count windows split in half after a statement timeout");
+    private static readonly Prometheus.Counter countWindowSplits = Prometheus.Metrics.CreateCounter("sky_indexer_retention_count_window_splits", "Per item count End ranges split in half after a statement timeout");
     private static readonly Prometheus.Counter batches = Prometheus.Metrics.CreateCounter("sky_indexer_retention_batches", "Delete batches committed");
     private static readonly Prometheus.Counter monthsDeleted = Prometheus.Metrics.CreateCounter("sky_indexer_retention_months_deleted", "Months whose MariaDB rows were fully deleted");
     private static readonly Prometheus.Counter healthStops = Prometheus.Metrics.CreateCounter("sky_indexer_retention_health_stops", "Delete runs stopped by the binlog / purge lag / replica gate");
@@ -404,31 +405,66 @@ public class AuctionRetentionWorker : BackgroundService
         return null;
     }
 
+    /// <summary>What the delete walk of a month needs for every item.</summary>
+    private sealed record MonthWalk(int Month, DateTime Start, DateTime End, IReadOnlyDictionary<string, ushort> VerifiedTags, ArchiveOptions Options);
+
+    /// <summary>How the walk of one ItemId ended: rows deleted plus the health stop reason or the abort problem (both null when the item is done).</summary>
+    private readonly record struct ItemWalkResult(long Deleted, string StopReason = null, string Problem = null);
+
+    private const int ItemProgressLogInterval = 500;
+
+    /// <summary>
+    /// Deletes the month ItemId by ItemId (<c>Auctions</c> has no <c>End</c> index, only <c>(ItemId, End)</c>). The ItemId list is read from the primary;
+    /// an item inserted after that read is missed here, but <see cref="CompleteMonthAsync"/> reads the list again and its count then aborts the month.
+    /// </summary>
     private async Task<(MonthDeleteOutcome outcome, long deleted)> DeleteBatchesAsync(int month, ArchiveOptions options, DateTime nowUtc, CancellationToken cancellationToken)
     {
         var (monthStart, monthEnd) = ArchiveMonths.MonthRange(month);
         var verifiedTags = await GetVerifiedTagsAsync(month, cancellationToken).ConfigureAwait(false);
+        var items = AuctionItemFirstEnds.ItemsEndingBefore(await GetPrimaryItemFirstEndsAsync(cancellationToken).ConfigureAwait(false), monthEnd);
+        var walk = new MonthWalk(month, monthStart, monthEnd, verifiedTags, options);
+        logger.LogInformation("Retention: deleting MariaDB rows of {Month} item by item ({Items} ItemIds)", month, items.Count);
         long total = 0;
-        var cursor = monthStart;
-        logger.LogInformation("Retention: deleting MariaDB rows of {Month}", month);
+        for (var i = 0; i < items.Count; i++)
+        {
+            var result = await DeleteItemAsync(walk, items[i], cancellationToken).ConfigureAwait(false);
+            total += result.Deleted;
+            if (result.StopReason != null)
+                return HealthStop(month, result.StopReason, total);
+            if (result.Problem != null)
+                return await AbortAsync(month, "nothing of this batch deleted", result.Problem, total, options, nowUtc, cancellationToken).ConfigureAwait(false);
+            if ((i + 1) % ItemProgressLogInterval == 0)
+                logger.LogInformation("Retention: {Month} walked {Done} of {Items} ItemIds, {Rows} auctions deleted so far", month, i + 1, items.Count, total);
+        }
+        return await CompleteMonthAsync(month, total, options, nowUtc, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Deletes the rows of one ItemId in the month batch by batch (a batch never spans two items). The operational gates run right before every
+    /// delete; an item without rows in the month costs one indexed load and no gate read.
+    /// </summary>
+    private async Task<ItemWalkResult> DeleteItemAsync(MonthWalk walk, int itemId, CancellationToken cancellationToken)
+    {
+        long deleted = 0;
+        var (cursorEnd, cursorId) = (walk.Start, 0);
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var stopReason = await OperationalStopReasonAsync(options, cancellationToken).ConfigureAwait(false);
-            if (stopReason != null)
-                return HealthStop(month, stopReason, total);
-            var batch = await LoadDeleteBatchAsync(cursor, monthEnd, options.DeleteBatchSize, cancellationToken).ConfigureAwait(false);
+            var batch = await LoadDeleteBatchAsync(itemId, cursorEnd, cursorId, walk.End, walk.Options.DeleteBatchSize, cancellationToken).ConfigureAwait(false);
             if (batch.Count == 0)
-                break;
-            var (problem, deleted) = await DeleteBatchAsync(month, batch, verifiedTags, cancellationToken).ConfigureAwait(false);
+                return new ItemWalkResult(deleted);
+            var stopReason = await OperationalStopReasonAsync(walk.Options, cancellationToken).ConfigureAwait(false);
+            if (stopReason != null)
+                return new ItemWalkResult(deleted, StopReason: stopReason);
+            var (problem, count) = await DeleteBatchAsync(walk.Month, batch, walk.VerifiedTags, cancellationToken).ConfigureAwait(false);
             if (problem != null)
-                return await AbortAsync(month, "nothing of this batch deleted", problem, total, options, nowUtc, cancellationToken).ConfigureAwait(false);
-            total += deleted;
-            // deleted rows vanish from the End range, so the cursor only has to move forward to the last End seen
-            cursor = batch.Max(b => b.End);
-            await Delay(TimeSpan.FromMilliseconds(options.DeletePauseMs), cancellationToken).ConfigureAwait(false);
+                return new ItemWalkResult(deleted, Problem: problem);
+            deleted += count;
+            // keyset cursor past the batch: deleted rows are gone anyway, a row the batch kept is never loaded again (the final reconcile counts it)
+            var last = batch.MaxBy(b => (b.End, b.Id));
+            (cursorEnd, cursorId) = (last.End, last.Id);
+            await Delay(TimeSpan.FromMilliseconds(walk.Options.DeletePauseMs), cancellationToken).ConfigureAwait(false);
         }
-        return await CompleteMonthAsync(month, total, options, nowUtc, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -483,7 +519,7 @@ public class AuctionRetentionWorker : BackgroundService
     private async Task<(MonthDeleteOutcome outcome, long deleted)> CompleteMonthAsync(int month, long total, ArchiveOptions options, DateTime nowUtc, CancellationToken cancellationToken)
     {
         var (monthStart, monthEnd) = ArchiveMonths.MonthRange(month);
-        var problem = await CountProblemAsync(month, monthStart, monthEnd, cancellationToken).ConfigureAwait(false);
+        var problem = await PrimaryReconcileProblemAsync(month, monthStart, monthEnd, true, cancellationToken).ConfigureAwait(false);
         if (problem != null)
             return await AbortAsync(month, "the month is not marked deleted", "final reconcile failed: " + problem, total, options, nowUtc, cancellationToken).ConfigureAwait(false);
         await MarkMonthDeletedAsync(month, cancellationToken).ConfigureAwait(false);
@@ -666,20 +702,37 @@ public class AuctionRetentionWorker : BackgroundService
     /// Per tag count reconcile: the primary's <c>Auctions</c> ending in the month, grouped by tag, must equal for EVERY tag what phase 1 archived
     /// minus what earlier runs already deleted (the deletes book <c>deleted_rows</c> in their own transaction, so there is no tolerance). More rows than
     /// expected mean rows missing from the archive, fewer mean rows vanished. Null when every tag matches (also after the last batch, when all are 0).
+    /// The ItemId list is read fresh from the primary here (never reused from the delete walk), so rows of an item that appeared during the walk are counted.
     /// </summary>
-    internal async Task<string> CountProblemAsync(int month, DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
+    internal Task<string> CountProblemAsync(int month, DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
+        => PrimaryReconcileProblemAsync(month, monthStart, monthEnd, false, cancellationToken);
+
+    /// <summary>
+    /// <see cref="CountProblemAsync"/> plus, with <paramref name="requireEmpty"/>, no auction of the month may be left on the primary: a row a batch kept
+    /// (its booking then still matches) must not let the month be marked deleted.
+    /// </summary>
+    private async Task<string> PrimaryReconcileProblemAsync(int month, DateTime monthStart, DateTime monthEnd, bool requireEmpty, CancellationToken cancellationToken)
     {
         var rows = await GetReconcileRowsAsync(month, cancellationToken).ConfigureAwait(false);
         var (expectations, problem) = await ReadExpectationsAsync(month, rows, cancellationToken).ConfigureAwait(false);
         if (problem != null)
             return problem;
-        var actual = await CountPrimaryAuctionsByTagAsync(monthStart, monthEnd, cancellationToken).ConfigureAwait(false);
-        return FindCountMismatch(expectations, actual);
+        var items = AuctionItemFirstEnds.ItemsEndingBefore(await GetPrimaryItemFirstEndsAsync(cancellationToken).ConfigureAwait(false), monthEnd);
+        var actual = await CountPrimaryAuctionsByTagAsync(items, monthStart, monthEnd, cancellationToken).ConfigureAwait(false);
+        return FindCountMismatch(expectations, actual) ?? (requireEmpty ? LeftoverProblem(actual) : null);
+    }
+
+    private static string LeftoverProblem(IReadOnlyDictionary<string, long> actual)
+    {
+        var left = actual.Where(kv => kv.Value != 0).OrderBy(kv => kv.Key, StringComparer.Ordinal).ToList();
+        if (left.Count == 0)
+            return null;
+        return $"the primary still has {left.Sum(kv => kv.Value)} auctions ending in the month after the delete walk (tag '{left[0].Key}': {left[0].Value})";
     }
 
     /// <summary>
-    /// The same reconcile for the pre-delete gate, but read from the replica: the expectations and the (month long, GROUP BY over ~18 M rows) count come from
-    /// ONE read only snapshot, so they are consistent with each other (a delete and its <c>deleted_rows</c> booking commit atomically on the primary and
+    /// The same reconcile for the pre-delete gate, but read from the replica: the expectations, the ItemId list and the per item counts (one
+    /// <c>(ItemId, End)</c> range query per item, ~18 M rows in total) come from ONE read only snapshot, so they are consistent with each other (a delete and its <c>deleted_rows</c> booking commit atomically on the primary and
     /// replicate together). The replica gate bounds the lag before this runs.
     /// </summary>
     internal async Task<string> ReplicaCountProblemAsync(int month, CancellationToken cancellationToken)
@@ -896,14 +949,18 @@ public class AuctionRetentionWorker : BackgroundService
     internal static IQueryable<ReconcileRowResult> ReconcileRowsQuery(HypixelContext db, int monthIndex)
         => db.Database.SqlQuery<ReconcileRowResult>($"SELECT CAST(m.tag_id AS SIGNED) AS TagId, t.tag AS Tag, m.source AS Source, CAST(m.`rows` AS SIGNED) AS `Rows`, CAST(COALESCE(m.deleted_rows, 0) AS SIGNED) AS DeletedRows FROM archived_months m LEFT JOIN auction_tags t ON t.id = m.tag_id WHERE m.month = {monthIndex} AND m.tag_id <> 0");
 
-    /// <summary>Auctions ending in the month per tag: an <c>End</c> index range with one GROUP BY, no subquery.</summary>
-    internal static IQueryable<TagCount> CountByTagQuery(HypixelContext db, DateTime monthStart, DateTime monthEnd)
-        => db.Auctions.AsNoTracking().Where(a => a.End >= monthStart && a.End < monthEnd)
+    /// <summary>
+    /// Auctions of ONE ItemId ending in [from, to) per tag: an <c>ItemId = x AND End</c> range on <c>IX_Auctions_ItemId_End</c> with one GROUP BY, no subquery.
+    /// Never filter on <c>End</c> alone: <c>Auctions</c> has no <c>End</c> index in production, that is a full scan of ~700 M rows.
+    /// </summary>
+    internal static IQueryable<TagCount> ItemCountByTagQuery(HypixelContext db, int itemId, DateTime from, DateTime to)
+        => db.Auctions.AsNoTracking().Where(a => a.ItemId == itemId && a.End >= from && a.End < to)
             .GroupBy(a => a.Tag).Select(g => new TagCount { Tag = g.Key, Count = g.LongCount() });
 
     /// <summary>
-    /// Expectations (<c>archived_months</c>) and per tag counts of the month from the READ REPLICA (<c>DBReadOnlyConnection</c>, the primary when none is
-    /// configured) inside one <c>START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY</c>, so both reflect the same replicated point in time.
+    /// Expectations (<c>archived_months</c>), the ItemId list and the per tag counts of the month from the READ REPLICA (<c>DBReadOnlyConnection</c>, the
+    /// primary when none is configured) inside one <c>START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY</c>, so all reflect the same replicated point in
+    /// time. The ItemId list comes from the same snapshot, so every row the counts could see belongs to a listed item.
     /// </summary>
     protected virtual async Task<CountSnapshot> ReadCountSnapshotAsync(int month, DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
     {
@@ -915,7 +972,8 @@ public class AuctionRetentionWorker : BackgroundService
         try
         {
             var rows = await ReconcileRowsQuery(db, ArchiveMonths.ToIndex(month)).ToListAsync(cancellationToken).ConfigureAwait(false);
-            var counts = await CountByTagInWindowsAsync(monthStart, monthEnd, (from, to, ct) => CountWindowInSnapshotAsync(db, from, to, ct), logger, cancellationToken).ConfigureAwait(false);
+            var items = AuctionItemFirstEnds.ItemsEndingBefore(await AuctionItemFirstEnds.ReadAsync(db, cancellationToken).ConfigureAwait(false), monthEnd);
+            var counts = await CountByTagPerItemAsync(items, monthStart, monthEnd, (itemId, from, to, ct) => CountItemInSnapshotAsync(db, itemId, from, to, ct), logger, cancellationToken).ConfigureAwait(false);
             return new CountSnapshot(rows.Select(ToReconcileRow).ToList(), counts);
         }
         finally
@@ -924,12 +982,12 @@ public class AuctionRetentionWorker : BackgroundService
         }
     }
 
-    /// <summary>Counts one window; after a statement timeout the snapshot transaction must still be open, otherwise later windows would read a different point in time.</summary>
-    private static async Task<List<TagCount>> CountWindowInSnapshotAsync(HypixelContext db, DateTime from, DateTime to, CancellationToken cancellationToken)
+    /// <summary>Counts one item range; after a statement timeout the snapshot transaction must still be open, otherwise later queries would read a different point in time.</summary>
+    private static async Task<List<TagCount>> CountItemInSnapshotAsync(HypixelContext db, int itemId, DateTime from, DateTime to, CancellationToken cancellationToken)
     {
         try
         {
-            return await CountByTagQuery(db, from, to).ToListAsync(cancellationToken).ConfigureAwait(false);
+            return await ItemCountByTagQuery(db, itemId, from, to).ToListAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (AuctionArchiveJob.IsStatementTimeout(ex))
         {
@@ -941,7 +999,7 @@ public class AuctionRetentionWorker : BackgroundService
     }
 
     /// <summary>
-    /// The snapshot transaction ended after a statement timeout. It wraps that timeout for diagnostics, so the window splitter must exclude it
+    /// The snapshot transaction ended after a statement timeout. It wraps that timeout for diagnostics, so the per item range splitter must exclude it
     /// explicitly (<see cref="AuctionArchiveJob.IsStatementTimeout"/> walks inner exceptions); it always fails the gate.
     /// </summary>
     internal sealed class SnapshotLostException : InvalidOperationException
@@ -952,45 +1010,45 @@ public class AuctionRetentionWorker : BackgroundService
         }
     }
 
-    private static readonly TimeSpan CountWindow = TimeSpan.FromDays(1);
+    /// <summary>The shortest End range a timed out per item count is split into; a range that would be split shorter rethrows the timeout.</summary>
     internal static readonly TimeSpan MinCountWindow = TimeSpan.FromMinutes(15);
 
-    /// <summary>The half-open day windows that exactly tile [monthStart, monthEnd); the last one is clipped.</summary>
-    internal static IEnumerable<(DateTime From, DateTime To)> CountWindows(DateTime monthStart, DateTime monthEnd)
-    {
-        for (var from = monthStart; from < monthEnd; from += CountWindow)
-            yield return (from, from + CountWindow < monthEnd ? from + CountWindow : monthEnd);
-    }
+    /// <summary>Per tag count of one ItemId over [from, to), see <see cref="ItemCountByTagQuery"/>.</summary>
+    internal delegate Task<List<TagCount>> ItemTagCounter(int itemId, DateTime from, DateTime to, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Per tag counts of [monthStart, monthEnd) summed over day windows, so no single statement runs into the server's <c>max_statement_time</c>. A window that
-    /// still times out is split in half, but never into halves shorter than <see cref="MinCountWindow"/> (from a day that ends at 22.5 min windows); then the timeout is rethrown.
+    /// Per tag counts of [monthStart, monthEnd) summed over one query per ItemId (each a clean <c>(ItemId, End)</c> index range), merged case-insensitively.
+    /// An item whose query still hits the statement timeout has its End range split in half, never into halves shorter than <see cref="MinCountWindow"/>; then the
+    /// timeout is rethrown. <see cref="SnapshotLostException"/> is never split.
     /// </summary>
-    internal static async Task<IReadOnlyDictionary<string, long>> CountByTagInWindowsAsync(DateTime monthStart, DateTime monthEnd,
-        Func<DateTime, DateTime, CancellationToken, Task<List<TagCount>>> countWindow, ILogger logger, CancellationToken cancellationToken)
+    internal static async Task<IReadOnlyDictionary<string, long>> CountByTagPerItemAsync(IReadOnlyList<int> itemIds, DateTime monthStart, DateTime monthEnd,
+        ItemTagCounter countItem, ILogger logger, CancellationToken cancellationToken)
     {
         var all = new List<TagCount>();
-        foreach (var (from, to) in CountWindows(monthStart, monthEnd))
-            await CountWindowSplittingAsync(from, to, countWindow, logger, all, cancellationToken).ConfigureAwait(false);
+        foreach (var itemId in itemIds)
+            await CountItemSplittingAsync(itemId, monthStart, monthEnd, countItem, logger, all, cancellationToken).ConfigureAwait(false);
         return ToCountMap(all);
     }
 
-    private static async Task CountWindowSplittingAsync(DateTime from, DateTime to, Func<DateTime, DateTime, CancellationToken, Task<List<TagCount>>> countWindow,
-        ILogger logger, List<TagCount> sink, CancellationToken cancellationToken)
+    private static async Task CountItemSplittingAsync(int itemId, DateTime from, DateTime to, ItemTagCounter countItem, ILogger logger, List<TagCount> sink, CancellationToken cancellationToken)
     {
         try
         {
-            sink.AddRange(await countWindow(from, to, cancellationToken).ConfigureAwait(false));
+            sink.AddRange(await countItem(itemId, from, to, cancellationToken).ConfigureAwait(false));
         }
-        catch (Exception ex) when (ex is not SnapshotLostException && AuctionArchiveJob.IsStatementTimeout(ex) && !cancellationToken.IsCancellationRequested && (to - from) / 2 >= MinCountWindow)
+        catch (Exception ex) when (IsSplittableTimeout(ex, cancellationToken) && (to - from) / 2 >= MinCountWindow)
         {
             var mid = from + (to - from) / 2;
             countWindowSplits.Inc();
-            logger.LogWarning("Retention: count window {From:u} - {To:u} hit the statement timeout, splitting at {Mid:u}", from, to, mid);
-            await CountWindowSplittingAsync(from, mid, countWindow, logger, sink, cancellationToken).ConfigureAwait(false);
-            await CountWindowSplittingAsync(mid, to, countWindow, logger, sink, cancellationToken).ConfigureAwait(false);
+            logger.LogWarning("Retention: count of ItemId {ItemId} {From:u} - {To:u} hit the statement timeout, splitting at {Mid:u}", itemId, from, to, mid);
+            await CountItemSplittingAsync(itemId, from, mid, countItem, logger, sink, cancellationToken).ConfigureAwait(false);
+            await CountItemSplittingAsync(itemId, mid, to, countItem, logger, sink, cancellationToken).ConfigureAwait(false);
         }
     }
+
+    /// <summary>A statement timeout that may be retried on a smaller range; a lost snapshot wraps a timeout but must fail the gate.</summary>
+    private static bool IsSplittableTimeout(Exception ex, CancellationToken cancellationToken)
+        => ex is not SnapshotLostException && AuctionArchiveJob.IsStatementTimeout(ex) && !cancellationToken.IsCancellationRequested;
 
     /// <summary>Ends the snapshot transaction; a failure is only logged so it cannot mask the exception of the reads.</summary>
     private async Task RollbackSnapshotAsync(HypixelContext db)
@@ -1020,14 +1078,25 @@ public class AuctionRetentionWorker : BackgroundService
     }
 
     /// <summary>
-    /// <c>COUNT(*)</c> per <c>Tag</c> of the primary's <c>Auctions</c> with <c>End</c> in the month (End index range, long command timeout). A row without a tag
-    /// is counted under the empty tag, which no archive row can expect.
+    /// <c>COUNT(*)</c> per <c>Tag</c> of the primary's <c>Auctions</c> with <c>End</c> in the month, one <c>(ItemId, End)</c> range query per item of
+    /// <paramref name="itemIds"/>. A row without a tag is counted under the empty tag, which no archive row can expect.
     /// </summary>
-    protected virtual async Task<IReadOnlyDictionary<string, long>> CountPrimaryAuctionsByTagAsync(DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
+    protected virtual async Task<IReadOnlyDictionary<string, long>> CountPrimaryAuctionsByTagAsync(IReadOnlyList<int> itemIds, DateTime monthStart, DateTime monthEnd, CancellationToken cancellationToken)
     {
         using var db = new HypixelContext();
         db.Database.SetCommandTimeout(TimeSpan.FromMinutes(30));
-        return await CountByTagInWindowsAsync(monthStart, monthEnd, (from, to, ct) => CountByTagQuery(db, from, to).ToListAsync(ct), logger, cancellationToken).ConfigureAwait(false);
+        return await CountByTagPerItemAsync(itemIds, monthStart, monthEnd, (itemId, from, to, ct) => ItemCountByTagQuery(db, itemId, from, to).ToListAsync(ct), logger, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The ItemId list (with first End) read from the PRIMARY: the delete walk and the final reconcile must see every row the primary has, also rows the
+    /// replica has not applied yet.
+    /// </summary>
+    protected virtual async Task<IReadOnlyDictionary<int, DateTime>> GetPrimaryItemFirstEndsAsync(CancellationToken cancellationToken)
+    {
+        using var db = new HypixelContext();
+        db.Database.SetCommandTimeout(TimeSpan.FromMinutes(10));
+        return await AuctionItemFirstEnds.ReadAsync(db, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>The receipt JSON of a month, null when it does not exist. Fails (fail closed) when no object probe is configured.</summary>
@@ -1124,16 +1193,22 @@ public class AuctionRetentionWorker : BackgroundService
         return tags.Where(t => verified.Contains(t.Id)).ToDictionary(t => t.Tag, t => t.Id, StringComparer.Ordinal);
     }
 
-    /// <summary>The next batch of the month by the End index (rows already deleted are gone from the range).</summary>
-    protected virtual async Task<IReadOnlyList<DeleteCandidate>> LoadDeleteBatchAsync(DateTime cursor, DateTime monthEnd, int batchSize, CancellationToken cancellationToken)
+    /// <summary>
+    /// The next batch of one ItemId after the keyset cursor <c>(End, Id)</c>, same filter as the archive job's pages (<see cref="AuctionArchiveJob.PageFilter"/>):
+    /// <c>ItemId = x</c> plus an End range on <c>IX_Auctions_ItemId_End</c>, ordered by <c>End, Id</c> (the index order, InnoDB appends the primary key), no filesort.
+    /// </summary>
+    internal static IQueryable<DeleteCandidate> DeleteBatchQuery(HypixelContext db, int itemId, DateTime cursorEnd, int cursorId, DateTime monthEnd, int batchSize)
+        => db.Auctions.AsNoTracking()
+            .Where(AuctionArchiveJob.PageFilter(itemId, cursorEnd, cursorId, monthEnd))
+            .OrderBy(a => a.End).ThenBy(a => a.Id)
+            .Take(batchSize)
+            .Select(a => new DeleteCandidate(a.Id, a.UId, a.Tag, a.End, a.NbtDataId, a.SellerId, a.AuctioneerId, a.ItemId));
+
+    /// <summary>The next delete batch of one ItemId from the primary, see <see cref="DeleteBatchQuery"/>.</summary>
+    protected virtual async Task<IReadOnlyList<DeleteCandidate>> LoadDeleteBatchAsync(int itemId, DateTime cursorEnd, int cursorId, DateTime monthEnd, int batchSize, CancellationToken cancellationToken)
     {
         using var db = new HypixelContext();
-        return await db.Auctions.AsNoTracking()
-            .Where(a => a.End >= cursor && a.End < monthEnd)
-            .OrderBy(a => a.End)
-            .Take(batchSize)
-            .Select(a => new DeleteCandidate(a.Id, a.UId, a.Tag, a.End, a.NbtDataId, a.SellerId, a.AuctioneerId))
-            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return await DeleteBatchQuery(db, itemId, cursorEnd, cursorId, monthEnd, batchSize).ToListAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>How many of the uids have an <c>auction_locations</c> row for the month (primary key lookups).</summary>

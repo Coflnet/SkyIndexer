@@ -64,9 +64,29 @@ python3 -I mirror.py                                     # 1. mirror (resumable:
     --out /storage/backup/hypixel/archive-receipts/$(date -u +%Y%m%dT%H%M%SZ)   # 2. verify, writes receipts
 ./snapshot.sh --receipts <that out dir>                  # 3. dry run: checks + plan
 ./snapshot.sh --receipts <that out dir> --execute        # 3. snapshot + hold + re-read + stamp
+python3 -I upload_receipts.py --receipts <that out dir>/with-snapshot            # 4. dry run: validates, prints new/replaced/unchanged
+python3 -I upload_receipts.py --receipts <that out dir>/with-snapshot --execute  # 4. PUT to R2 + read back
 ```
 
 The stamped receipts end up in `<out dir>/with-snapshot/receipt-yyyy-MM.json`.
+
+### 4. upload_receipts.py
+
+Uploads the stamped receipts to `auctions/v2/_meta/backup/yyyy-MM.json` in R2, where SkyIndexer's retention worker looks
+for them (an unstamped receipt counts as none). Needs a separate **read/write** token (Object Read & Write, scoped to
+bucket `sky-auctions-archive`) in `~/.config/coflnet/sky-auctions-r2-rw.env` (`chmod 600`, same keys as the ro file;
+override with `--env-file`). Instead of the 4 keys the file may hold just a Cloudflare API token (a bare single line,
+or `R2_API_TOKEN=` / `CLOUDFLARE_API_TOKEN=`; `chmod 600`): endpoint, bucket and region then come from the token file or
+`--endpoint-env-file` (default the ro env file), the token id (from Cloudflare's token verify API) is the access key id
+and sha256(token) the secret; the token is never printed. Token mode calls api.cloudflare.com (no redirects followed) even in the dry run; an account
+API token needs the permission "Workers R2 Storage Bucket Item Write" scoped to `sky-auctions-archive`. Everything is validated first (name `receipt-yyyy-MM.json`, version 1, month equals file name,
+snapshot `auction-archive-yyyymmddThhmmZ`, tags/objects with key/etag/size, one snapshot generation in the directory);
+one bad file refuses the whole run (exit 2). The dry run only reads (GET) to tell `new` / `replaced` / `unchanged`.
+`--execute` PUTs (Content-Type application/json, Content-MD5), reads back and compares bytes; identical objects are not
+re-uploaded. Every receipt file in the directory is validated even with `--month`. A month whose R2 receipt names a
+NEWER snapshot is refused unless `--allow-older`. The snapshot must still exist with its hold (`zfs holds -H
+storage/backup@<snap>` must list tag `auction-archive`; `--dataset`, `--hold-tag`), also in the dry run. `--month yyyy-MM` (repeatable) limits the months. Exit 0 ok, 1 a month failed, 2 refused/misconfigured.
+Copy it with the other scripts: `scp upload_receipts.py mirror.py ekwav@192.168.2.44:~/archive-mirror/`.
 
 ### 1. mirror.py
 

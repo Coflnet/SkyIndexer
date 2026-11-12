@@ -887,10 +887,23 @@ public class AuctionRetentionWorker : BackgroundService
     }
 
     /// <summary>
+    /// Most ids in one DELETE IN list. MariaDB stops index dives at <c>eq_range_index_dive_limit</c> = 200 values and then plans from index statistics;
+    /// <c>IX_UuId_SaveAuctionId</c> reports cardinality 2 (the column is always NULL), so 300 ids there plan a full scan of ~555 M index entries
+    /// (verified with EXPLAIN on the replica 2026-11-12; 2020-10 timed out after 60 s). 100 keeps every child table on a range plan.
+    /// </summary>
+    internal const int MaxDeleteIdsPerStatement = 100;
+
+    /// <summary>
     /// The ordered DELETE statements of one batch: children, then Auctions (one statement per tag when <paramref name="tagIds"/> is given, so the
-    /// affected rows of each tag can be booked), then NbtData no longer referenced.
+    /// affected rows of each tag can be booked), then NbtData no longer referenced. Every statement holds at most <see cref="MaxDeleteIdsPerStatement"/> ids.
     /// </summary>
     internal static List<DeleteStatement> BuildDeleteStatements(IReadOnlyList<DeleteCandidate> batch, IReadOnlyDictionary<string, ushort> tagIds = null)
+        => BuildUnchunkedDeleteStatements(batch, tagIds).SelectMany(SplitStatement).ToList();
+
+    private static IEnumerable<DeleteStatement> SplitStatement(DeleteStatement statement)
+        => statement.Ids.Chunk(MaxDeleteIdsPerStatement).Select(chunk => statement with { Ids = chunk });
+
+    private static List<DeleteStatement> BuildUnchunkedDeleteStatements(IReadOnlyList<DeleteCandidate> batch, IReadOnlyDictionary<string, ushort> tagIds)
     {
         var ids = batch.Select(b => (long)b.Id).Distinct().ToList();
         var nbtIds = batch.Where(b => b.NbtDataId != null).Select(b => (long)b.NbtDataId.Value).Distinct().ToList();

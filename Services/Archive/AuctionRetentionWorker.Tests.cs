@@ -1496,6 +1496,28 @@ public class AuctionRetentionWorkerTests
         Assert.That(AuctionRetentionWorker.BuildDeleteStatements(new[] { new DeleteCandidate(3, 30, "T", Now, null) }).Select(s => s.Table), Does.Not.Contain("NbtData"));
     }
 
+    /// <summary>
+    /// Regression (2026-11-12, month 2020-10): one item had more than 200 rows in a batch, the UuId DELETE planned a full index scan
+    /// (eq_range_index_dive_limit 200, IX_UuId_SaveAuctionId cardinality 2) and hit the 60 s command timeout.
+    /// </summary>
+    [Test]
+    public void DeleteStatementsNeverExceedTheIndexDiveLimit()
+    {
+        var batch = Enumerable.Range(1, 5000).Select(i => new DeleteCandidate(i, i, i % 3 == 0 ? "A" : "B", Now, i)).ToList();
+        var tagIds = new Dictionary<string, ushort> { ["A"] = 1, ["B"] = 2 };
+        var statements = AuctionRetentionWorker.BuildDeleteStatements(batch, tagIds);
+        Assert.That(AuctionRetentionWorker.MaxDeleteIdsPerStatement, Is.LessThan(200));
+        Assert.That(statements.Max(s => s.Ids.Count), Is.LessThanOrEqualTo(AuctionRetentionWorker.MaxDeleteIdsPerStatement));
+        Assert.That(statements.Where(s => s.Table == "UuId" && s.Column == "SaveAuctionId").SelectMany(s => s.Ids), Is.EquivalentTo(batch.Select(b => (long)b.Id)));
+        Assert.That(statements.Where(s => s.Table == "Auctions" && s.TagId == 1).SelectMany(s => s.Ids), Is.EquivalentTo(batch.Where(b => b.Tag == "A").Select(b => (long)b.Id)));
+        Assert.That(statements.Where(s => s.Table == "Auctions" && s.TagId == 2).SelectMany(s => s.Ids).Count(), Is.EqualTo(batch.Count(b => b.Tag == "B")));
+        Assert.That(statements.Where(s => s.Table == "NbtData").All(s => s.KeepIfReferencedByTable == "Auctions"), Is.True);
+        var order = statements.Select(s => s.Table).Distinct().ToList();
+        Assert.That(order, Is.EqualTo(new[] { "Bids", "NBTLookups", "Enchantment", "UuId", "Auctions", "NbtData" }));
+        Assert.That(statements.FindLastIndex(s => s.Table != "Auctions" && s.Table != "NbtData"), Is.LessThan(statements.FindIndex(s => s.Table == "Auctions")));
+        Assert.That(statements.FindLastIndex(s => s.Table == "Auctions"), Is.LessThan(statements.FindIndex(s => s.Table == "NbtData")));
+    }
+
     /// <summary>The raw delete SQL and the archive job's child queries rely on these EF shadow FK columns and table names.</summary>
     [Test]
     public void HypixelContextColumnsUsedByRawSqlExist()

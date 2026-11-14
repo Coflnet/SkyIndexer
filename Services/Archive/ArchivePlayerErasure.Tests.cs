@@ -46,7 +46,7 @@ public class ArchivePlayerErasureTests
         protected override Task<IReadOnlyList<long>> GetIndexedUidsAsync(uint playerId, CancellationToken cancellationToken)
             => Task.FromResult<IReadOnlyList<long>>(Sellers.Where(s => s.SellerId == playerId).Select(s => s.Uid).Concat(Bidders.Where(b => b.BidderId == playerId).Select(b => b.Uid)).ToList());
 
-        protected override Task<IReadOnlyList<long>> GetMariaDbUidsAsync(uint playerId, string uuid, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<long>>(MariaDbUids.ToList());
+        protected override Task<IReadOnlyList<long>> GetMariaDbUidsAsync(uint playerId, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<long>>(MariaDbUids.ToList());
         protected override Task<IReadOnlyList<ErasureMonth>> GetUnmarkedMonthsAsync(CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<ErasureMonth>>(Unmarked.ToList());
 
         protected override Task UpdateMonthShaAsync(ushort tagId, int month, string sha, CancellationToken cancellationToken)

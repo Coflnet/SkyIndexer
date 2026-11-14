@@ -1,16 +1,27 @@
 # Player data erasure runbook (internal operator)
 
-Scope: SQL (MariaDB) only. This command does **not** erase data in Scylla/Cassandra or
-in any other service; handle those separately. Exports contain personal data: keep them
-private (`out/` is ignored by Git).
+Scope: numbered sellers/bidders in SQL (MariaDB), target relations on known auctions,
+and the auction archive when both `ARCHIVE:ENABLED` and `S3:ENABLED` are true.
+Scylla/Cassandra source tables and other services require separate cleanup. Exports
+and generated plans contain personal data: keep them private under `out/`, which is
+excluded from Git, Docker contexts and .NET build/publish items. Remove task exports
+and verification artifacts when they are no longer needed; use synthetic data in tests.
 
-What `privacy erase` does, in one transaction: auctions and bids of the player stay
+What the SQL phase of `privacy erase` does, in one transaction: auctions and bids of the player stay
 (economic data other users need) but get an anonymous identity; the coop-member and
 claimed-bid relation rows naming the player and the `Players` row are deleted, profile ids
 equal to the player's uuid on the loaded rows are cleared, and `Users.MinecraftUuid` is set
 to null for every account linked to the player (the number is printed). The account row, its
 email and `AgreementAcceptances` are kept deliberately (compliance). `privacy check` writes
 nothing. Nothing else in `HypixelContext` is touched.
+
+The archive phase runs before SQL deletion, after the live SQL check. It discovers
+auctions through indexed numeric seller/bidder IDs and archive indexes; unmarked
+Scylla-sourced archive parts are also checked by UUID. Avoid global raw UUID queries
+on `Auctions`: `AuctioneerId` has no index and a full scan can time out.
+Rewritten blobs are read back and verified, hashes updated, and only then are the
+player's archive index rows deleted. Archive writes are not rolled back if the later
+SQL phase fails; rerun the same command while its export still matches SQL.
 
 Bid and profile references of the player on auctions outside the export scope are not indexed,
 so they are not scanned for. They are removed lazily: whenever the indexer loads such an auction
@@ -35,12 +46,14 @@ the export scope are not loaded by those paths and stay in SQL.
    curl -X POST https://INDEXER_HOST/Player/optout/PLAYER_UUID
    ```
 
-2. Export the player's data and verify the archive.
+2. Export the player's data and verify the ZIP. Optional `--cql` and `--mcconnect`
+   collect additional source data but do not erase it. Do not pass
+   `--no-older-archives` unless their absence has actually been established.
 
    ```sh
-   mkdir -m 700 -p out
+   install -d -m 700 out
    python3 scripts/player-export.py export AnyMinecraftName \
-     --cql --mcconnect --no-older-archives --output out/player.zip
+     --cql --mcconnect --output out/player.zip
    python3 scripts/player-export.py verify out/player.zip
    ```
 
@@ -54,11 +67,34 @@ the export scope are not loaded by those paths and stay in SQL.
    dotnet bin/Release/net10.0/SkyIndexer.dll privacy check out/player.zip
    ```
 
-4. Erase. Run the same comparison again, then apply; any failure rolls back.
+4. Confirm archive configuration before erasing. Both flags above must be enabled
+   to include the archive; otherwise the command completes SQL erasure and reports
+   that the archive was untouched. The command repeats the live comparison before
+   applying. SQL failures roll back its transaction; archive work is resumable.
 
    ```sh
    dotnet bin/Release/net10.0/SkyIndexer.dll privacy erase out/player.zip
    ```
+
+5. Verify against the primary database using the numeric player ID captured before
+   erasure: the player row, original seller/bidder references, target relations on
+   known auctions, linked `Users.MinecraftUuid` values and archive seller/bidder
+   index rows should be absent. Keep the opt-out. Auction/bid values remain, their
+   UUIDs use the anonymous prefix and their profile IDs are cleared. The background
+   `Numberer` can assign an anonymous sentinel ID from the UUID's hexadecimal suffix,
+   so a numeric ID need not remain zero. Check the archive completion summary; zero
+   rewrites is valid when no matching archived auctions were found. A post-erasure
+   `privacy check` of the original export is expected to fail because its player was deleted.
+
+For offline cross-service planning, prepare exact exported Scylla keys and snapshot hashes:
+
+```sh
+python3 scripts/player-erasure-plan.py out/player.zip --output out/erasure-plan.json
+```
+
+This makes no database changes and implements no Scylla apply command. BazaarPro account
+deletion is a separate operation through its loopback-only endpoint; see
+[its runbook](https://github.com/Coflnet/BazaarPro-API#internal-account-deletion).
 
 Run the binary with the ordinary indexer database configuration (`DBConnection` in the
 environment or a protected `appsettings.json`), never in command arguments. In Kubernetes

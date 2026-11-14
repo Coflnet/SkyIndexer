@@ -64,7 +64,7 @@ namespace Coflnet.Sky.Indexer.Archive
                 throw new ArgumentException("A numbered player and its canonical uuid are required");
             // (a) index rows and (b) the player's auctions still in MariaDB
             var uids = (await GetIndexedUidsAsync(playerId, cancellationToken).ConfigureAwait(false))
-                .Concat(await GetMariaDbUidsAsync(playerId, uuid, cancellationToken).ConfigureAwait(false)).Distinct().ToList();
+                .Concat(await GetMariaDbUidsAsync(playerId, cancellationToken).ConfigureAwait(false)).Distinct().ToList();
             var located = new Dictionary<long, AuctionLocation>();
             foreach (var chunk in uids.Chunk(EfArchiveLocationLookup.LocationChunkSize * 10))
                 foreach (var (uid, location) in await lookup.GetLocationsAsync(chunk, cancellationToken).ConfigureAwait(false))
@@ -279,15 +279,14 @@ namespace Coflnet.Sky.Indexer.Archive
             return sold.Concat(bid).ToList();
         }
 
-        /// <summary>Uids of the player's auctions still in MariaDB (as seller by id or uuid, or with a bid by the player).</summary>
-        protected virtual async Task<IReadOnlyList<long>> GetMariaDbUidsAsync(uint playerId, string uuid, CancellationToken cancellationToken)
+        /// <summary>Uids of the player's auctions still in MariaDB, found through indexed seller and bidder ids.</summary>
+        protected virtual async Task<IReadOnlyList<long>> GetMariaDbUidsAsync(uint playerId, CancellationToken cancellationToken)
         {
             using var db = new HypixelContext();
             var id = (int)playerId;
             var sold = await db.Auctions.AsNoTracking().Where(a => a.SellerId == id).Select(a => a.UId).ToListAsync(cancellationToken).ConfigureAwait(false);
-            var byUuid = await db.Auctions.AsNoTracking().Where(a => a.AuctioneerId == uuid).Select(a => a.UId).ToListAsync(cancellationToken).ConfigureAwait(false);
             var bid = await db.Bids.AsNoTracking().Where(b => b.BidderId == id).Select(b => b.Auction.UId).ToListAsync(cancellationToken).ConfigureAwait(false);
-            return sold.Concat(byUuid).Concat(bid).ToList();
+            return sold.Concat(bid).ToList();
         }
 
         /// <summary>Archived months (sentinel present) without a row in <c>auction_seller_backfill</c>, with their tag rows.</summary>
